@@ -1,0 +1,48 @@
+{
+  "name": "ideal-auth",
+  "version": "0.1.0",
+  "description": "Auth primitives for the JS ecosystem. Zero framework dependencies.",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "bun run build",
+    "test": "bun test"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "ideal-auth": "./dist/bin/ideal-auth.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "iron-session": "^8.0.4",
+    "bcryptjs": "^3.0.3"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^3.0.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ramonmalcolm10/ideal-auth.git"
+  },
+  "license": "MIT"
+}
