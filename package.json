@@ -1,6 +1,6 @@
 {
   "name": "ideal-auth",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Auth primitives for the JS ecosystem. Zero framework dependencies.",
   "scripts": {
     "build": "tsc",
