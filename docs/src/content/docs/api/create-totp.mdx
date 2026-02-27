@@ -1,0 +1,299 @@
+---
+title: createTOTP
+description: API reference for createTOTP — TOTP two-factor authentication.
+---
+
+## createTOTP
+
+### Signature
+
+```typescript
+function createTOTP(config?: TOTPConfig): TOTPInstance
+```
+
+Creates a TOTP (Time-based One-Time Password) instance for two-factor authentication, compliant with [RFC 6238](https://datatracker.ietf.org/doc/html/rfc6238).
+
+```typescript
+import { createTOTP } from 'ideal-auth';
+
+const totp = createTOTP();
+```
+
+---
+
+### TOTPConfig
+
+```typescript
+interface TOTPConfig {
+  digits?: number;
+  period?: number;
+  window?: number;
+}
+```
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `digits` | `number` | No | `6` |
+| `period` | `number` (seconds) | No | `30` |
+| `window` | `number` | No | `1` |
+
+- **`digits`** — Number of digits in the generated TOTP code. Most authenticator apps expect 6.
+- **`period`** — Time step duration in seconds. Codes rotate every `period` seconds.
+- **`window`** — Number of time steps to check in each direction when verifying. A window of `1` accepts the current code plus the codes from one step before and one step after (3 total), accounting for clock skew.
+
+```typescript
+const totp = createTOTP({
+  digits: 6,
+  period: 30,
+  window: 1,
+});
+```
+
+---
+
+### TOTPInstance
+
+#### generateSecret
+
+```typescript
+generateSecret(): string
+```
+
+Generates a cryptographically random secret encoded in Base32. This secret should be stored in the database alongside the user record (encrypted at rest if possible).
+
+```typescript
+const totp = createTOTP();
+const secret = totp.generateSecret();
+// "JBSWY3DPEHPK3PXP..."
+```
+
+#### generateQrUri
+
+```typescript
+generateQrUri(options: {
+  secret: string;
+  issuer: string;
+  account: string;
+}): string
+```
+
+Generates an `otpauth://` URI suitable for encoding into a QR code. Users scan this QR code with an authenticator app (Google Authenticator, Authy, 1Password, etc.).
+
+```typescript
+const totp = createTOTP();
+const secret = totp.generateSecret();
+
+const uri = totp.generateQrUri({
+  secret,
+  issuer: 'My App',
+  account: 'user@example.com',
+});
+// "otpauth://totp/My%20App:user%40example.com?secret=JBSWY3DP...&issuer=My%20App&digits=6&period=30"
+```
+
+| Parameter | Description |
+|---|---|
+| `secret` | The Base32-encoded secret from `generateSecret()` |
+| `issuer` | Your application name, displayed in the authenticator app |
+| `account` | The user's account identifier (typically email), displayed in the authenticator app |
+
+:::tip
+Use a QR code library like `qrcode` to render the URI as an image:
+
+```typescript
+import QRCode from 'qrcode';
+
+const dataUrl = await QRCode.toDataURL(uri);
+// Use dataUrl as the src of an <img> tag
+```
+:::
+
+#### verify
+
+```typescript
+verify(token: string, secret: string): boolean
+```
+
+Verifies a TOTP code against a secret. Returns `true` if the code is valid within the configured time window.
+
+```typescript
+const totp = createTOTP();
+
+const isValid = totp.verify('123456', user.totpSecret);
+
+if (!isValid) {
+  return { error: 'Invalid verification code.' };
+}
+```
+
+The `window` configuration determines how many adjacent time steps are checked. With the default window of `1`, the current time step and one step in each direction are checked (3 codes total). This accommodates minor clock drift between the server and the user's authenticator app.
+
+---
+
+## generateRecoveryCodes
+
+### Signature
+
+```typescript
+function generateRecoveryCodes(
+  hash: HashInstance,
+  count?: number,
+): Promise<{ codes: string[]; hashed: string[] }>
+```
+
+Generates a set of one-time recovery codes for 2FA backup. Each code is bcrypt-hashed for secure storage.
+
+```typescript
+import { createHash, generateRecoveryCodes } from 'ideal-auth';
+
+const hash = createHash();
+
+const { codes, hashed } = await generateRecoveryCodes(hash);
+```
+
+| Parameter | Type | Required | Default |
+|---|---|---|---|
+| `hash` | [`HashInstance`](/ideal-auth/api/create-hash/) | Yes | — |
+| `count` | `number` | No | `8` |
+
+### Return value
+
+| Field | Type | Description |
+|---|---|---|
+| `codes` | `string[]` | Plain-text codes to display to the user **once** |
+| `hashed` | `string[]` | Bcrypt-hashed codes to store in the database |
+
+### Code format
+
+Each code follows the pattern `xxxxxxxx-xxxxxxxx` — 16 hexadecimal characters separated by a hyphen, providing 64 bits of entropy per code.
+
+```
+a1b2c3d4-e5f6a7b8
+```
+
+### Example: 2FA setup
+
+```typescript
+import { createTOTP, createHash, generateRecoveryCodes } from 'ideal-auth';
+
+const hash = createHash();
+const totp = createTOTP();
+
+async function enableTwoFactor(userId: string) {
+  const secret = totp.generateSecret();
+
+  const { codes, hashed } = await generateRecoveryCodes(hash);
+
+  await db.user.update({
+    where: { id: userId },
+    data: {
+      totpSecret: secret,
+      recoveryCodes: hashed, // Store hashed codes
+    },
+  });
+
+  // Return the plain-text codes and QR URI to the user
+  return {
+    qrUri: totp.generateQrUri({
+      secret,
+      issuer: 'My App',
+      account: 'user@example.com',
+    }),
+    recoveryCodes: codes, // Show these once, never again
+  };
+}
+```
+
+:::caution
+Display the plain-text `codes` array to the user exactly **once** during 2FA setup. These codes cannot be recovered from the hashed values. Instruct the user to save them in a secure location.
+:::
+
+---
+
+## verifyRecoveryCode
+
+### Signature
+
+```typescript
+function verifyRecoveryCode(
+  code: string,
+  hashedCodes: string[],
+  hash: HashInstance,
+): Promise<{ valid: boolean; remaining: string[] }>
+```
+
+Verifies a recovery code against the stored hashed codes. If valid, returns the remaining hashed codes with the matched entry removed.
+
+```typescript
+import { verifyRecoveryCode, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+const { valid, remaining } = await verifyRecoveryCode(
+  'a1b2c3d4-e5f6a7b8',
+  user.recoveryCodes,
+  hash,
+);
+```
+
+| Parameter | Type | Description |
+|---|---|---|
+| `code` | `string` | The plain-text recovery code entered by the user |
+| `hashedCodes` | `string[]` | The array of bcrypt-hashed codes stored in the database |
+| `hash` | [`HashInstance`](/ideal-auth/api/create-hash/) | A hash instance created by `createHash()` |
+
+### Return value
+
+| Field | Type | Description |
+|---|---|---|
+| `valid` | `boolean` | Whether the code matched any of the hashed codes |
+| `remaining` | `string[]` | The hashed codes array with the matched code removed |
+
+:::caution
+Always update the stored codes to `remaining` after a successful verification. This ensures each recovery code can only be used once.
+:::
+
+### Example: recovery code login
+
+```typescript
+import { verifyRecoveryCode, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+async function loginWithRecoveryCode(userId: string, code: string) {
+  const user = await db.user.findUnique({ where: { id: userId } });
+
+  if (!user || !user.recoveryCodes) {
+    return { error: 'Invalid recovery code.' };
+  }
+
+  const { valid, remaining } = await verifyRecoveryCode(
+    code,
+    user.recoveryCodes,
+    hash,
+  );
+
+  if (!valid) {
+    return { error: 'Invalid recovery code.' };
+  }
+
+  // Remove the used code from the stored set
+  await db.user.update({
+    where: { id: userId },
+    data: { recoveryCodes: remaining },
+  });
+
+  // Complete the login
+  await auth().loginById(userId);
+
+  return { success: true };
+}
+```
+
+---
+
+## Types
+
+```typescript
+import type { TOTPConfig, TOTPInstance } from 'ideal-auth';
+```

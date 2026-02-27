@@ -1,0 +1,279 @@
+---
+title: createTokenVerifier
+description: API reference for createTokenVerifier — signed expiring tokens.
+---
+
+## Signature
+
+```typescript
+function createTokenVerifier(config: TokenVerifierConfig): TokenVerifierInstance
+```
+
+Creates a token verifier for generating and validating signed, expiring tokens. Useful for password reset links, email verification, magic links, and similar one-time-use flows.
+
+```typescript
+import { createTokenVerifier } from 'ideal-auth';
+
+const passwordResetTokens = createTokenVerifier({
+  secret: process.env.AUTH_SECRET!,
+});
+```
+
+:::danger
+The `secret` must be at least **32 characters**. `createTokenVerifier` throws immediately if the secret is shorter.
+:::
+
+:::tip
+Use a **different secret** (or a derived secret) for each use case. This prevents a token created for password resets from being accepted by an email verification flow.
+
+```typescript
+const passwordResetTokens = createTokenVerifier({
+  secret: process.env.AUTH_SECRET! + ':password-reset',
+});
+
+const emailVerificationTokens = createTokenVerifier({
+  secret: process.env.AUTH_SECRET! + ':email-verification',
+});
+```
+:::
+
+---
+
+## TokenVerifierConfig
+
+```typescript
+interface TokenVerifierConfig {
+  secret: string;
+  expiryMs?: number;
+}
+```
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `secret` | `string` | Yes | — |
+| `expiryMs` | `number` (milliseconds) | No | `3600000` (1 hour) |
+
+### secret
+
+The secret used to sign and verify tokens. Must be at least 32 characters.
+
+### expiryMs
+
+Token lifetime in milliseconds. After this duration, `verifyToken` returns `null`.
+
+```typescript
+// Tokens expire in 15 minutes
+const shortLivedTokens = createTokenVerifier({
+  secret: process.env.AUTH_SECRET!,
+  expiryMs: 15 * 60 * 1000,
+});
+
+// Tokens expire in 24 hours
+const longLivedTokens = createTokenVerifier({
+  secret: process.env.AUTH_SECRET!,
+  expiryMs: 24 * 60 * 60 * 1000,
+});
+```
+
+---
+
+## TokenVerifierInstance
+
+### createToken
+
+```typescript
+createToken(userId: string): string
+```
+
+Generates a signed token for the given user ID. The token encodes the user ID, a random identifier, creation time, expiration time, and an HMAC signature.
+
+```typescript
+const tokens = createTokenVerifier({
+  secret: process.env.AUTH_SECRET!,
+});
+
+const token = tokens.createToken('user_abc123');
+// "dXNlcl9hYmMxMjM.k8f3j2m1.1709136000000.1709139600000.a1b2c3d4..."
+```
+
+**Token format:**
+
+The token is a dot-separated string with 5 parts:
+
+```
+base64url(userId).randomId.iat.exp.signature
+```
+
+| Part | Description |
+|---|---|
+| `base64url(userId)` | The user ID, base64url-encoded to support dots and special characters |
+| `randomId` | A random identifier unique to this token |
+| `iat` | Issued-at timestamp in milliseconds (`Date.now()` at creation) |
+| `exp` | Expiration timestamp in milliseconds (`iat + expiryMs`) |
+| `signature` | HMAC-SHA256 signature covering all four preceding fields |
+
+### verifyToken
+
+```typescript
+verifyToken(token: string): { userId: string; iatMs: number } | null
+```
+
+Validates a token's signature and checks that it has not expired. Returns the decoded payload on success, or `null` if the token is invalid, expired, or tampered with.
+
+```typescript
+const tokens = createTokenVerifier({
+  secret: process.env.AUTH_SECRET!,
+});
+
+const result = tokens.verifyToken(token);
+
+if (!result) {
+  return { error: 'Invalid or expired token.' };
+}
+
+// result.userId  — the user ID encoded in the token
+// result.iatMs   — creation timestamp in milliseconds
+```
+
+Returns `null` when:
+- The token format is malformed (wrong number of segments)
+- The signature does not match (token was tampered with)
+- The token has expired (`Date.now() > exp`)
+
+---
+
+## Invalidation patterns
+
+Tokens are **stateless** — there is no token store to revoke. Use the `iatMs` field to implement invalidation patterns without a database lookup per verification.
+
+### Invalidate after password change
+
+Store a `passwordChangedAt` timestamp on the user. Reject tokens issued before the last password change.
+
+```typescript
+async function handlePasswordReset(token: string, newPassword: string) {
+  const result = tokens.verifyToken(token);
+
+  if (!result) {
+    return { error: 'Invalid or expired token.' };
+  }
+
+  const user = await db.user.findUnique({
+    where: { id: result.userId },
+  });
+
+  if (!user) {
+    return { error: 'User not found.' };
+  }
+
+  // Reject if token was issued before the last password change
+  if (user.passwordChangedAt && result.iatMs < user.passwordChangedAt.getTime()) {
+    return { error: 'This token has already been used.' };
+  }
+
+  const hashedPassword = await hash.make(newPassword);
+
+  await db.user.update({
+    where: { id: user.id },
+    data: {
+      password: hashedPassword,
+      passwordChangedAt: new Date(),
+    },
+  });
+
+  return { success: true };
+}
+```
+
+### Single-use tokens
+
+Store the token's `iatMs` or a nonce in the database and check it during verification.
+
+```typescript
+async function verifyEmail(token: string) {
+  const result = tokens.verifyToken(token);
+
+  if (!result) {
+    return { error: 'Invalid or expired token.' };
+  }
+
+  const user = await db.user.findUnique({
+    where: { id: result.userId },
+  });
+
+  if (!user || user.emailVerifiedAt) {
+    return { error: 'Invalid token.' };
+  }
+
+  await db.user.update({
+    where: { id: user.id },
+    data: { emailVerifiedAt: new Date() },
+  });
+
+  return { success: true };
+}
+```
+
+---
+
+## Full example: password reset flow
+
+```typescript
+import { createTokenVerifier, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+const passwordResetTokens = createTokenVerifier({
+  secret: process.env.AUTH_SECRET! + ':password-reset',
+  expiryMs: 60 * 60 * 1000, // 1 hour
+});
+
+// Step 1: Generate a reset token and send it via email
+async function requestPasswordReset(email: string) {
+  const user = await db.user.findUnique({ where: { email } });
+
+  if (!user) {
+    // Return success even if user doesn't exist to prevent enumeration
+    return { success: true };
+  }
+
+  const token = passwordResetTokens.createToken(user.id);
+  const resetUrl = `https://example.com/reset-password?token=${token}`;
+
+  await sendEmail(user.email, 'Reset your password', resetUrl);
+
+  return { success: true };
+}
+
+// Step 2: Verify the token and update the password
+async function resetPassword(token: string, newPassword: string) {
+  const result = passwordResetTokens.verifyToken(token);
+
+  if (!result) {
+    return { error: 'Invalid or expired reset link.' };
+  }
+
+  const hashedPassword = await hash.make(newPassword);
+
+  await db.user.update({
+    where: { id: result.userId },
+    data: {
+      password: hashedPassword,
+      passwordChangedAt: new Date(),
+    },
+  });
+
+  return { success: true };
+}
+```
+
+---
+
+## Types
+
+```typescript
+import type {
+  TokenVerifierConfig,
+  TokenVerifierInstance,
+} from 'ideal-auth';
+```

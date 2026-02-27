@@ -1,0 +1,230 @@
+---
+title: Remember Me
+description: Implement persistent login sessions with ideal-auth.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+ideal-auth supports three session duration modes controlled by the `LoginOptions` parameter. This guide explains how each mode works, how to implement a "Remember me" checkbox, and how to customize durations.
+
+## Three session modes
+
+The `remember` option in `LoginOptions` controls session duration:
+
+| `remember` value | Cookie behavior | Default duration |
+|-----------------|----------------|------------------|
+| `true` | Persistent cookie with `maxAge` | 30 days |
+| `false` | Session cookie (no `maxAge`) | Until browser closes |
+| `undefined` (omitted) | Persistent cookie with `maxAge` | 7 days |
+
+```ts
+interface LoginOptions {
+  remember?: boolean;
+}
+```
+
+### `remember: true` -- 30-day session
+
+The cookie is set with `maxAge: 2592000` (30 days). The session persists across browser restarts.
+
+```ts
+await session.login(user, { remember: true });
+```
+
+### `remember: false` -- session cookie
+
+The cookie is set without a `maxAge`, making it a session cookie. The browser deletes it when the user closes their browser.
+
+```ts
+await session.login(user, { remember: false });
+```
+
+<Aside>
+  "Session cookie" here refers to the browser's definition: a cookie with no expiration date that is deleted when the browsing session ends. This is different from ideal-auth's session payload, which always contains an `exp` (expiration) timestamp.
+</Aside>
+
+### No option (default) -- 7-day session
+
+When `remember` is not passed, the cookie is set with `maxAge: 604800` (7 days).
+
+```ts
+await session.login(user);
+// or equivalently:
+await session.attempt(credentials);
+```
+
+## Login form checkbox
+
+The most common pattern is a checkbox on the login form that controls the `remember` option.
+
+### Client-side form
+
+```html
+<form action="/api/auth/login" method="POST">
+  <label>
+    Email
+    <input type="email" name="email" required />
+  </label>
+  <label>
+    Password
+    <input type="password" name="password" required />
+  </label>
+  <label>
+    <input type="checkbox" name="remember" value="true" />
+    Remember me
+  </label>
+  <button type="submit">Sign in</button>
+</form>
+```
+
+### Server-side handler
+
+```ts
+import { createAuth, createHash } from 'ideal-auth';
+
+const hash = createHash();
+const auth = createAuth({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  hash,
+  resolveUser: (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+
+// POST /api/auth/login
+export async function login(req, res) {
+  const { email, password, remember } = req.body;
+
+  const session = auth();
+  const success = await session.attempt(
+    { email, password },
+    { remember: remember === 'true' },
+  );
+
+  if (!success) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  return res.json({ success: true });
+}
+```
+
+<Aside type="tip">
+  Form checkboxes submit as a string `"true"` when checked and are absent when unchecked. Parse accordingly: `remember === 'true'` gives you a boolean `true` when checked, and `false` when unchecked. Since `false` is an explicit value, it creates a session cookie. If you want the default 7-day behavior when unchecked, use `remember === 'true' ? true : undefined` instead.
+</Aside>
+
+### Choosing between "unchecked = session cookie" and "unchecked = default"
+
+There are two common interpretations of an unchecked "Remember me" box:
+
+**Option A: Unchecked means session cookie (closes with browser)**
+```ts
+const options = { remember: remember === 'true' };
+// checked → { remember: true }  → 30 days
+// unchecked → { remember: false } → session cookie
+```
+
+**Option B: Unchecked means default duration**
+```ts
+const options = remember === 'true' ? { remember: true } : {};
+// checked → { remember: true }  → 30 days
+// unchecked → {}                 → 7 days (default)
+```
+
+Option A is the traditional behavior. Option B is more user-friendly since sessions survive browser restarts even when the user forgets to check the box.
+
+## Configuring custom durations
+
+Override the default durations in your `createAuth` config:
+
+```ts
+const auth = createAuth({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  session: {
+    maxAge: 60 * 60 * 24 * 3,      // 3 days (default, when remember is omitted)
+    rememberMaxAge: 60 * 60 * 24 * 90, // 90 days (when remember: true)
+  },
+  resolveUser: (id) => db.user.findUnique({ where: { id } }),
+  // ...
+});
+```
+
+| Config option | Default | Controls |
+|--------------|---------|----------|
+| `session.maxAge` | `604800` (7 days) | Duration when `remember` is omitted |
+| `session.rememberMaxAge` | `2592000` (30 days) | Duration when `remember: true` |
+
+When `remember: false`, the cookie has no `maxAge` regardless of these settings.
+
+## How it works internally
+
+When `login()` or `attempt()` is called:
+
+1. A session payload is created with `{ uid, iat, exp }` where `exp = iat + maxAge`
+2. The payload is encrypted using AES-256-GCM via iron-session
+3. The encrypted payload is set as a cookie:
+   - `remember: true` -- cookie `maxAge` is set to `rememberMaxAge`
+   - `remember: false` -- no cookie `maxAge` (session cookie)
+   - `remember` omitted -- cookie `maxAge` is set to `maxAge`
+
+The `exp` in the session payload always matches the cookie duration. Even if a session cookie somehow survives a browser restart (some browsers restore session cookies), the `exp` check in `unseal` will reject it once the intended duration has passed.
+
+## Security tradeoffs
+
+Longer sessions are more convenient but carry more risk:
+
+- **Shared or public computers**: A 30-day session on a shared computer means the next person can access the account for a month. This is why "Remember me" should always be an explicit opt-in.
+
+- **Stolen sessions**: If a session cookie is compromised (via XSS, network interception, etc.), a longer session gives the attacker a larger window of access. ideal-auth mitigates this with `httpOnly` cookies (always forced on, preventing JavaScript access) and `secure` cookies (enforced in production, preventing transmission over HTTP).
+
+- **Password changes**: After a password change, all existing sessions remain valid until they expire. Use the `passwordChangedAt` check described in the [Password Reset](/ideal-auth/guides/password-reset/) guide to invalidate old sessions immediately.
+
+<Aside type="tip">
+  For sensitive applications (banking, healthcare), consider not offering "Remember me" at all and using a shorter default `maxAge`. For consumer applications, the 7-day default with 30-day "Remember me" provides a good balance.
+</Aside>
+
+## Complete example
+
+```ts
+import { createAuth, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+const auth = createAuth({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  hash,
+  session: {
+    cookieName: 'session',
+    maxAge: 60 * 60 * 24 * 7,        // 7 days
+    rememberMaxAge: 60 * 60 * 24 * 30, // 30 days
+    cookie: {
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: '/',
+    },
+  },
+  resolveUser: (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+
+// Login with remember me support
+export async function login(req, res) {
+  const { email, password, remember } = req.body;
+
+  const session = auth();
+  const success = await session.attempt(
+    { email, password },
+    { remember: remember === 'true' },
+  );
+
+  if (!success) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  return res.json({ success: true });
+}
+```

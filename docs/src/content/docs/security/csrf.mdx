@@ -1,0 +1,326 @@
+---
+title: CSRF Protection
+description: Cross-Site Request Forgery prevention strategies for each framework.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+ideal-auth does **not** handle CSRF protection. This is by design — CSRF mitigation is a framework-level concern, and every major framework has its own mechanism. This guide explains the threat and walks through prevention strategies for each supported framework.
+
+---
+
+## What is CSRF?
+
+Cross-Site Request Forgery (CSRF) is an attack where a malicious website tricks a user's browser into making an authenticated request to your application. Because the browser automatically attaches cookies (including session cookies) to every request to your domain, the attacker can perform actions as the logged-in user without their knowledge.
+
+**Example attack:**
+
+1. A user is logged into your application at `app.example.com`
+2. The user visits `evil.example.com`, which contains a hidden form:
+   ```html
+   <form action="https://app.example.com/api/transfer" method="POST">
+     <input type="hidden" name="to" value="attacker" />
+     <input type="hidden" name="amount" value="1000" />
+   </form>
+   <script>document.forms[0].submit();</script>
+   ```
+3. The browser submits the form with the user's session cookie attached
+4. Your server processes the transfer as if the user initiated it
+
+This is why CSRF protection matters for any application that uses cookie-based authentication — which includes ideal-auth.
+
+---
+
+## Why ideal-auth does not handle CSRF
+
+CSRF protection requires intercepting incoming requests before they reach your application logic. This is inherently framework-specific:
+
+- Next.js Server Actions have built-in protection
+- SvelteKit form actions have built-in protection
+- Express requires middleware
+- Hono has a built-in middleware
+
+Implementing CSRF at the auth library level would mean coupling to a specific framework's request/response model, which contradicts ideal-auth's framework-agnostic design. Instead, ideal-auth provides the **SameSite cookie attribute** (default: `lax`) as a foundational defense layer, and you add framework-specific CSRF protection on top.
+
+---
+
+## Framework-specific strategies
+
+<Tabs>
+  <TabItem label="Next.js">
+    **Server Actions** have built-in CSRF protection. Next.js automatically validates the `Origin` header on all Server Action requests and rejects cross-origin submissions. No configuration is needed.
+
+    **API Route Handlers** (`app/api/*/route.ts`) do **not** have automatic CSRF protection. If you accept state-changing requests via API routes, validate the `Origin` header manually:
+
+    ```ts title="app/api/example/route.ts"
+    import { headers } from 'next/headers';
+    import { NextResponse } from 'next/server';
+
+    export async function POST(request: Request) {
+      const headerStore = await headers();
+      const origin = headerStore.get('origin');
+      const host = headerStore.get('host');
+
+      if (!origin || new URL(origin).host !== host) {
+        return NextResponse.json(
+          { error: 'Invalid origin' },
+          { status: 403 },
+        );
+      }
+
+      // ... handle the request
+    }
+    ```
+
+    <Aside type="tip">
+      If all your state-changing operations use Server Actions (the recommended pattern), you already have CSRF protection with zero extra code.
+    </Aside>
+  </TabItem>
+
+  <TabItem label="SvelteKit">
+    **Form actions** have built-in CSRF protection. SvelteKit validates the `Origin` header against the server's host on all form action submissions and returns a `403` for mismatches.
+
+    This is enabled by default. You can verify it has not been disabled in your `svelte.config.js`:
+
+    ```js title="svelte.config.js"
+    const config = {
+      kit: {
+        // csrf.checkOrigin defaults to true — do not set it to false
+        csrf: {
+          checkOrigin: true,
+        },
+      },
+    };
+    ```
+
+    **Custom API endpoints** (`+server.ts`) do not receive automatic CSRF protection. Apply the same Origin header check:
+
+    ```ts title="src/routes/api/example/+server.ts"
+    import { error, json } from '@sveltejs/kit';
+    import type { RequestHandler } from './$types';
+
+    export const POST: RequestHandler = async ({ request, url }) => {
+      const origin = request.headers.get('origin');
+      if (!origin || new URL(origin).host !== url.host) {
+        throw error(403, 'Invalid origin');
+      }
+
+      // ... handle the request
+      return json({ ok: true });
+    };
+    ```
+  </TabItem>
+
+  <TabItem label="Nuxt">
+    Nuxt does not include built-in CSRF protection. Use the [nuxt-csrf](https://github.com/morgenstern-ui/nuxt-csurf) module or implement Origin header validation in server middleware:
+
+    **Option 1: nuxt-csrf module**
+
+    ```bash
+    npx nuxi module add nuxt-csurf
+    ```
+
+    The module automatically generates a CSRF token and validates it on form submissions.
+
+    **Option 2: Manual Origin check**
+
+    ```ts title="server/middleware/csrf.ts"
+    export default defineEventHandler((event) => {
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(event.method)) {
+        const origin = getHeader(event, 'origin');
+        const host = getHeader(event, 'host');
+
+        if (!origin || !host || new URL(origin).host !== host) {
+          throw createError({
+            statusCode: 403,
+            message: 'Invalid origin',
+          });
+        }
+      }
+    });
+    ```
+  </TabItem>
+
+  <TabItem label="TanStack Start">
+    TanStack Start does not include built-in CSRF protection. Validate the `Origin` header in your server functions:
+
+    ```ts title="app/lib/csrf.ts"
+    export function validateOrigin(request: Request): void {
+      const origin = request.headers.get('origin');
+      const host = request.headers.get('host');
+
+      if (!origin || !host || new URL(origin).host !== host) {
+        throw new Error('CSRF validation failed');
+      }
+    }
+    ```
+
+    Call this at the start of any server function that performs a state-changing operation:
+
+    ```ts title="app/routes/api/example.ts"
+    import { validateOrigin } from '../lib/csrf';
+
+    export const serverFn = createServerFn('POST', async (data, ctx) => {
+      validateOrigin(ctx.request);
+      // ... handle the request
+    });
+    ```
+  </TabItem>
+
+  <TabItem label="Express">
+    Use the double-submit cookie pattern or a dedicated CSRF middleware. The popular `csrf-csrf` package implements the double-submit pattern:
+
+    ```bash
+    npm install csrf-csrf
+    ```
+
+    ```ts title="src/middleware/csrf.ts"
+    import { doubleCsrf } from 'csrf-csrf';
+
+    const { doubleCsrfProtection, generateToken } = doubleCsrf({
+      getSecret: () => process.env.CSRF_SECRET!,
+      cookieName: '__csrf',
+      cookieOptions: {
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: process.env.NODE_ENV === 'production',
+        path: '/',
+      },
+      getTokenFromRequest: (req) => req.headers['x-csrf-token'] as string,
+    });
+
+    export { doubleCsrfProtection, generateToken };
+    ```
+
+    ```ts title="src/app.ts"
+    import express from 'express';
+    import { doubleCsrfProtection } from './middleware/csrf';
+
+    const app = express();
+
+    // Apply CSRF protection to all state-changing routes
+    app.use(doubleCsrfProtection);
+    ```
+  </TabItem>
+
+  <TabItem label="Hono">
+    Hono has a built-in `csrf()` middleware that validates the `Origin` header:
+
+    ```ts title="src/index.ts"
+    import { Hono } from 'hono';
+    import { csrf } from 'hono/csrf';
+
+    const app = new Hono();
+
+    app.use(csrf());
+    ```
+
+    By default, this checks the `Origin` header against the request's host. You can specify allowed origins:
+
+    ```ts
+    app.use(csrf({
+      origin: ['https://app.example.com', 'https://staging.example.com'],
+    }));
+    ```
+  </TabItem>
+
+  <TabItem label="Elysia">
+    Elysia does not include built-in CSRF protection. Validate the `Origin` header in a global `onBeforeHandle` hook:
+
+    ```ts title="src/index.ts"
+    import { Elysia } from 'elysia';
+
+    const app = new Elysia()
+      .onBeforeHandle((ctx) => {
+        if (ctx.request.method === 'GET' || ctx.request.method === 'HEAD') {
+          return;
+        }
+
+        const origin = ctx.request.headers.get('origin');
+        const host = ctx.request.headers.get('host');
+
+        if (!origin || !host || new URL(origin).host !== host) {
+          ctx.set.status = 403;
+          throw new Error('CSRF validation failed');
+        }
+      });
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## The double-submit cookie pattern
+
+If your framework does not provide built-in CSRF protection, the double-submit cookie pattern is a reliable framework-agnostic fallback. Here is how it works:
+
+1. **On page load**, the server sets a random CSRF token in a cookie (`sameSite: 'strict'`, **not** `httpOnly` — JavaScript needs to read it)
+2. **On form submission**, JavaScript reads the token from the cookie and includes it as a request header (e.g., `X-CSRF-Token`)
+3. **On the server**, the middleware compares the token in the header to the token in the cookie. If they match, the request is legitimate
+
+This works because:
+- A cross-origin attacker can cause the browser to **send** cookies, but cannot **read** cookies belonging to your domain
+- The attacker cannot set the `X-CSRF-Token` header because they cannot read the cookie value
+- `SameSite: strict` on the CSRF cookie prevents the cookie from being sent in cross-origin requests at all
+
+```ts title="Example: manual double-submit implementation"
+import { randomBytes } from 'node:crypto';
+
+// Generate and set the CSRF token cookie
+function setCsrfToken(setCookie: (name: string, value: string, options: any) => void): string {
+  const token = randomBytes(32).toString('hex');
+  setCookie('csrf_token', token, {
+    httpOnly: false,    // JavaScript must read this
+    sameSite: 'strict',
+    secure: process.env.NODE_ENV === 'production',
+    path: '/',
+  });
+  return token;
+}
+
+// Validate the CSRF token on incoming requests
+function validateCsrfToken(
+  cookieToken: string | undefined,
+  headerToken: string | undefined,
+): boolean {
+  if (!cookieToken || !headerToken) return false;
+  // Use timing-safe comparison
+  return cookieToken.length === headerToken.length &&
+    require('node:crypto').timingSafeEqual(
+      Buffer.from(cookieToken),
+      Buffer.from(headerToken),
+    );
+}
+```
+
+---
+
+## SameSite cookies as a defense layer
+
+ideal-auth defaults to `sameSite: 'lax'` on session cookies. This provides baseline CSRF protection by itself:
+
+| SameSite value | Behavior |
+|----------------|----------|
+| `strict` | Cookie is never sent in cross-origin requests. Maximum protection, but breaks legitimate navigation (e.g., clicking a link from an email) |
+| `lax` (default) | Cookie is sent for top-level navigations (GET) but **not** for cross-origin form submissions (POST). Protects against the most common CSRF vectors |
+| `none` | Cookie is always sent. Requires `secure: true`. No CSRF protection from this attribute |
+
+`SameSite: lax` blocks the classic CSRF attack (cross-origin POST) while still allowing users to follow links to your app without losing their session. For most applications, this is the correct default.
+
+<Aside type="caution">
+  `SameSite: lax` does not protect against CSRF in GET requests. Never perform state-changing operations in response to GET requests. All mutations should use POST, PUT, PATCH, or DELETE.
+</Aside>
+
+---
+
+## Summary
+
+| Framework | Forms/Actions | API Routes |
+|-----------|--------------|------------|
+| Next.js | Built-in (Server Actions) | Manual Origin check |
+| SvelteKit | Built-in (form actions) | Manual Origin check |
+| Nuxt | nuxt-csrf module or manual | nuxt-csrf module or manual |
+| TanStack Start | Manual Origin check | Manual Origin check |
+| Express | csrf-csrf or double-submit | csrf-csrf or double-submit |
+| Hono | Built-in csrf() middleware | Built-in csrf() middleware |
+| Elysia | Manual Origin check | Manual Origin check |

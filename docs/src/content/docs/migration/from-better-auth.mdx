@@ -1,0 +1,447 @@
+---
+title: Migrating from Better Auth
+description: Step-by-step guide to migrate from Better Auth to ideal-auth.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+This guide walks through migrating from [Better Auth](https://www.better-auth.com) to ideal-auth. Better Auth is a full-featured authentication framework that manages your database schema, sessions, and plugins. ideal-auth takes the opposite approach — it provides primitives and lets you manage everything else.
+
+---
+
+## Why migrate?
+
+**Better Auth manages your schema.** It creates and manages `users`, `sessions`, and `accounts` tables (plus more for plugins). If you need to change the schema, you work within Better Auth's constraints. ideal-auth does not touch your database — you write the queries, you own the schema entirely.
+
+**Better Auth uses server-side sessions.** Every session check requires a database query to validate the session ID. ideal-auth uses encrypted cookies (iron-session), so session validation is a cryptographic operation with no database round-trip. This reduces latency and database load, especially at scale.
+
+**Simpler dependency tree.** Better Auth includes adapters, plugins, OAuth handling, and a client-side SDK. ideal-auth has two runtime dependencies (`iron-session` and `bcryptjs`) and zero framework dependencies. Less code means less to audit and fewer potential vulnerabilities.
+
+**No plugin architecture.** Better Auth's plugin system (2FA, magic link, anonymous auth, etc.) adds features through a plugin API with lifecycle hooks. ideal-auth provides TOTP, recovery codes, token verification, and rate limiting as standalone functions. You compose them yourself — no plugin lifecycle, no implicit state changes.
+
+---
+
+## Key differences
+
+| Concept | Better Auth | ideal-auth |
+|---------|-------------|------------|
+| Session storage | Database (sessions table) | Encrypted cookie (iron-session) |
+| Schema management | Managed by Better Auth | You manage your own schema |
+| Database access | Built-in adapters (Prisma, Drizzle, Kysely, etc.) | You write the queries (`resolveUser`, `resolveUserByCredentials`) |
+| Session check | Database lookup per request | Cryptographic verification (no DB query) |
+| Login | `signIn.email({ email, password })` | `session.attempt({ email, password })` |
+| Logout | `signOut()` | `session.logout()` |
+| Get session | `useSession()` (client) or `auth.api.getSession()` | `session.user()` (server-side only) |
+| 2FA | Plugin (`twoFactor()`) | Built-in (`createTOTP`, `generateRecoveryCodes`) |
+| OAuth | Built-in with `socialProviders` | Not included — use [Arctic](https://arcticjs.dev) |
+| Rate limiting | Not built-in | Built-in (`createRateLimiter`) |
+| Token verification | Not built-in (sessions used for everything) | Built-in (`createTokenVerifier`) for reset/verify flows |
+| Client SDK | `createAuthClient()` | None — server-side only, pass data via props |
+
+---
+
+## Migration steps
+
+<Steps>
+
+1. ### Map your existing schema
+
+   Better Auth typically creates these tables:
+
+   - `users` — id, name, email, emailVerified, image, createdAt, updatedAt
+   - `sessions` — id, userId, token, expiresAt, ipAddress, userAgent, createdAt, updatedAt
+   - `accounts` — id, userId, accountId, providerId, accessToken, refreshToken, etc.
+
+   With ideal-auth, you keep the `users` table (adding a `password` column if you do not have one) and drop the `sessions` and `accounts` tables (sessions are now cookie-based). If you use OAuth, keep the `accounts` table for linking OAuth providers to users.
+
+   ```sql
+   -- Ensure your users table has a password column
+   ALTER TABLE users ADD COLUMN IF NOT EXISTS password VARCHAR(255);
+
+   -- After migration is complete, you can drop these:
+   -- DROP TABLE sessions;
+   -- DROP TABLE accounts; -- only if you no longer need OAuth
+   ```
+
+   <Aside type="caution">
+     Do not drop the `sessions` table until all active Better Auth sessions have expired or you have fully migrated. Dropping it while Better Auth is still running will log out all users immediately.
+   </Aside>
+
+2. ### Install ideal-auth
+
+   ```bash
+   bun add ideal-auth
+   ```
+
+   Add the session secret to your environment:
+
+   ```bash title=".env"
+   IDEAL_AUTH_SECRET="your-32-character-or-longer-secret"
+   ```
+
+3. ### Create the auth configuration
+
+   ```ts title="lib/auth.ts"
+   import { createAuth, createHash } from 'ideal-auth';
+
+   type User = {
+     id: string;
+     email: string;
+     name: string;
+     password: string;
+   };
+
+   export const hash = createHash({ rounds: 12 });
+
+   export const auth = createAuth<User>({
+     secret: process.env.IDEAL_AUTH_SECRET!,
+     cookie: createCookieBridge(), // see framework guides for your framework
+     hash,
+
+     async resolveUser(id) {
+       // This replaces Better Auth's adapter.findUserById
+       return db.user.findUnique({ where: { id } });
+     },
+
+     async resolveUserByCredentials(credentials) {
+       // This replaces Better Auth's credential verification
+       return db.user.findUnique({
+         where: { email: credentials.email },
+       });
+     },
+   });
+   ```
+
+   <Aside type="tip">
+     See the [Framework Guides](/ideal-auth/frameworks/nextjs/) for complete cookie bridge implementations for your framework.
+   </Aside>
+
+4. ### Replace signIn.email with session.attempt
+
+   **Before (Better Auth):**
+   ```ts
+   // Client-side
+   import { authClient } from '@/lib/auth-client';
+
+   const { data, error } = await authClient.signIn.email({
+     email: 'user@example.com',
+     password: 'password123',
+   });
+   ```
+
+   **After (ideal-auth):**
+   ```ts title="app/actions/login.ts"
+   'use server';
+
+   import { redirect } from 'next/navigation';
+   import { auth } from '@/lib/auth';
+
+   export async function loginAction(_prev: unknown, formData: FormData) {
+     const email = formData.get('email') as string;
+     const password = formData.get('password') as string;
+
+     if (!email || !password) {
+       return { error: 'Email and password are required.' };
+     }
+
+     const session = auth();
+     const success = await session.attempt({ email, password });
+
+     if (!success) {
+       return { error: 'Invalid email or password.' };
+     }
+
+     redirect('/dashboard');
+   }
+   ```
+
+   <Aside>
+     Better Auth's `signIn.email` is a client-to-server API call. ideal-auth's `session.attempt` runs server-side (in a Server Action, API route, or server function). This means no client SDK and no client-side auth state — the session is managed entirely through cookies.
+   </Aside>
+
+5. ### Replace signOut with session.logout
+
+   **Before (Better Auth):**
+   ```ts
+   await authClient.signOut();
+   ```
+
+   **After (ideal-auth):**
+   ```ts title="app/actions/logout.ts"
+   'use server';
+
+   import { redirect } from 'next/navigation';
+   import { auth } from '@/lib/auth';
+
+   export async function logoutAction() {
+     const session = auth();
+     await session.logout();
+     redirect('/login');
+   }
+   ```
+
+6. ### Replace useSession with server-side session access
+
+   **Before (Better Auth):**
+   ```tsx
+   // Client component
+   import { authClient } from '@/lib/auth-client';
+
+   function Dashboard() {
+     const { data: session, isPending } = authClient.useSession();
+
+     if (isPending) return <p>Loading...</p>;
+     if (!session) redirect('/login');
+
+     return <p>Welcome, {session.user.name}</p>;
+   }
+   ```
+
+   **After (ideal-auth):**
+
+   ideal-auth does not provide a client-side session hook. Fetch the user server-side and pass data as props:
+
+   ```tsx title="app/dashboard/page.tsx"
+   import { auth } from '@/lib/auth';
+   import { redirect } from 'next/navigation';
+   import { DashboardClient } from './dashboard-client';
+
+   export default async function DashboardPage() {
+     const session = auth();
+     const user = await session.user();
+
+     if (!user) {
+       redirect('/login');
+     }
+
+     return (
+       <DashboardClient
+         user={{ id: user.id, name: user.name, email: user.email }}
+       />
+     );
+   }
+   ```
+
+   ```tsx title="app/dashboard/dashboard-client.tsx"
+   'use client';
+
+   type Props = {
+     user: { id: string; name: string; email: string };
+   };
+
+   export function DashboardClient({ user }: Props) {
+     return <p>Welcome, {user.name}</p>;
+   }
+   ```
+
+7. ### Migrate 2FA
+
+   If you are using Better Auth's `twoFactor()` plugin, migrate to ideal-auth's built-in TOTP:
+
+   **Before (Better Auth):**
+   ```ts
+   // Server config
+   import { twoFactor } from 'better-auth/plugins';
+
+   export const auth = betterAuth({
+     plugins: [twoFactor()],
+   });
+
+   // Client
+   const { data } = await authClient.twoFactor.enable({ password });
+   await authClient.twoFactor.verifyTotp({ code });
+   ```
+
+   **After (ideal-auth):**
+   ```ts title="lib/totp.ts"
+   import { createTOTP, generateRecoveryCodes, verifyRecoveryCode } from 'ideal-auth';
+   import { hash } from './auth';
+
+   export const totp = createTOTP({
+     digits: 6,
+     period: 30,
+     window: 1,
+   });
+   ```
+
+   ```ts title="app/actions/2fa-setup.ts"
+   'use server';
+
+   import { totp } from '@/lib/totp';
+   import { hash } from '@/lib/auth';
+   import { encrypt } from 'ideal-auth';
+   import { generateRecoveryCodes } from 'ideal-auth';
+   import { db } from '@/lib/db';
+
+   export async function enable2FA(userId: string) {
+     // Generate TOTP secret
+     const secret = totp.generateSecret();
+
+     // Generate recovery codes
+     const { codes, hashed } = await generateRecoveryCodes(hash);
+
+     // Generate QR URI for authenticator app
+     const user = await db.user.findUnique({ where: { id: userId } });
+     const qrUri = totp.generateQrUri({
+       secret,
+       issuer: 'YourApp',
+       account: user!.email,
+     });
+
+     // Store encrypted secret and hashed recovery codes
+     const encryptedSecret = await encrypt(secret, process.env.TOTP_KEY!);
+     await db.user.update({
+       where: { id: userId },
+       data: {
+         totpSecret: encryptedSecret,
+         recoveryCodes: hashed,
+         twoFactorEnabled: true,
+       },
+     });
+
+     // Return codes to show the user (one time only)
+     return { qrUri, recoveryCodes: codes };
+   }
+   ```
+
+   ```ts title="app/actions/2fa-verify.ts"
+   'use server';
+
+   import { totp } from '@/lib/totp';
+   import { decrypt } from 'ideal-auth';
+   import { db } from '@/lib/db';
+
+   export async function verify2FA(userId: string, code: string) {
+     const user = await db.user.findUnique({ where: { id: userId } });
+     if (!user?.totpSecret) return { error: '2FA is not enabled.' };
+
+     const secret = await decrypt(user.totpSecret, process.env.TOTP_KEY!);
+     const isValid = totp.verify(code, secret);
+
+     if (!isValid) {
+       return { error: 'Invalid code.' };
+     }
+
+     return { success: true };
+   }
+   ```
+
+   Better Auth stores 2FA state in the `accounts` table via its plugin system. With ideal-auth, you add `totpSecret`, `recoveryCodes`, and `twoFactorEnabled` columns to your `users` table (or a separate table) and manage the state yourself.
+
+8. ### Remove Better Auth
+
+   Once all flows are migrated and tested:
+
+   ```bash
+   bun remove better-auth
+   ```
+
+   Delete:
+   - `lib/auth.ts` (Better Auth server config) — replace with your ideal-auth config
+   - `lib/auth-client.ts` (Better Auth client) — no longer needed
+   - `app/api/auth/[...all]/route.ts` (Better Auth API route) — no longer needed
+   - Better Auth migration files if you used `npx @better-auth/cli migrate`
+
+   After confirming all users can log in with the new system:
+
+   ```sql
+   -- Drop Better Auth's session table (sessions are now cookie-based)
+   DROP TABLE IF EXISTS sessions;
+
+   -- Drop accounts table only if you no longer need OAuth provider linking
+   -- DROP TABLE IF EXISTS accounts;
+   ```
+
+</Steps>
+
+---
+
+## Schema migration
+
+Better Auth manages specific tables. Here is what to keep and what to drop:
+
+| Better Auth table | Action | Notes |
+|-------------------|--------|-------|
+| `users` | **Keep** | Add `password` column if missing. Add `totpSecret`, `recoveryCodes`, `twoFactorEnabled` if migrating 2FA. |
+| `sessions` | **Drop** (after migration) | ideal-auth uses encrypted cookies, not database sessions |
+| `accounts` | **Keep if using OAuth** | Stores OAuth provider links. Keep if you plan to use Arctic for OAuth. |
+| `verifications` | **Drop** (after migration) | Replace with `createTokenVerifier` for email verification and password reset flows |
+
+<Aside>
+  If Better Auth hashed passwords using bcrypt (the default), ideal-auth can verify them directly — bcrypt hashes are compatible. No rehashing is needed for existing users.
+</Aside>
+
+---
+
+## Session storage comparison
+
+This is the most significant architectural difference:
+
+**Better Auth** stores sessions in your database. Every `auth.api.getSession()` call queries the `sessions` table. This means:
+- Session invalidation is easy (delete the row)
+- Every page load hits the database
+- Horizontal scaling requires a shared database or session store
+
+**ideal-auth** stores sessions in encrypted cookies. Every `session.user()` call decrypts the cookie (no database query for session validation — only for user resolution via `resolveUser`). This means:
+- No session table, no session garbage collection
+- Session validation is CPU-only (cryptographic decryption)
+- Horizontal scaling requires no shared state
+- Session invalidation requires patterns described in the [Session Invalidation](/ideal-auth/security/session-invalidation/) guide
+
+For most applications, the encrypted cookie approach is simpler and faster. If you need server-side session revocation (e.g., "logout everywhere"), see the [Session Invalidation](/ideal-auth/security/session-invalidation/) guide for practical patterns.
+
+---
+
+## Handling OAuth users
+
+If you used Better Auth's `socialProviders` for OAuth login, you have users in the `accounts` table linked to OAuth providers. These users may not have a password.
+
+**Recommended approach:** Use [Arctic](https://arcticjs.dev) for OAuth. After verifying the OAuth token, look up the user via their `accounts` record and call `session.login(user)`:
+
+```ts
+import { GitHub } from 'arctic';
+import { auth } from '@/lib/auth';
+
+const github = new GitHub(
+  process.env.GITHUB_CLIENT_ID!,
+  process.env.GITHUB_CLIENT_SECRET!,
+  null,
+);
+
+export async function handleGitHubCallback(code: string) {
+  const tokens = await github.validateAuthorizationCode(code);
+  const githubUser = await fetchGitHubUser(tokens.accessToken());
+
+  // Find user via accounts table (your existing Better Auth data)
+  const account = await db.account.findFirst({
+    where: {
+      providerId: 'github',
+      accountId: String(githubUser.id),
+    },
+    include: { user: true },
+  });
+
+  if (!account) {
+    // New OAuth user — create user and account
+    const user = await db.user.create({
+      data: { email: githubUser.email, name: githubUser.name },
+    });
+    await db.account.create({
+      data: {
+        userId: user.id,
+        providerId: 'github',
+        accountId: String(githubUser.id),
+      },
+    });
+    const session = auth();
+    await session.login(user);
+    return;
+  }
+
+  // Existing user — log them in
+  const session = auth();
+  await session.login(account.user);
+}
+```
+
+This lets OAuth-only users continue logging in without ever setting a password.

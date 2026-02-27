@@ -1,0 +1,326 @@
+---
+title: Open Redirect Prevention
+description: Prevent attackers from redirecting users to malicious sites after login.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Open redirects are one of the most common vulnerabilities in authentication flows. They are easy to introduce and easy to prevent. This guide explains the threat and provides concrete implementations for every supported framework.
+
+---
+
+## What is an open redirect?
+
+An open redirect occurs when your application redirects users to a URL taken from user input without validating it. In auth flows, the most common pattern is a "redirect after login" parameter:
+
+```
+https://app.example.com/login?redirect=/dashboard
+```
+
+After the user logs in, your application redirects them to `/dashboard`. This is a good user experience — the user lands where they intended to go.
+
+The vulnerability appears when an attacker modifies the redirect parameter:
+
+```
+https://app.example.com/login?redirect=https://evil.example.com/phishing
+```
+
+If your application blindly redirects to this URL after login, the user lands on an attacker-controlled page. Because the login happened on your legitimate domain, the user trusts the redirect. The phishing page can then:
+
+- Display a fake "session expired" message and collect credentials again
+- Mimic your application's UI to steal sensitive data
+- Serve malware
+
+---
+
+## Why this matters for auth
+
+Open redirects are particularly dangerous in authentication flows because:
+
+1. **Trust is at its highest.** The user just entered their password on your real login page. They trust the next page they see.
+2. **The URL looks legitimate.** The initial link points to your domain, which passes URL inspection by security-conscious users.
+3. **It bypasses phishing defenses.** Email filters and browser warnings check the link domain, which is yours. The redirect happens after the click.
+
+---
+
+## Prevention: validate redirect URLs
+
+The rule is simple: **never redirect to user-supplied absolute URLs**. Only allow relative paths.
+
+### The `safeRedirect` function
+
+```ts title="lib/safe-redirect.ts"
+/**
+ * Validates a redirect URL to prevent open redirect attacks.
+ * Only allows relative paths (starting with "/", not "//").
+ * Returns the fallback URL if the input is invalid.
+ */
+export function safeRedirect(url: string | null | undefined, fallback = '/'): string {
+  if (
+    !url ||
+    !url.startsWith('/') ||
+    url.startsWith('//') ||
+    url.startsWith('/\\') ||
+    url.includes('://')
+  ) {
+    return fallback;
+  }
+
+  return url;
+}
+```
+
+This function rejects:
+
+| Input | Reason | Result |
+|-------|--------|--------|
+| `null` / `undefined` / `""` | Missing | Fallback |
+| `https://evil.com` | Absolute URL with protocol | Fallback |
+| `//evil.com` | Protocol-relative URL (browser follows it) | Fallback |
+| `/\evil.com` | Backslash trick (some browsers normalize `\` to `/`) | Fallback |
+| `javascript:alert(1)` | Does not start with `/` | Fallback |
+| `/dashboard` | Valid relative path | `/dashboard` |
+| `/settings/profile` | Valid relative path | `/settings/profile` |
+
+<Aside type="caution">
+  The check for `//` is critical. A URL like `//evil.com/path` is a valid protocol-relative URL. The browser will follow it using the current page's protocol (e.g., `https://evil.com/path`). It looks like a relative path but is actually an absolute URL to a different domain.
+</Aside>
+
+---
+
+## Integration with login flows
+
+### Step 1: Pass the redirect parameter to the login page
+
+When redirecting an unauthenticated user to the login page, include their intended destination:
+
+```ts
+// In middleware or a route guard
+const loginUrl = new URL('/login', request.url);
+loginUrl.searchParams.set('redirect', request.nextUrl.pathname);
+return NextResponse.redirect(loginUrl);
+```
+
+### Step 2: Include the redirect in the login form
+
+```tsx title="Login form"
+export default function LoginPage({
+  searchParams,
+}: {
+  searchParams: { redirect?: string };
+}) {
+  return (
+    <form action={loginAction}>
+      <input
+        type="hidden"
+        name="redirect"
+        value={searchParams.redirect ?? '/dashboard'}
+      />
+      {/* email, password fields */}
+      <button type="submit">Sign in</button>
+    </form>
+  );
+}
+```
+
+### Step 3: Validate before redirecting
+
+```ts title="Login action"
+import { safeRedirect } from '@/lib/safe-redirect';
+
+export async function loginAction(_prev: unknown, formData: FormData) {
+  const email = formData.get('email') as string;
+  const password = formData.get('password') as string;
+  const redirectTo = formData.get('redirect') as string;
+
+  const session = auth();
+  const success = await session.attempt({ email, password });
+
+  if (!success) {
+    return { error: 'Invalid email or password.' };
+  }
+
+  // Validate the redirect URL — never trust user input
+  redirect(safeRedirect(redirectTo, '/dashboard'));
+}
+```
+
+---
+
+## Framework-specific examples
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/actions/login.ts"
+    'use server';
+
+    import { redirect } from 'next/navigation';
+    import { auth } from '@/lib/auth';
+    import { safeRedirect } from '@/lib/safe-redirect';
+
+    export async function loginAction(_prev: unknown, formData: FormData) {
+      const email = formData.get('email') as string;
+      const password = formData.get('password') as string;
+      const redirectTo = formData.get('redirect') as string;
+
+      if (!email || !password) {
+        return { error: 'Email and password are required.' };
+      }
+
+      const session = auth();
+      const success = await session.attempt({ email, password });
+
+      if (!success) {
+        return { error: 'Invalid email or password.' };
+      }
+
+      redirect(safeRedirect(redirectTo, '/dashboard'));
+    }
+    ```
+
+    ```ts title="middleware.ts"
+    import { NextResponse } from 'next/server';
+    import type { NextRequest } from 'next/server';
+
+    export function middleware(request: NextRequest) {
+      const hasSession = request.cookies.has('ideal_session');
+
+      if (!hasSession) {
+        const loginUrl = new URL('/login', request.url);
+        loginUrl.searchParams.set('redirect', request.nextUrl.pathname);
+        return NextResponse.redirect(loginUrl);
+      }
+
+      return NextResponse.next();
+    }
+    ```
+  </TabItem>
+
+  <TabItem label="SvelteKit">
+    ```ts title="src/routes/login/+page.server.ts"
+    import { redirect, fail } from '@sveltejs/kit';
+    import type { Actions, PageServerLoad } from './$types';
+    import { auth } from '$lib/auth';
+    import { safeRedirect } from '$lib/safe-redirect';
+
+    export const load: PageServerLoad = async ({ url }) => {
+      return {
+        redirect: url.searchParams.get('redirect') ?? '/dashboard',
+      };
+    };
+
+    export const actions: Actions = {
+      default: async ({ request, cookies }) => {
+        const formData = await request.formData();
+        const email = formData.get('email') as string;
+        const password = formData.get('password') as string;
+        const redirectTo = formData.get('redirect') as string;
+
+        if (!email || !password) {
+          return fail(400, { error: 'Email and password are required.' });
+        }
+
+        const session = auth(cookies);
+        const success = await session.attempt({ email, password });
+
+        if (!success) {
+          return fail(401, { error: 'Invalid email or password.' });
+        }
+
+        throw redirect(303, safeRedirect(redirectTo, '/dashboard'));
+      },
+    };
+    ```
+  </TabItem>
+
+  <TabItem label="Express">
+    ```ts title="src/routes/auth.ts"
+    import { Router } from 'express';
+    import { auth } from '../lib/auth';
+    import { safeRedirect } from '../lib/safe-redirect';
+
+    const router = Router();
+
+    router.post('/login', async (req, res) => {
+      const { email, password, redirect: redirectTo } = req.body;
+
+      const session = auth(req, res);
+      const success = await session.attempt({ email, password });
+
+      if (!success) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+
+      res.redirect(safeRedirect(redirectTo, '/dashboard'));
+    });
+
+    export default router;
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Advanced: allowlisted paths
+
+For applications that need tighter control, maintain an explicit list of allowed redirect paths:
+
+```ts title="lib/safe-redirect.ts"
+const ALLOWED_REDIRECT_PREFIXES = [
+  '/dashboard',
+  '/settings',
+  '/profile',
+  '/projects',
+];
+
+export function safeRedirect(url: string | null | undefined, fallback = '/'): string {
+  if (
+    !url ||
+    !url.startsWith('/') ||
+    url.startsWith('//') ||
+    url.startsWith('/\\') ||
+    url.includes('://')
+  ) {
+    return fallback;
+  }
+
+  // Check against allowlist
+  const isAllowed = ALLOWED_REDIRECT_PREFIXES.some(
+    (prefix) => url === prefix || url.startsWith(prefix + '/'),
+  );
+
+  return isAllowed ? url : fallback;
+}
+```
+
+This approach prevents redirects to paths like `/logout` (which could log the user out immediately after login) or `/api/delete-account`.
+
+---
+
+## Redirect in URL path vs. query string
+
+Prefer encoding the redirect target in the URL **path** or as a form field rather than a query parameter when possible:
+
+```
+# Less ideal — redirect in query string
+/login?redirect=/dashboard
+
+# Better — redirect as a hidden form field
+<input type="hidden" name="redirect" value="/dashboard" />
+```
+
+Query strings are logged by web servers, proxies, and analytics tools. If the redirect contains any sensitive path (e.g., `/settings/api-keys`), it becomes visible in logs. Form fields submitted via POST are not logged in URLs.
+
+<Aside>
+  This is the same principle as the [Production Checklist](/ideal-auth/security/production-checklist/) recommendation to put tokens in URL paths rather than query strings.
+</Aside>
+
+---
+
+## Summary
+
+1. **Never redirect to absolute URLs** from user input
+2. **Always validate** redirect parameters with `safeRedirect()` or an equivalent
+3. **Check for `//`** — protocol-relative URLs bypass the "starts with `/`" check
+4. **Use a fallback** — if the redirect is invalid, send users to a safe default like `/dashboard`
+5. **Consider an allowlist** for applications with strict security requirements

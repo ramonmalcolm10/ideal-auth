@@ -1,0 +1,540 @@
+---
+title: TanStack Start
+description: Complete auth setup for TanStack Start with ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide walks through setting up authentication in a **TanStack Start** application using `ideal-auth`. By the end, you will have working login, registration, logout, route protection via `beforeLoad`, and access to the current user in your routes.
+
+## Installation
+
+<Steps>
+
+1. **Install ideal-auth**
+
+   ```bash
+   bun add ideal-auth
+   ```
+
+2. **Set the session secret**
+
+   Add a secret to your `.env` file. It must be at least 32 characters.
+
+   ```bash title=".env"
+   IDEAL_AUTH_SECRET="at-least-32-characters-long-secret-here"
+   ```
+
+   Generate a strong secret:
+
+   ```bash
+   bunx ideal-auth secret
+   ```
+
+</Steps>
+
+---
+
+## Cookie bridge
+
+TanStack Start uses Vinxi under the hood. Use the cookie utilities from `vinxi/http` to build the bridge.
+
+```ts title="app/lib/cookies.ts"
+import { getCookie, setCookie, deleteCookie } from 'vinxi/http';
+import type { CookieBridge } from 'ideal-auth';
+
+export function createCookieBridge(): CookieBridge {
+  return {
+    get(name: string) {
+      return getCookie(name);
+    },
+    set(name, value, options) {
+      setCookie(name, value, options);
+    },
+    delete(name) {
+      deleteCookie(name, { path: '/' });
+    },
+  };
+}
+```
+
+<Aside type="caution">
+  The `vinxi/http` cookie functions use async local storage internally and must be called within a server function context. They will throw if called outside of a `createServerFn` handler or server middleware.
+</Aside>
+
+---
+
+## Auth setup
+
+Create a single `auth()` factory. Each server function calls `auth()` to get a fresh `AuthInstance` bound to the current request's cookies.
+
+```ts title="app/lib/auth.ts"
+import { createAuth, createHash } from 'ideal-auth';
+import { createCookieBridge } from './cookies';
+import { db } from './db'; // your database client
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+};
+
+export const hash = createHash({ rounds: 12 });
+
+const authFactory = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  hash,
+
+  async resolveUser(id) {
+    return db.user.findUnique({ where: { id } });
+  },
+
+  async resolveUserByCredentials(credentials) {
+    return db.user.findUnique({
+      where: { email: credentials.email },
+    });
+  },
+});
+
+export function auth() {
+  return authFactory();
+}
+```
+
+---
+
+## Login server function
+
+```ts title="app/lib/auth.actions.ts"
+import { createServerFn } from '@tanstack/start';
+import { auth, hash } from './auth';
+import { db } from './db';
+
+export const loginFn = createServerFn({ method: 'POST' })
+  .validator((data: { email: string; password: string; remember?: boolean }) => data)
+  .handler(async ({ data }) => {
+    if (!data.email || !data.password) {
+      throw new Error('Email and password are required.');
+    }
+
+    const session = auth();
+    const success = await session.attempt(
+      { email: data.email, password: data.password },
+      { remember: data.remember ?? false },
+    );
+
+    if (!success) {
+      throw new Error('Invalid email or password.');
+    }
+
+    return { success: true };
+  });
+```
+
+### Login route
+
+```tsx title="app/routes/login.tsx"
+import { createFileRoute, useNavigate } from '@tanstack/react-router';
+import { useServerFn } from '@tanstack/start';
+import { useState } from 'react';
+import { loginFn } from '../lib/auth.actions';
+
+export const Route = createFileRoute('/login')({
+  component: LoginPage,
+});
+
+function LoginPage() {
+  const navigate = useNavigate();
+  const login = useServerFn(loginFn);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+
+    const formData = new FormData(e.currentTarget);
+    const email = formData.get('email') as string;
+    const password = formData.get('password') as string;
+    const remember = formData.get('remember') === 'on';
+
+    try {
+      await login({ data: { email, password, remember } });
+      navigate({ to: '/dashboard' });
+    } catch (err: any) {
+      setError(err.message ?? 'Login failed.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div>
+      <h1>Sign in</h1>
+      {error && <p className="error">{error}</p>}
+
+      <form onSubmit={handleSubmit}>
+        <label htmlFor="email">Email</label>
+        <input id="email" name="email" type="email" required />
+
+        <label htmlFor="password">Password</label>
+        <input id="password" name="password" type="password" required />
+
+        <label>
+          <input name="remember" type="checkbox" /> Remember me
+        </label>
+
+        <button type="submit" disabled={loading}>
+          {loading ? 'Signing in...' : 'Sign in'}
+        </button>
+      </form>
+    </div>
+  );
+}
+```
+
+---
+
+## Registration server function
+
+```ts title="app/lib/auth.actions.ts" ins={3-44}
+export const registerFn = createServerFn({ method: 'POST' })
+  .validator(
+    (data: {
+      email: string;
+      name: string;
+      password: string;
+      passwordConfirmation: string;
+    }) => data,
+  )
+  .handler(async ({ data }) => {
+    if (!data.email || !data.name || !data.password) {
+      throw new Error('All fields are required.');
+    }
+
+    if (data.password.length < 8) {
+      throw new Error('Password must be at least 8 characters.');
+    }
+
+    if (data.password !== data.passwordConfirmation) {
+      throw new Error('Passwords do not match.');
+    }
+
+    const existing = await db.user.findUnique({ where: { email: data.email } });
+    if (existing) {
+      throw new Error('An account with this email already exists.');
+    }
+
+    const user = await db.user.create({
+      data: {
+        email: data.email,
+        name: data.name,
+        password: await hash.make(data.password),
+      },
+    });
+
+    // Log the user in immediately after registration
+    const session = auth();
+    await session.login(user);
+
+    return { success: true };
+  });
+```
+
+---
+
+## Logout server function
+
+```ts title="app/lib/auth.actions.ts" ins={3-11}
+export const logoutFn = createServerFn({ method: 'POST' })
+  .handler(async () => {
+    const session = auth();
+    await session.logout();
+    return { success: true };
+  });
+```
+
+### Logout button
+
+```tsx title="app/components/LogoutButton.tsx"
+import { useNavigate } from '@tanstack/react-router';
+import { useServerFn } from '@tanstack/start';
+import { logoutFn } from '../lib/auth.actions';
+
+export function LogoutButton() {
+  const navigate = useNavigate();
+  const logout = useServerFn(logoutFn);
+
+  async function handleLogout() {
+    await logout({});
+    navigate({ to: '/login' });
+  }
+
+  return <button onClick={handleLogout}>Sign out</button>;
+}
+```
+
+---
+
+## Current user server function
+
+Create a server function to fetch the current user. This is used by route loaders and the `beforeLoad` guard.
+
+```ts title="app/lib/auth.actions.ts" ins={3-15}
+export const getCurrentUserFn = createServerFn({ method: 'GET' })
+  .handler(async () => {
+    const session = auth();
+    const user = await session.user();
+
+    if (!user) {
+      return { user: null };
+    }
+
+    return {
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+      },
+    };
+  });
+```
+
+---
+
+## Route protection (beforeLoad)
+
+Use `beforeLoad` to guard protected routes. This runs before the route's loader, preventing unauthorized data fetching.
+
+```tsx title="app/routes/dashboard.tsx"
+import { createFileRoute, redirect } from '@tanstack/react-router';
+import { getCurrentUserFn } from '../lib/auth.actions';
+import { LogoutButton } from '../components/LogoutButton';
+
+export const Route = createFileRoute('/dashboard')({
+  beforeLoad: async () => {
+    const { user } = await getCurrentUserFn();
+
+    if (!user) {
+      throw redirect({
+        to: '/login',
+        search: { callbackUrl: '/dashboard' },
+      });
+    }
+
+    return { user };
+  },
+  component: DashboardPage,
+});
+
+function DashboardPage() {
+  const { user } = Route.useRouteContext();
+
+  return (
+    <div>
+      <h1>Welcome, {user.name}</h1>
+      <p>Email: {user.email}</p>
+      <LogoutButton />
+    </div>
+  );
+}
+```
+
+### Reusable auth guard
+
+To avoid repeating the `beforeLoad` logic, create a helper:
+
+```ts title="app/lib/auth-guard.ts"
+import { redirect } from '@tanstack/react-router';
+import { getCurrentUserFn } from './auth.actions';
+
+export async function requireAuth(currentPath: string) {
+  const { user } = await getCurrentUserFn();
+
+  if (!user) {
+    throw redirect({
+      to: '/login',
+      search: { callbackUrl: currentPath },
+    });
+  }
+
+  return { user };
+}
+
+export async function requireGuest() {
+  const { user } = await getCurrentUserFn();
+
+  if (user) {
+    throw redirect({ to: '/dashboard' });
+  }
+}
+```
+
+Use it in any route:
+
+```tsx title="app/routes/settings.tsx"
+import { createFileRoute } from '@tanstack/react-router';
+import { requireAuth } from '../lib/auth-guard';
+
+export const Route = createFileRoute('/settings')({
+  beforeLoad: () => requireAuth('/settings'),
+  component: SettingsPage,
+});
+
+function SettingsPage() {
+  const { user } = Route.useRouteContext();
+  return <h1>Settings for {user.name}</h1>;
+}
+```
+
+---
+
+## Getting the current user
+
+### In a route loader
+
+```tsx title="app/routes/profile.tsx"
+import { createFileRoute } from '@tanstack/react-router';
+import { getCurrentUserFn } from '../lib/auth.actions';
+import { requireAuth } from '../lib/auth-guard';
+
+export const Route = createFileRoute('/profile')({
+  beforeLoad: () => requireAuth('/profile'),
+  loader: async () => {
+    const { user } = await getCurrentUserFn();
+    return { user };
+  },
+  component: ProfilePage,
+});
+
+function ProfilePage() {
+  const { user } = Route.useLoaderData();
+
+  return (
+    <div>
+      <h1>{user?.name}</h1>
+      <p>{user?.email}</p>
+    </div>
+  );
+}
+```
+
+### In a layout route
+
+```tsx title="app/routes/_authed.tsx"
+import { createFileRoute, Outlet } from '@tanstack/react-router';
+import { requireAuth } from '../lib/auth-guard';
+
+export const Route = createFileRoute('/_authed')({
+  beforeLoad: () => requireAuth('/_authed'),
+  component: AuthedLayout,
+});
+
+function AuthedLayout() {
+  const { user } = Route.useRouteContext();
+
+  return (
+    <div>
+      <nav>
+        <span>Signed in as {user.email}</span>
+      </nav>
+      <main>
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+```
+
+Then nest protected routes under `_authed`:
+
+```
+app/routes/
+  _authed.tsx          (layout with auth guard)
+  _authed.dashboard.tsx
+  _authed.settings.tsx
+  _authed.profile.tsx
+  login.tsx
+  register.tsx
+```
+
+---
+
+## CSRF protection
+
+TanStack Start does not include built-in CSRF protection. You need to validate the `Origin` header manually in your server functions or server middleware.
+
+### Option 1: Middleware (Vinxi)
+
+```ts title="app/middleware.ts"
+import { createMiddleware } from '@tanstack/start';
+import { getRequestHeader } from 'vinxi/http';
+
+const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
+
+export default createMiddleware({
+  id: 'csrf',
+  handler: async ({ request, next }) => {
+    if (SAFE_METHODS.includes(request.method)) {
+      return next();
+    }
+
+    const origin = getRequestHeader('origin');
+    const host = getRequestHeader('host');
+
+    if (!origin || !host) {
+      throw new Error('Forbidden: missing origin header.');
+    }
+
+    try {
+      const originHost = new URL(origin).host;
+      if (originHost !== host) {
+        throw new Error('Forbidden: origin mismatch.');
+      }
+    } catch {
+      throw new Error('Forbidden: invalid origin.');
+    }
+
+    return next();
+  },
+});
+```
+
+### Option 2: Per-function validation
+
+```ts title="app/lib/csrf.ts"
+import { getRequestHeader } from 'vinxi/http';
+
+export function validateOrigin() {
+  const origin = getRequestHeader('origin');
+  const host = getRequestHeader('host');
+
+  if (!origin || new URL(origin).host !== host) {
+    throw new Error('CSRF validation failed.');
+  }
+}
+```
+
+Call `validateOrigin()` at the top of any state-changing server function:
+
+```ts
+export const loginFn = createServerFn({ method: 'POST' })
+  .handler(async ({ data }) => {
+    validateOrigin();
+    // ... rest of login logic
+  });
+```
+
+---
+
+## Security notes
+
+- **Session secret**: Store `IDEAL_AUTH_SECRET` in environment variables. Never hard-code it or commit it to version control.
+- **HTTPS**: Set `NODE_ENV=production` in production so session cookies are automatically marked `Secure`.
+- **Cookie scope**: The default `SameSite=Lax` and `HttpOnly=true` settings protect against CSRF and XSS cookie theft.
+- **Server function context**: All `vinxi/http` cookie operations must run inside a server function. Calling them at module level or in client code will throw.
+- **Route context types**: Use `Route.useRouteContext()` to access data set in `beforeLoad`. TypeScript will infer the types automatically from your return value.
+- **Layout routes**: Use TanStack Router's pathless layout routes (prefixed with `_`) to apply auth guards to groups of routes without repeating the `beforeLoad` logic.

@@ -1,0 +1,759 @@
+---
+title: Testing
+description: How to test auth flows in your application.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Testing authentication code requires mocking the boundary between your application and the framework — primarily the cookie layer. ideal-auth's `CookieBridge` interface makes this straightforward: replace the three cookie functions with in-memory implementations and you have a fully functional auth system in your tests.
+
+## Mocking the cookie bridge
+
+The cookie bridge is three functions: `get`, `set`, and `delete`. For tests, back them with a `Map`:
+
+```ts
+import type { CookieBridge, CookieOptions } from 'ideal-auth';
+
+function createMockCookieBridge(): CookieBridge {
+  const store = new Map<string, string>();
+  return {
+    get: (name: string) => store.get(name),
+    set: (name: string, value: string, _options: CookieOptions) => {
+      store.set(name, value);
+    },
+    delete: (name: string) => {
+      store.delete(name);
+    },
+  };
+}
+```
+
+This gives you a cookie bridge that behaves like a real one but runs entirely in memory. No HTTP, no framework, no browser.
+
+<Aside type="tip">
+  If you need to assert on cookie options (e.g., verifying `maxAge` or `secure`), store `_options` in a variable on the bridge object. See the "Test helpers" section at the end of this guide for an enhanced version.
+</Aside>
+
+## Testing login/logout flows
+
+Create a real auth instance with the mock cookie bridge and a mock user store. Use `createHash` with low rounds (4 is the minimum for bcrypt) so tests run fast:
+
+```ts
+import { createAuth, createHash } from 'ideal-auth';
+import type { AuthInstance } from 'ideal-auth';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+}
+
+const hash = createHash({ rounds: 4 });
+
+async function setupAuth() {
+  const hashedPassword = await hash.make('correct-password');
+  const users: User[] = [
+    { id: '1', email: 'alice@example.com', name: 'Alice', password: hashedPassword },
+  ];
+
+  const bridge = createMockCookieBridge();
+  const auth = createAuth<User>({
+    secret: 'a'.repeat(32), // 32+ character test secret
+    cookie: bridge,
+    hash,
+    resolveUser: async (id) => users.find((u) => u.id === id) ?? null,
+    resolveUserByCredentials: async (creds) =>
+      users.find((u) => u.email === creds.email) ?? null,
+  });
+
+  return { auth, bridge, users };
+}
+```
+
+### Full login/logout test
+
+```ts
+import { describe, it, expect } from 'vitest'; // or bun:test, jest, etc.
+
+describe('auth flow', () => {
+  it('attempt → check → user → logout → check', async () => {
+    const { auth } = await setupAuth();
+    const session = auth();
+
+    // Attempt login with correct credentials
+    const success = await session.attempt({
+      email: 'alice@example.com',
+      password: 'correct-password',
+    });
+    expect(success).toBe(true);
+
+    // Session is now active
+    expect(await session.check()).toBe(true);
+
+    // User is resolved
+    const user = await session.user();
+    expect(user).not.toBeNull();
+    expect(user!.email).toBe('alice@example.com');
+    expect(user!.name).toBe('Alice');
+
+    // User ID is available
+    expect(await session.id()).toBe('1');
+
+    // Logout clears the session
+    await session.logout();
+    expect(await session.check()).toBe(false);
+    expect(await session.user()).toBeNull();
+    expect(await session.id()).toBeNull();
+  });
+
+  it('attempt fails with wrong password', async () => {
+    const { auth } = await setupAuth();
+    const session = auth();
+
+    const success = await session.attempt({
+      email: 'alice@example.com',
+      password: 'wrong-password',
+    });
+    expect(success).toBe(false);
+    expect(await session.check()).toBe(false);
+  });
+
+  it('attempt fails with unknown email', async () => {
+    const { auth } = await setupAuth();
+    const session = auth();
+
+    const success = await session.attempt({
+      email: 'unknown@example.com',
+      password: 'correct-password',
+    });
+    expect(success).toBe(false);
+  });
+
+  it('login directly with a user object', async () => {
+    const { auth, users } = await setupAuth();
+    const session = auth();
+
+    await session.login(users[0]);
+    expect(await session.check()).toBe(true);
+    expect(await session.user()).toEqual(users[0]);
+  });
+
+  it('loginById resolves and logs in', async () => {
+    const { auth } = await setupAuth();
+    const session = auth();
+
+    await session.loginById('1');
+    expect(await session.check()).toBe(true);
+    expect(await session.id()).toBe('1');
+  });
+});
+```
+
+## Testing with a mock auth instance
+
+When unit testing components or server actions that _use_ auth (rather than testing the auth system itself), you do not need a real auth instance. Mock the `AuthInstance` interface directly:
+
+```ts
+import type { AuthInstance } from 'ideal-auth';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+}
+
+function createMockAuthInstance(user: User | null): AuthInstance<User> {
+  return {
+    check: async () => user !== null,
+    user: async () => user,
+    id: async () => user?.id ?? null,
+    login: async () => {},
+    loginById: async () => {},
+    logout: async () => {},
+    attempt: async () => user !== null,
+  };
+}
+```
+
+Use it in your tests:
+
+```ts
+// Test an authenticated scenario
+const authedSession = createMockAuthInstance({
+  id: '1',
+  email: 'test@example.com',
+  name: 'Test User',
+});
+
+expect(await authedSession.check()).toBe(true);
+expect((await authedSession.user())!.email).toBe('test@example.com');
+
+// Test an unauthenticated scenario
+const guestSession = createMockAuthInstance(null);
+
+expect(await guestSession.check()).toBe(false);
+expect(await guestSession.user()).toBeNull();
+```
+
+This is useful for testing:
+
+- Server components that call `session.user()` and render conditionally
+- Server actions that call `session.check()` as a guard
+- API route handlers that read `session.id()` to scope database queries
+- Middleware logic that branches on authentication state
+
+## Testing token verifier
+
+The token verifier is stateless and deterministic (given the same secret), so it is straightforward to test. Use a test secret that is at least 32 characters long:
+
+```ts
+import { createTokenVerifier } from 'ideal-auth';
+
+const SECRET = 'test-secret-that-is-at-least-32-chars';
+
+describe('token verifier', () => {
+  const verifier = createTokenVerifier({ secret: SECRET });
+
+  it('creates and verifies a token', () => {
+    const token = verifier.createToken('user-1');
+    const result = verifier.verifyToken(token);
+
+    expect(result).not.toBeNull();
+    expect(result!.userId).toBe('user-1');
+    expect(result!.iatMs).toBeLessThanOrEqual(Date.now());
+  });
+
+  it('returns null for an expired token', () => {
+    const expiredVerifier = createTokenVerifier({
+      secret: SECRET,
+      expiryMs: 0, // expires immediately
+    });
+    const token = expiredVerifier.createToken('user-1');
+
+    expect(expiredVerifier.verifyToken(token)).toBeNull();
+  });
+
+  it('returns null with a different secret', () => {
+    const token = verifier.createToken('user-1');
+    const otherVerifier = createTokenVerifier({
+      secret: 'different-secret-at-least-32-characters',
+    });
+
+    expect(otherVerifier.verifyToken(token)).toBeNull();
+  });
+
+  it('returns null for tampered tokens', () => {
+    const token = verifier.createToken('user-1');
+    const tampered = token.slice(0, -1) + 'x';
+
+    expect(verifier.verifyToken(tampered)).toBeNull();
+  });
+
+  it('returns null for malformed strings', () => {
+    expect(verifier.verifyToken('')).toBeNull();
+    expect(verifier.verifyToken('not-a-token')).toBeNull();
+    expect(verifier.verifyToken('a.b')).toBeNull();
+  });
+});
+```
+
+## Testing rate limiting
+
+Use the built-in `MemoryRateLimitStore` for tests. Each test gets a fresh store, so there is no cross-test contamination:
+
+```ts
+import { createRateLimiter } from 'ideal-auth';
+
+describe('rate limiting', () => {
+  it('allows up to maxAttempts, then blocks', async () => {
+    const limiter = createRateLimiter({
+      maxAttempts: 3,
+      windowMs: 60_000,
+    });
+
+    const first = await limiter.attempt('test-key');
+    expect(first.allowed).toBe(true);
+    expect(first.remaining).toBe(2);
+
+    const second = await limiter.attempt('test-key');
+    expect(second.allowed).toBe(true);
+    expect(second.remaining).toBe(1);
+
+    const third = await limiter.attempt('test-key');
+    expect(third.allowed).toBe(true);
+    expect(third.remaining).toBe(0);
+
+    // Fourth attempt is blocked
+    const fourth = await limiter.attempt('test-key');
+    expect(fourth.allowed).toBe(false);
+    expect(fourth.remaining).toBe(0);
+    expect(fourth.resetAt).toBeInstanceOf(Date);
+  });
+
+  it('reset clears the limit', async () => {
+    const limiter = createRateLimiter({
+      maxAttempts: 1,
+      windowMs: 60_000,
+    });
+
+    await limiter.attempt('test-key');
+    expect((await limiter.attempt('test-key')).allowed).toBe(false);
+
+    await limiter.reset('test-key');
+    expect((await limiter.attempt('test-key')).allowed).toBe(true);
+  });
+
+  it('different keys are independent', async () => {
+    const limiter = createRateLimiter({
+      maxAttempts: 1,
+      windowMs: 60_000,
+    });
+
+    await limiter.attempt('key-a');
+    expect((await limiter.attempt('key-a')).allowed).toBe(false);
+    expect((await limiter.attempt('key-b')).allowed).toBe(true);
+  });
+});
+```
+
+<Aside>
+  `createRateLimiter` uses a `MemoryRateLimitStore` by default when no `store` option is provided. Since each call to `createRateLimiter` creates a new store instance, every test that creates its own limiter starts with a clean slate.
+</Aside>
+
+## Testing TOTP
+
+Testing TOTP requires generating a valid code for a known secret. The library's own test suite uses a helper function to compute TOTP codes from first principles. Here is a simplified version you can use in your tests:
+
+```ts
+import { createHmac } from 'node:crypto';
+import { createTOTP } from 'ideal-auth';
+
+// Helper: compute a TOTP code for a given secret at the current time + offset
+function generateTestCode(
+  secret: string,
+  digits: number = 6,
+  period: number = 30,
+  offset: number = 0,
+): string {
+  const counter = Math.floor(Date.now() / 1000 / period) + offset;
+  const buf = Buffer.alloc(8);
+  let tmp = counter;
+  for (let i = 7; i >= 0; i--) {
+    buf[i] = tmp & 0xff;
+    tmp = Math.floor(tmp / 256);
+  }
+  // Decode base32 secret
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  for (const ch of secret) {
+    bits += alphabet.indexOf(ch).toString(2).padStart(5, '0');
+  }
+  const bytes = new Uint8Array(Math.floor(bits.length / 8));
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(bits.slice(i * 8, i * 8 + 8), 2);
+  }
+
+  const hmac = createHmac('sha1', bytes).update(buf).digest();
+  const off = hmac[hmac.length - 1] & 0x0f;
+  const code =
+    ((hmac[off] & 0x7f) << 24) |
+    ((hmac[off + 1] & 0xff) << 16) |
+    ((hmac[off + 2] & 0xff) << 8) |
+    (hmac[off + 3] & 0xff);
+  return String(code % 10 ** digits).padStart(digits, '0');
+}
+```
+
+### TOTP verification tests
+
+```ts
+describe('TOTP', () => {
+  const totp = createTOTP();
+
+  it('generates a secret', () => {
+    const secret = totp.generateSecret();
+    expect(secret).toMatch(/^[A-Z2-7]+$/);
+    expect(secret).toHaveLength(32);
+  });
+
+  it('verifies a valid code', () => {
+    const secret = totp.generateSecret();
+    const code = generateTestCode(secret);
+    expect(totp.verify(code, secret)).toBe(true);
+  });
+
+  it('rejects an invalid code', () => {
+    const secret = totp.generateSecret();
+    expect(totp.verify('000000', secret)).toBe(false);
+  });
+
+  it('accepts codes within the window (default +-1 step)', () => {
+    const secret = totp.generateSecret();
+    const pastCode = generateTestCode(secret, 6, 30, -1);
+    const futureCode = generateTestCode(secret, 6, 30, 1);
+    expect(totp.verify(pastCode, secret)).toBe(true);
+    expect(totp.verify(futureCode, secret)).toBe(true);
+  });
+
+  it('generates a valid QR URI', () => {
+    const secret = totp.generateSecret();
+    const uri = totp.generateQrUri({
+      secret,
+      issuer: 'TestApp',
+      account: 'user@test.com',
+    });
+    expect(uri).toMatch(/^otpauth:\/\/totp\//);
+    expect(uri).toContain(`secret=${secret}`);
+    expect(uri).toContain('issuer=TestApp');
+  });
+});
+```
+
+### Testing recovery codes
+
+```ts
+import { createHash, generateRecoveryCodes, verifyRecoveryCode } from 'ideal-auth';
+
+describe('recovery codes', () => {
+  const hash = createHash({ rounds: 4 });
+
+  it('generates codes and verifies them', async () => {
+    const { codes, hashed } = await generateRecoveryCodes(hash);
+
+    expect(codes).toHaveLength(8);
+    expect(hashed).toHaveLength(8);
+
+    // Verify the first code
+    const result = await verifyRecoveryCode(codes[0], hashed, hash);
+    expect(result.valid).toBe(true);
+    expect(result.remaining).toHaveLength(7);
+  });
+
+  it('rejects an invalid code', async () => {
+    const { hashed } = await generateRecoveryCodes(hash);
+
+    const result = await verifyRecoveryCode('invalid-code', hashed, hash);
+    expect(result.valid).toBe(false);
+    expect(result.remaining).toHaveLength(8); // unchanged
+  });
+
+  it('removes used codes from remaining', async () => {
+    const { codes, hashed } = await generateRecoveryCodes(hash, 3);
+
+    // Use the first code
+    const first = await verifyRecoveryCode(codes[0], hashed, hash);
+    expect(first.valid).toBe(true);
+    expect(first.remaining).toHaveLength(2);
+
+    // Use the third code with the updated remaining hashes
+    const second = await verifyRecoveryCode(codes[2], first.remaining, hash);
+    expect(second.valid).toBe(true);
+    expect(second.remaining).toHaveLength(1);
+  });
+});
+```
+
+## Framework-specific testing tips
+
+### Next.js (App Router)
+
+Next.js provides `cookies()` from `next/headers`. In tests, mock this function to return your test cookie bridge:
+
+<Tabs>
+  <TabItem label="Vitest">
+    ```ts
+    import { vi, describe, it, expect } from 'vitest';
+
+    // Mock next/headers before importing your auth module
+    vi.mock('next/headers', () => {
+      const store = new Map<string, string>();
+      return {
+        cookies: () => ({
+          get: (name: string) => {
+            const value = store.get(name);
+            return value ? { name, value } : undefined;
+          },
+          set: (name: string, value: string, _options?: any) => {
+            store.set(name, value);
+          },
+          delete: (name: string) => {
+            store.delete(name);
+          },
+        }),
+      };
+    });
+
+    // Now import your auth module — it will use the mocked cookies()
+    import { auth } from '@/lib/auth';
+
+    describe('protected server action', () => {
+      it('returns user data when authenticated', async () => {
+        const session = auth();
+        // Login with a test user to populate the mock cookie store
+        await session.login({ id: '1', email: 'test@example.com', name: 'Test' });
+
+        expect(await session.check()).toBe(true);
+      });
+    });
+    ```
+  </TabItem>
+  <TabItem label="Jest">
+    ```ts
+    // __mocks__/next/headers.ts
+    const store = new Map<string, string>();
+
+    export function cookies() {
+      return {
+        get: (name: string) => {
+          const value = store.get(name);
+          return value ? { name, value } : undefined;
+        },
+        set: (name: string, value: string, _options?: any) => {
+          store.set(name, value);
+        },
+        delete: (name: string) => {
+          store.delete(name);
+        },
+      };
+    }
+    ```
+
+    ```ts
+    // your-test.test.ts
+    jest.mock('next/headers');
+    import { auth } from '@/lib/auth';
+
+    describe('protected route', () => {
+      it('works with mocked cookies', async () => {
+        const session = auth();
+        await session.login({ id: '1', email: 'test@example.com', name: 'Test' });
+        expect(await session.check()).toBe(true);
+      });
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+### Setting up the mock cookie bridge in Vitest or Jest
+
+If your auth module accepts a cookie bridge as a parameter (or you can inject one through a factory), the simplest approach is to pass the mock bridge directly:
+
+```ts
+// lib/auth.ts
+import { createAuth, createHash } from 'ideal-auth';
+import type { CookieBridge } from 'ideal-auth';
+
+const hash = createHash();
+
+export function createAppAuth(cookie: CookieBridge) {
+  return createAuth({
+    secret: process.env.SESSION_SECRET!,
+    cookie,
+    hash,
+    resolveUser: (id) => db.user.findUnique({ where: { id } }),
+    resolveUserByCredentials: (creds) =>
+      db.user.findUnique({ where: { email: creds.email } }),
+  });
+}
+```
+
+```ts
+// auth.test.ts
+import { createAppAuth } from '@/lib/auth';
+
+const bridge = createMockCookieBridge(); // from the "Mocking the cookie bridge" section
+const auth = createAppAuth(bridge);
+const session = auth();
+
+// ... test as normal
+```
+
+### E2E with Playwright
+
+For end-to-end tests, you do not mock anything. Test the complete flow through the browser:
+
+```ts
+import { test, expect } from '@playwright/test';
+
+test('login flow', async ({ page }) => {
+  // Navigate to the login page
+  await page.goto('/login');
+
+  // Fill in credentials
+  await page.fill('input[name="email"]', 'alice@example.com');
+  await page.fill('input[name="password"]', 'correct-password');
+  await page.click('button[type="submit"]');
+
+  // Verify redirect to dashboard
+  await expect(page).toHaveURL('/dashboard');
+
+  // Verify the session cookie was set
+  const cookies = await page.context().cookies();
+  const sessionCookie = cookies.find((c) => c.name === 'ideal_session');
+  expect(sessionCookie).toBeDefined();
+  expect(sessionCookie!.httpOnly).toBe(true);
+
+  // Verify authenticated content is visible
+  await expect(page.getByText('Welcome, Alice')).toBeVisible();
+});
+
+test('logout flow', async ({ page }) => {
+  // Login first (reuse a helper or storage state)
+  await page.goto('/login');
+  await page.fill('input[name="email"]', 'alice@example.com');
+  await page.fill('input[name="password"]', 'correct-password');
+  await page.click('button[type="submit"]');
+  await expect(page).toHaveURL('/dashboard');
+
+  // Logout
+  await page.click('button:has-text("Logout")');
+
+  // Verify redirect to login
+  await expect(page).toHaveURL('/login');
+
+  // Verify the session cookie was removed
+  const cookies = await page.context().cookies();
+  const sessionCookie = cookies.find((c) => c.name === 'ideal_session');
+  expect(sessionCookie).toBeUndefined();
+});
+
+test('protected route redirects when unauthenticated', async ({ page }) => {
+  await page.goto('/dashboard');
+  await expect(page).toHaveURL('/login');
+});
+```
+
+<Aside type="tip">
+  Use Playwright's [storage state](https://playwright.dev/docs/auth) to save an authenticated session and reuse it across tests. This avoids repeating the login flow in every test.
+</Aside>
+
+## Test helpers
+
+Here is a reusable `createTestAuth()` factory that wires up a mock cookie bridge with a test user store. Copy it into a shared test utilities file:
+
+```ts
+// test/helpers/auth.ts
+import { createAuth, createHash } from 'ideal-auth';
+import type { CookieBridge, CookieOptions, AuthInstance } from 'ideal-auth';
+
+interface TestUser {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+}
+
+interface MockCookieBridge extends CookieBridge {
+  store: Map<string, string>;
+  lastOptions: CookieOptions | undefined;
+}
+
+export function createMockCookieBridge(): MockCookieBridge {
+  const store = new Map<string, string>();
+  return {
+    store,
+    lastOptions: undefined,
+    get(name: string) {
+      return store.get(name);
+    },
+    set(name: string, value: string, options: CookieOptions) {
+      store.set(name, value);
+      this.lastOptions = options;
+    },
+    delete(name: string) {
+      store.delete(name);
+    },
+  };
+}
+
+const hash = createHash({ rounds: 4 });
+
+interface TestAuthResult {
+  auth: () => AuthInstance<TestUser>;
+  bridge: MockCookieBridge;
+  users: TestUser[];
+  hash: typeof hash;
+}
+
+export async function createTestAuth(
+  overrides: Partial<TestUser>[] = [],
+): Promise<TestAuthResult> {
+  const hashedPassword = await hash.make('password123');
+
+  const users: TestUser[] = [
+    {
+      id: '1',
+      email: 'alice@example.com',
+      name: 'Alice',
+      password: hashedPassword,
+      ...overrides[0],
+    },
+    ...(overrides.slice(1).map((o, i) => ({
+      id: String(i + 2),
+      email: `user${i + 2}@example.com`,
+      name: `User ${i + 2}`,
+      password: hashedPassword,
+      ...o,
+    }))),
+  ];
+
+  const bridge = createMockCookieBridge();
+
+  const auth = createAuth<TestUser>({
+    secret: 'a'.repeat(32),
+    cookie: bridge,
+    hash,
+    resolveUser: async (id) => users.find((u) => u.id === id) ?? null,
+    resolveUserByCredentials: async (creds) =>
+      users.find((u) => u.email === creds.email) ?? null,
+  });
+
+  return { auth, bridge, users, hash };
+}
+```
+
+### Using the helper
+
+```ts
+import { describe, it, expect } from 'vitest';
+import { createTestAuth } from '../helpers/auth';
+
+describe('my feature', () => {
+  it('requires authentication', async () => {
+    const { auth } = await createTestAuth();
+    const session = auth();
+
+    // Not logged in
+    expect(await session.check()).toBe(false);
+
+    // Log in
+    await session.attempt({ email: 'alice@example.com', password: 'password123' });
+    expect(await session.check()).toBe(true);
+  });
+
+  it('works with custom users', async () => {
+    const { auth } = await createTestAuth([
+      { email: 'admin@example.com', name: 'Admin' },
+    ]);
+    const session = auth();
+
+    await session.attempt({ email: 'admin@example.com', password: 'password123' });
+    const user = await session.user();
+    expect(user!.name).toBe('Admin');
+  });
+
+  it('can inspect cookie state', async () => {
+    const { auth, bridge } = await createTestAuth();
+    const session = auth();
+
+    await session.attempt({ email: 'alice@example.com', password: 'password123' });
+
+    // The session cookie was set
+    expect(bridge.store.has('ideal_session')).toBe(true);
+
+    // Cookie options were applied
+    expect(bridge.lastOptions?.httpOnly).toBe(true);
+  });
+});
+```

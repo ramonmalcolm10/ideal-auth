@@ -1,0 +1,286 @@
+---
+title: Crypto Utilities
+description: API reference for standalone crypto functions.
+---
+
+Standalone cryptographic utilities exported from `ideal-auth`. These functions are used internally by the library and are also available for direct use in your application.
+
+```typescript
+import {
+  generateToken,
+  signData,
+  verifySignature,
+  encrypt,
+  decrypt,
+  timingSafeEqual,
+} from 'ideal-auth';
+```
+
+---
+
+## generateToken
+
+```typescript
+function generateToken(bytes?: number): string
+```
+
+Generates a cryptographically secure random token as a hexadecimal string using `crypto.randomBytes` (CSPRNG).
+
+| Parameter | Type | Required | Default |
+|---|---|---|---|
+| `bytes` | `number` | No | `32` |
+
+- Default: 32 bytes, producing a 64-character hex string.
+- Throws if `bytes` is less than `1`.
+
+```typescript
+import { generateToken } from 'ideal-auth';
+
+const token = generateToken();
+// "a3f1b2c4d5e6f7081920a1b2c3d4e5f6a7b8c9d0e1f2031415161718191a1b2c"
+// (64 hex characters = 32 bytes)
+
+const shortToken = generateToken(16);
+// "a3f1b2c4d5e6f708192031415161718" (32 hex characters = 16 bytes)
+```
+
+```typescript
+// Throws for invalid input
+try {
+  generateToken(0);
+} catch (error) {
+  // Error: bytes must be at least 1
+}
+```
+
+---
+
+## signData
+
+```typescript
+function signData(data: string, secret: string): string
+```
+
+Creates an HMAC-SHA256 signature of the given data using the provided secret. Returns the signature as a hex digest.
+
+| Parameter | Type | Required |
+|---|---|---|
+| `data` | `string` | Yes |
+| `secret` | `string` | Yes |
+
+Throws if `secret` is an empty string.
+
+```typescript
+import { signData } from 'ideal-auth';
+
+const signature = signData('user_abc123:1709136000000', process.env.AUTH_SECRET!);
+// "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+```
+
+```typescript
+// Throws for empty secret
+try {
+  signData('some data', '');
+} catch (error) {
+  // Error: secret must not be empty
+}
+```
+
+### Use case: signed URLs
+
+```typescript
+import { signData, verifySignature } from 'ideal-auth';
+
+function createSignedUrl(url: string, secret: string): string {
+  const signature = signData(url, secret);
+  return `${url}&sig=${signature}`;
+}
+
+function isValidSignedUrl(url: string, signature: string, secret: string): boolean {
+  return verifySignature(url, signature, secret);
+}
+```
+
+---
+
+## verifySignature
+
+```typescript
+function verifySignature(data: string, signature: string, secret: string): boolean
+```
+
+Verifies an HMAC-SHA256 signature using **timing-safe comparison**. Returns `true` if the signature is valid for the given data and secret.
+
+| Parameter | Type | Required |
+|---|---|---|
+| `data` | `string` | Yes |
+| `signature` | `string` | Yes |
+| `secret` | `string` | Yes |
+
+```typescript
+import { signData, verifySignature } from 'ideal-auth';
+
+const data = 'user_abc123:1709136000000';
+const secret = process.env.AUTH_SECRET!;
+
+const signature = signData(data, secret);
+
+verifySignature(data, signature, secret);            // true
+verifySignature(data, 'tampered-signature', secret); // false
+verifySignature('tampered-data', signature, secret); // false
+```
+
+---
+
+## encrypt
+
+```typescript
+function encrypt(plaintext: string, secret: string): Promise<string>
+```
+
+Encrypts a string using **AES-256-GCM** with scrypt key derivation. Returns a base64url-encoded ciphertext string.
+
+| Parameter | Type | Required |
+|---|---|---|
+| `plaintext` | `string` | Yes |
+| `secret` | `string` | Yes |
+
+Throws if `secret` is an empty string.
+
+**Encryption details:**
+
+| Property | Value |
+|---|---|
+| Algorithm | AES-256-GCM |
+| Key derivation | scrypt (N=32768, r=8, p=1) |
+| Salt | Random 16 bytes (generated per call) |
+| IV | Random 12 bytes (generated per call) |
+| Output | base64url-encoded |
+
+Each call produces a **different ciphertext** even for the same plaintext and secret, because a fresh random salt and IV are generated every time.
+
+```typescript
+import { encrypt } from 'ideal-auth';
+
+const ciphertext = await encrypt('sensitive-data', process.env.AUTH_SECRET!);
+// "YWJjZGVmZ2hpamts..." (base64url-encoded)
+
+// Same input, different output each time
+const ciphertext2 = await encrypt('sensitive-data', process.env.AUTH_SECRET!);
+// Different from ciphertext
+```
+
+---
+
+## decrypt
+
+```typescript
+function decrypt(ciphertext: string, secret: string): Promise<string>
+```
+
+Decrypts a ciphertext string produced by `encrypt()`. Returns the original plaintext.
+
+| Parameter | Type | Required |
+|---|---|---|
+| `ciphertext` | `string` | Yes |
+| `secret` | `string` | Yes |
+
+Throws in the following cases:
+- `secret` is an empty string
+- The ciphertext is too short (fails minimum length check)
+- The ciphertext has been tampered with (GCM authentication fails)
+- The ciphertext was encrypted with a different secret
+
+```typescript
+import { encrypt, decrypt } from 'ideal-auth';
+
+const secret = process.env.AUTH_SECRET!;
+
+const ciphertext = await encrypt('sensitive-data', secret);
+const plaintext = await decrypt(ciphertext, secret);
+// "sensitive-data"
+```
+
+```typescript
+// Tampered ciphertext throws
+try {
+  await decrypt('invalid-ciphertext', secret);
+} catch (error) {
+  // Decryption failed
+}
+
+// Wrong secret throws
+try {
+  await decrypt(ciphertext, 'wrong-secret');
+} catch (error) {
+  // Decryption failed
+}
+```
+
+### Use case: encrypting TOTP secrets at rest
+
+```typescript
+import { encrypt, decrypt } from 'ideal-auth';
+
+const secret = process.env.AUTH_SECRET!;
+
+// Encrypt before storing
+async function storeTotpSecret(userId: string, totpSecret: string) {
+  const encryptedSecret = await encrypt(totpSecret, secret);
+  await db.user.update({
+    where: { id: userId },
+    data: { totpSecret: encryptedSecret },
+  });
+}
+
+// Decrypt when reading
+async function getTotpSecret(userId: string): Promise<string | null> {
+  const user = await db.user.findUnique({ where: { id: userId } });
+  if (!user?.totpSecret) return null;
+  return decrypt(user.totpSecret, secret);
+}
+```
+
+---
+
+## timingSafeEqual
+
+```typescript
+function timingSafeEqual(a: string, b: string): boolean
+```
+
+Performs a **constant-time string comparison** to prevent timing side-channel attacks. Uses `crypto.timingSafeEqual` internally.
+
+| Parameter | Type | Required |
+|---|---|---|
+| `a` | `string` | Yes |
+| `b` | `string` | Yes |
+
+The implementation pads both strings to equal length before calling `crypto.timingSafeEqual` (which requires equal-length buffers), then verifies the actual lengths match. This ensures that neither the comparison itself nor the length check leaks timing information.
+
+```typescript
+import { timingSafeEqual } from 'ideal-auth';
+
+timingSafeEqual('abc123', 'abc123'); // true
+timingSafeEqual('abc123', 'xyz789'); // false
+timingSafeEqual('short', 'longer-string'); // false
+```
+
+### When to use
+
+Use `timingSafeEqual` whenever you compare secrets, tokens, or signatures in security-sensitive code. A naive `===` comparison can leak information about how many characters matched through timing differences.
+
+```typescript
+import { timingSafeEqual } from 'ideal-auth';
+
+function verifyWebhook(payload: string, receivedSignature: string, secret: string) {
+  const expectedSignature = computeHmac(payload, secret);
+
+  // Timing-safe: does not leak how many characters matched
+  return timingSafeEqual(receivedSignature, expectedSignature);
+}
+```
+
+:::note
+For verifying HMAC signatures specifically, prefer [`verifySignature`](#verifysignature) which handles both the HMAC computation and the timing-safe comparison.
+:::
