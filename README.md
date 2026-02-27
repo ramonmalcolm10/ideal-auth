@@ -2,6 +2,8 @@
 
 Auth primitives for the JS ecosystem. Zero framework dependencies. Inspired by Laravel's `Auth` and `Hash` facades.
 
+**[Documentation](https://ramonmalcolm10.github.io/ideal-auth/)**
+
 Provide a cookie bridge (3 functions) once during setup, and `auth().login(user)` just works — handles session creation, cookie encryption, and storage internally via [iron-session](https://github.com/vvo/iron-session).
 
 ## Install
