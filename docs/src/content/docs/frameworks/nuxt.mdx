@@ -1,0 +1,470 @@
+---
+title: Nuxt
+description: Complete auth setup for Nuxt with ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide walks through setting up authentication in a **Nuxt 3** application using `ideal-auth`. By the end, you will have working login, registration, logout, route protection via server middleware, and access to the current user in pages and components.
+
+## Installation
+
+<Steps>
+
+1. **Install ideal-auth**
+
+   ```bash
+   bun add ideal-auth
+   ```
+
+2. **Set the session secret**
+
+   Add a secret to your `.env` file. It must be at least 32 characters.
+
+   ```bash title=".env"
+   IDEAL_AUTH_SECRET="at-least-32-characters-long-secret-here"
+   ```
+
+   Generate a strong secret:
+
+   ```bash
+   bunx ideal-auth secret
+   ```
+
+3. **Register the runtime config**
+
+   ```ts title="nuxt.config.ts"
+   export default defineNuxtConfig({
+     runtimeConfig: {
+       idealAuthSecret: process.env.IDEAL_AUTH_SECRET,
+     },
+   });
+   ```
+
+</Steps>
+
+---
+
+## Cookie bridge
+
+Nuxt's server routes receive an H3 `event` object. Use the `getCookie`, `setCookie`, and `deleteCookie` helpers from `h3` to build the bridge.
+
+```ts title="server/utils/cookies.ts"
+import type { H3Event } from 'h3';
+import type { CookieBridge } from 'ideal-auth';
+
+export function createCookieBridge(event: H3Event): CookieBridge {
+  return {
+    get(name: string) {
+      return getCookie(event, name);
+    },
+    set(name, value, options) {
+      setCookie(event, name, value, options);
+    },
+    delete(name) {
+      deleteCookie(event, name, { path: '/' });
+    },
+  };
+}
+```
+
+<Aside>
+  `getCookie`, `setCookie`, and `deleteCookie` are auto-imported from `h3` in Nuxt server routes. You do not need to import them explicitly.
+</Aside>
+
+---
+
+## Auth setup
+
+Create an `auth()` utility that accepts an H3 event and returns an `AuthInstance`.
+
+```ts title="server/utils/auth.ts"
+import { createAuth, createHash } from 'ideal-auth';
+import { createCookieBridge } from './cookies';
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+};
+
+export const hash = createHash({ rounds: 12 });
+
+export function auth(event: H3Event) {
+  const config = useRuntimeConfig();
+
+  const authFactory = createAuth<User>({
+    secret: config.idealAuthSecret,
+    cookie: createCookieBridge(event),
+    hash,
+
+    async resolveUser(id) {
+      // Replace with your database query
+      return db.user.findUnique({ where: { id } });
+    },
+
+    async resolveUserByCredentials(credentials) {
+      return db.user.findUnique({
+        where: { email: credentials.email },
+      });
+    },
+  });
+
+  return authFactory();
+}
+```
+
+<Aside type="tip">
+  Files in `server/utils/` are auto-imported in Nuxt server routes. You can call `auth(event)` directly without importing it.
+</Aside>
+
+---
+
+## Login API route
+
+```ts title="server/api/auth/login.post.ts"
+export default defineEventHandler(async (event) => {
+  const body = await readBody(event);
+
+  if (!body.email || !body.password) {
+    throw createError({
+      statusCode: 400,
+      statusMessage: 'Email and password are required.',
+    });
+  }
+
+  const session = auth(event);
+  const success = await session.attempt(
+    { email: body.email, password: body.password },
+    { remember: body.remember ?? false },
+  );
+
+  if (!success) {
+    throw createError({
+      statusCode: 401,
+      statusMessage: 'Invalid email or password.',
+    });
+  }
+
+  return { success: true };
+});
+```
+
+### Login page
+
+```vue title="pages/login.vue"
+<script setup lang="ts">
+definePageMeta({ middleware: 'guest' });
+
+const email = ref('');
+const password = ref('');
+const remember = ref(false);
+const error = ref('');
+const loading = ref(false);
+
+async function handleLogin() {
+  error.value = '';
+  loading.value = true;
+
+  try {
+    await $fetch('/api/auth/login', {
+      method: 'POST',
+      body: { email: email.value, password: password.value, remember: remember.value },
+    });
+    await navigateTo('/dashboard');
+  } catch (e: any) {
+    error.value = e.data?.statusMessage ?? 'Login failed.';
+  } finally {
+    loading.value = false;
+  }
+}
+</script>
+
+<template>
+  <div>
+    <h1>Sign in</h1>
+
+    <p v-if="error" class="error">{{ error }}</p>
+
+    <form @submit.prevent="handleLogin">
+      <label for="email">Email</label>
+      <input id="email" v-model="email" type="email" required />
+
+      <label for="password">Password</label>
+      <input id="password" v-model="password" type="password" required />
+
+      <label>
+        <input v-model="remember" type="checkbox" /> Remember me
+      </label>
+
+      <button type="submit" :disabled="loading">
+        {{ loading ? 'Signing in...' : 'Sign in' }}
+      </button>
+    </form>
+  </div>
+</template>
+```
+
+---
+
+## Registration API route
+
+```ts title="server/api/auth/register.post.ts"
+export default defineEventHandler(async (event) => {
+  const body = await readBody(event);
+
+  if (!body.email || !body.name || !body.password) {
+    throw createError({
+      statusCode: 400,
+      statusMessage: 'All fields are required.',
+    });
+  }
+
+  if (body.password.length < 8) {
+    throw createError({
+      statusCode: 400,
+      statusMessage: 'Password must be at least 8 characters.',
+    });
+  }
+
+  if (body.password !== body.passwordConfirmation) {
+    throw createError({
+      statusCode: 400,
+      statusMessage: 'Passwords do not match.',
+    });
+  }
+
+  const existing = await db.user.findUnique({ where: { email: body.email } });
+  if (existing) {
+    throw createError({
+      statusCode: 409,
+      statusMessage: 'An account with this email already exists.',
+    });
+  }
+
+  const user = await db.user.create({
+    data: {
+      email: body.email,
+      name: body.name,
+      password: await hash.make(body.password),
+    },
+  });
+
+  // Log the user in immediately after registration
+  const session = auth(event);
+  await session.login(user);
+
+  return { success: true };
+});
+```
+
+---
+
+## Logout API route
+
+```ts title="server/api/auth/logout.post.ts"
+export default defineEventHandler(async (event) => {
+  const session = auth(event);
+  await session.logout();
+  return { success: true };
+});
+```
+
+---
+
+## Current user API route
+
+Expose a route that returns the current user so client-side code can access it.
+
+```ts title="server/api/auth/user.get.ts"
+export default defineEventHandler(async (event) => {
+  const session = auth(event);
+  const user = await session.user();
+
+  if (!user) {
+    return { user: null };
+  }
+
+  // Only return non-sensitive fields
+  return {
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+    },
+  };
+});
+```
+
+---
+
+## Auth middleware (server)
+
+Protect API routes that require authentication with a server middleware.
+
+```ts title="server/middleware/auth.ts"
+const protectedPrefixes = ['/api/dashboard', '/api/settings', '/api/profile'];
+
+export default defineEventHandler(async (event) => {
+  const path = getRequestURL(event).pathname;
+
+  const isProtected = protectedPrefixes.some((prefix) => path.startsWith(prefix));
+  if (!isProtected) return;
+
+  const session = auth(event);
+  const isAuthenticated = await session.check();
+
+  if (!isAuthenticated) {
+    throw createError({
+      statusCode: 401,
+      statusMessage: 'Authentication required.',
+    });
+  }
+});
+```
+
+---
+
+## Route middleware (client)
+
+Use Nuxt route middleware to protect pages on the client side.
+
+```ts title="middleware/auth.ts"
+export default defineNuxtRouteMiddleware(async (to) => {
+  const { data } = await useFetch('/api/auth/user');
+
+  if (!data.value?.user) {
+    return navigateTo(`/login?callbackUrl=${encodeURIComponent(to.fullPath)}`);
+  }
+});
+```
+
+```ts title="middleware/guest.ts"
+export default defineNuxtRouteMiddleware(async () => {
+  const { data } = await useFetch('/api/auth/user');
+
+  if (data.value?.user) {
+    return navigateTo('/dashboard');
+  }
+});
+```
+
+Apply middleware in your page:
+
+```vue title="pages/dashboard.vue"
+<script setup lang="ts">
+definePageMeta({ middleware: 'auth' });
+
+const { data } = await useFetch('/api/auth/user');
+</script>
+
+<template>
+  <div>
+    <h1>Welcome, {{ data?.user?.name }}</h1>
+    <p>Email: {{ data?.user?.email }}</p>
+  </div>
+</template>
+```
+
+---
+
+## Getting the current user
+
+### In a server route
+
+```ts title="server/api/dashboard/stats.get.ts"
+export default defineEventHandler(async (event) => {
+  const session = auth(event);
+  const user = await session.user();
+
+  if (!user) {
+    throw createError({ statusCode: 401, statusMessage: 'Unauthorized' });
+  }
+
+  // Use user.id to fetch user-specific data
+  const stats = await db.stats.findMany({ where: { userId: user.id } });
+  return { stats };
+});
+```
+
+### In a page via composable
+
+Create a reusable composable for the current user:
+
+```ts title="composables/useAuth.ts"
+export function useAuth() {
+  const user = useState<{ id: string; email: string; name: string } | null>('auth-user', () => null);
+
+  async function fetchUser() {
+    const { data } = await useFetch('/api/auth/user');
+    user.value = data.value?.user ?? null;
+  }
+
+  async function logout() {
+    await $fetch('/api/auth/logout', { method: 'POST' });
+    user.value = null;
+    await navigateTo('/login');
+  }
+
+  return { user, fetchUser, logout };
+}
+```
+
+---
+
+## CSRF protection
+
+Nuxt does not include built-in CSRF protection for API routes. You should implement Origin header validation for state-changing endpoints.
+
+### Option 1: Server middleware
+
+```ts title="server/middleware/csrf.ts"
+const SAFE_METHODS = ['GET', 'HEAD', 'OPTIONS'];
+
+export default defineEventHandler((event) => {
+  const method = getMethod(event);
+  if (SAFE_METHODS.includes(method)) return;
+
+  const origin = getRequestHeader(event, 'origin');
+  const host = getRequestHeader(event, 'host');
+
+  if (!origin || !host) {
+    throw createError({ statusCode: 403, statusMessage: 'Forbidden: missing origin.' });
+  }
+
+  try {
+    const originHost = new URL(origin).host;
+    if (originHost !== host) {
+      throw createError({ statusCode: 403, statusMessage: 'Forbidden: origin mismatch.' });
+    }
+  } catch {
+    throw createError({ statusCode: 403, statusMessage: 'Forbidden: invalid origin.' });
+  }
+});
+```
+
+### Option 2: Nuxt Security module
+
+```bash
+bun add nuxt-security
+```
+
+```ts title="nuxt.config.ts"
+export default defineNuxtConfig({
+  modules: ['nuxt-security'],
+});
+```
+
+The `nuxt-security` module provides CSRF protection along with other security headers out of the box.
+
+---
+
+## Security notes
+
+- **Session secret**: Store `IDEAL_AUTH_SECRET` in environment variables. Access it via `useRuntimeConfig()` in server routes, never in client code.
+- **HTTPS**: Set `NODE_ENV=production` in production so session cookies are automatically marked `Secure`.
+- **Cookie scope**: The default `SameSite=Lax` and `HttpOnly=true` settings protect against CSRF and XSS cookie theft.
+- **User data serialization**: Only return non-sensitive fields from the `/api/auth/user` endpoint. Never expose password hashes to the client.
+- **Server-side validation**: Always validate and sanitize input in server routes. Client-side validation is for UX only.
+- **Auto-imports**: Nuxt auto-imports `server/utils/` files. Ensure your `auth()` and `hash` utilities are in that directory for ergonomic usage.

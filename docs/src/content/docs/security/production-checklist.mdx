@@ -1,0 +1,213 @@
+---
+title: Production Checklist
+description: Security checklist before deploying to production.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Review every item on this list before deploying an application that uses ideal-auth to production. Each item links to the relevant documentation section where applicable.
+
+---
+
+## Environment
+
+- [ ] **`IDEAL_AUTH_SECRET` is set and is 32+ characters.** Generate one with `bunx ideal-auth secret`. ideal-auth will throw at startup if the secret is missing or too short.
+
+- [ ] **`IDEAL_AUTH_SECRET` is not committed to version control.** Store it in your deployment platform's environment variables (Vercel, Fly.io, Railway, AWS SSM, etc.). Add `.env` and `.env.local` to your `.gitignore`.
+
+- [ ] **`NODE_ENV` is set to `"production"`.** This controls whether the `secure` flag is set on session cookies. Most deployment platforms set this automatically.
+
+- [ ] **HTTPS is enabled.** Cookies with `secure: true` (the production default) are only sent over HTTPS. Without HTTPS, session cookies will not be set and authentication will silently fail.
+
+---
+
+## Sessions
+
+- [ ] **Session `maxAge` is appropriate for your use case.** The default is 7 days (604,800 seconds). For high-security applications (banking, healthcare), consider 1-4 hours. For consumer apps, 7-30 days is common.
+
+- [ ] **`httpOnly` is forced.** This is the default and cannot be overridden — ideal-auth always sets `httpOnly: true` at runtime. No action needed, but verify you are not using a custom cookie bridge that strips this flag after ideal-auth sets it.
+
+- [ ] **`secure` cookie flag is `true` in production.** This is automatic when `NODE_ENV=production`. Verify by inspecting the `Set-Cookie` header in your browser's DevTools (Network tab).
+
+- [ ] **`sameSite` is set.** The default is `lax`, which blocks cross-origin POST requests from sending the session cookie. Only change to `strict` if your application does not need cross-origin navigation support. Never set to `none` unless you have a specific cross-origin requirement and understand the CSRF implications.
+
+---
+
+## Passwords
+
+- [ ] **bcrypt rounds are 12+.** The default is 12. Each additional round doubles the computation time. 12 rounds takes approximately 250ms on modern hardware, which is a good balance between security and user experience. Do not go below 10 for production.
+
+  ```ts
+  const hash = createHash({ rounds: 12 }); // default
+  ```
+
+- [ ] **Password minimum length is enforced.** ideal-auth rejects empty passwords but does not enforce a minimum length. Implement this in your registration and password-change flows. NIST SP 800-63B recommends a minimum of 8 characters; many security teams recommend 10-12.
+
+  ```ts
+  if (password.length < 8) {
+    return { error: 'Password must be at least 8 characters.' };
+  }
+  ```
+
+- [ ] **Passwords are never logged or stored in plaintext.** Audit your logging middleware, error handlers, and monitoring tools. Ensure form data containing passwords is not logged in request bodies. If you use a request logging library, filter out fields named `password`, `password_confirmation`, `current_password`, and `new_password`.
+
+---
+
+## Rate limiting
+
+- [ ] **Login endpoint is rate limited.** Without rate limiting, an attacker can attempt thousands of passwords per second.
+
+  ```ts
+  import { createRateLimiter } from 'ideal-auth';
+
+  const loginLimiter = createRateLimiter({
+    maxAttempts: 5,
+    windowMs: 15 * 60 * 1000, // 15 minutes
+  });
+  ```
+
+- [ ] **Registration endpoint is rate limited.** Prevents mass account creation. Use a higher limit than login (e.g., 10 attempts per 15 minutes).
+
+- [ ] **Password reset endpoint is rate limited.** Prevents enumeration attacks and email spam. Use a low limit (e.g., 3 attempts per 15 minutes).
+
+- [ ] **Using a persistent store in production (not in-memory).** The default `MemoryRateLimitStore` resets on process restart and does not share state across server instances. Implement a `RateLimitStore` backed by Redis, your database, or a distributed cache.
+
+  ```ts
+  const loginLimiter = createRateLimiter({
+    maxAttempts: 5,
+    windowMs: 15 * 60 * 1000,
+    store: new RedisRateLimitStore(redis), // your implementation
+  });
+  ```
+
+- [ ] **`x-forwarded-for` is only used behind a trusted reverse proxy.** If you use the client's IP address as the rate limit key and read it from `x-forwarded-for`, an attacker can spoof this header to bypass rate limiting. Only trust `x-forwarded-for` if your application is behind a reverse proxy (Nginx, Cloudflare, AWS ALB) that sets it. On platforms like Vercel and Fly.io, this is handled automatically.
+
+---
+
+## CSRF
+
+- [ ] **CSRF protection is enabled for your framework.** See the [CSRF Protection](/ideal-auth/security/csrf/) guide for framework-specific instructions.
+
+- [ ] **API routes have CSRF protection if not using Server Actions.** Next.js Server Actions and SvelteKit form actions have built-in CSRF protection. If you use API Route Handlers or custom endpoints, you must implement CSRF protection manually (Origin header validation or double-submit cookie pattern).
+
+---
+
+## Tokens
+
+- [ ] **Token verifier secret is 32+ characters.** Same requirement as the session secret. You can use the same secret or a different one.
+
+  ```ts
+  const resetTokens = createTokenVerifier({
+    secret: process.env.RESET_TOKEN_SECRET!,
+    expiryMs: 60 * 60 * 1000, // 1 hour
+  });
+  ```
+
+- [ ] **Different secrets per use case.** Use separate secrets (or separate `createTokenVerifier` instances) for password reset tokens and email verification tokens. This prevents a reset token from being used as a verification token and vice versa.
+
+  ```ts
+  const resetTokens = createTokenVerifier({
+    secret: process.env.RESET_TOKEN_SECRET!,
+    expiryMs: 60 * 60 * 1000,        // 1 hour
+  });
+
+  const emailTokens = createTokenVerifier({
+    secret: process.env.EMAIL_TOKEN_SECRET!,
+    expiryMs: 24 * 60 * 60 * 1000,   // 24 hours
+  });
+  ```
+
+- [ ] **Token expiry is appropriate.** Recommended values:
+  - Password reset: 1 hour (`60 * 60 * 1000`)
+  - Email verification: 24 hours (`24 * 60 * 60 * 1000`)
+  - Magic link: 15 minutes (`15 * 60 * 1000`)
+
+- [ ] **Tokens are in URL paths, not query strings.** Query strings are logged by web servers, proxies, CDNs, and analytics tools. Put tokens in URL paths instead:
+
+  ```
+  # Bad — token in query string (logged everywhere)
+  https://app.example.com/reset-password?token=abc123
+
+  # Good — token in URL path (not logged in standard access logs)
+  https://app.example.com/reset-password/abc123
+  ```
+
+- [ ] **Token `iatMs` is checked against relevant timestamps.** When verifying a password reset token, check that the token was issued **after** any previous password change. This prevents reuse of old tokens:
+
+  ```ts
+  const result = resetTokens.verifyToken(token);
+  if (!result) return { error: 'Invalid or expired token.' };
+
+  const user = await db.user.findUnique({ where: { id: result.userId } });
+  if (!user) return { error: 'User not found.' };
+
+  // Ensure token was issued after the last password change
+  if (user.passwordChangedAt && result.iatMs < user.passwordChangedAt.getTime()) {
+    return { error: 'This token has already been used.' };
+  }
+  ```
+
+---
+
+## Two-factor authentication
+
+- [ ] **TOTP secret is stored encrypted in the database.** The TOTP secret is the shared secret between your server and the user's authenticator app. If your database is compromised, an attacker with the plaintext secret can generate valid TOTP codes. Encrypt the secret before storing it:
+
+  ```ts
+  import { encrypt, decrypt } from 'ideal-auth';
+
+  // Before storing
+  const encryptedSecret = await encrypt(totpSecret, process.env.TOTP_ENCRYPTION_KEY!);
+  await db.user.update({ where: { id: userId }, data: { totpSecret: encryptedSecret } });
+
+  // Before verifying
+  const decryptedSecret = await decrypt(user.totpSecret, process.env.TOTP_ENCRYPTION_KEY!);
+  const isValid = totp.verify(code, decryptedSecret);
+  ```
+
+- [ ] **Recovery codes are shown only once and stored hashed.** `generateRecoveryCodes` returns both plaintext codes (to show the user) and bcrypt-hashed versions (to store in your database). Never store or display the plaintext codes after the initial setup.
+
+- [ ] **2FA status is verified server-side, not in cookies alone.** Do not store `has2FA: true` in the session cookie and trust it. Always check the database for the user's 2FA status when performing sensitive operations.
+
+- [ ] **TOTP replay protection is implemented for critical flows.** A TOTP code is valid for the current time window (default: 30 seconds) plus the configured window tolerance (default: 1 step = 30 seconds on each side). For critical operations (e.g., disabling 2FA, changing email), track the last used TOTP timestamp and reject codes that are not newer.
+
+---
+
+## Redirects
+
+- [ ] **Post-login redirects are validated.** Never redirect to a user-supplied URL without validation. Use the `safeRedirect` function from the [Open Redirect Prevention](/ideal-auth/security/open-redirect/) guide.
+
+- [ ] **Only relative URLs are allowed for redirects.** Reject any redirect URL that does not start with `/` or starts with `//` (protocol-relative URL).
+
+---
+
+## Session invalidation
+
+- [ ] **Password change invalidates all sessions.** Add a `passwordChangedAt` column to your users table and update it on every password change. See the [Session Invalidation](/ideal-auth/security/session-invalidation/) guide.
+
+- [ ] **`IDEAL_AUTH_SECRET` rotation plan exists for emergency invalidation.** If your secret is compromised, rotating it instantly invalidates all sessions. Have a documented procedure for:
+  1. Generating a new secret
+  2. Deploying it to all server instances
+  3. Communicating the forced logout to users (if applicable)
+
+---
+
+## Optional but recommended
+
+These are not strictly required but significantly improve your security posture:
+
+- [ ] **Content Security Policy (CSP) header is set.** Prevents inline script injection and restricts resource loading to trusted origins.
+
+- [ ] **`Strict-Transport-Security` (HSTS) header is set.** Forces browsers to always use HTTPS for your domain.
+
+- [ ] **Subresource Integrity (SRI) is enabled** for third-party scripts loaded from CDNs.
+
+- [ ] **Error messages do not leak user existence.** Use the same error message for "wrong email" and "wrong password" (e.g., "Invalid email or password"). This prevents user enumeration.
+
+- [ ] **Account lockout is implemented after repeated failures.** After N failed login attempts, temporarily lock the account or require CAPTCHA. The rate limiter handles IP-based throttling; account lockout handles distributed attacks from multiple IPs.
+
+- [ ] **Security headers are set.** Review `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, and `Permissions-Policy`.
+
+<Aside type="tip">
+  Use [securityheaders.com](https://securityheaders.com) to scan your deployed application and identify missing security headers.
+</Aside>

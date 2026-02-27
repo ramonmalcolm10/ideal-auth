@@ -1,0 +1,54 @@
+---
+title: ideal-auth
+description: Auth primitives for the JS ecosystem. Zero framework dependencies.
+template: splash
+hero:
+  tagline: Session auth, password hashing, 2FA, token verification, and rate limiting. Bring your own schema. Works with any framework.
+  actions:
+    - text: Get Started
+      link: /ideal-auth/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/ramonmalcolm10/ideal-auth
+      icon: external
+      variant: minimal
+      attrs:
+        target: _blank
+        rel: noopener
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Why ideal-auth?
+
+<CardGrid>
+  <Card title="Framework agnostic" icon="rocket">
+    Works with Next.js, SvelteKit, Nuxt, TanStack Start, Express, Hono, and any framework that can get, set, and delete cookies.
+  </Card>
+  <Card title="Bring your own schema" icon="document">
+    No database adapters or ORM lock-in. You provide `resolveUser` and `resolveUserByCredentials` — use any database, any schema.
+  </Card>
+  <Card title="Encrypted sessions" icon="approve-check">
+    Session payloads are encrypted with AES-256-GCM and authenticated with HMAC via iron-session. No plaintext tokens, no JWTs.
+  </Card>
+  <Card title="TOTP 2FA with recovery codes" icon="setting">
+    RFC 6238 compliant one-time passwords with configurable digits, period, and window. Generate hashed recovery codes out of the box.
+  </Card>
+  <Card title="Security-first defaults" icon="warning">
+    `httpOnly` cookies are always forced on. bcrypt uses SHA-256 prehash for long passwords. All comparisons are timing-safe. `secure` defaults to `true` in production.
+  </Card>
+  <Card title="Runs everywhere" icon="laptop">
+    Zero framework dependencies. Works in Node.js, Bun, and Deno with no configuration changes.
+  </Card>
+</CardGrid>
+
+## What's included
+
+- **`createAuth`** — Session authentication with encrypted cookies, login, logout, and user resolution
+- **`createHash`** — bcrypt password hashing with automatic SHA-256 prehash for passwords exceeding 72 bytes
+- **`createTokenVerifier`** — Signed, expiring tokens for password resets, email verification, and similar flows
+- **`createTOTP`** — RFC 6238 time-based one-time passwords for two-factor authentication
+- **`generateRecoveryCodes`** — Hashed backup codes for 2FA recovery
+- **`createRateLimiter`** — Sliding-window rate limiting with pluggable stores
+- **Crypto utilities** — `encrypt`/`decrypt`, `signData`/`verifySignature`, `timingSafeEqual`, `generateToken`

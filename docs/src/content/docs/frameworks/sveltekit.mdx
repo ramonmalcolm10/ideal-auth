@@ -1,0 +1,420 @@
+---
+title: SvelteKit
+description: Complete auth setup for SvelteKit with ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide walks through setting up authentication in a **SvelteKit** application using `ideal-auth`. By the end, you will have working login, registration, logout, route protection via hooks, and access to the current user in pages and layouts.
+
+## Installation
+
+<Steps>
+
+1. **Install ideal-auth**
+
+   ```bash
+   bun add ideal-auth
+   ```
+
+2. **Set the session secret**
+
+   Add a secret to your `.env` file. It must be at least 32 characters.
+
+   ```bash title=".env"
+   IDEAL_AUTH_SECRET="at-least-32-characters-long-secret-here"
+   ```
+
+   Generate a strong secret:
+
+   ```bash
+   bunx ideal-auth secret
+   ```
+
+</Steps>
+
+---
+
+## Cookie bridge
+
+SvelteKit provides a `cookies` object on every `RequestEvent`. The bridge maps its API to the three functions `ideal-auth` expects.
+
+```ts title="src/lib/server/cookies.ts"
+import type { Cookies } from '@sveltejs/kit';
+import type { CookieBridge } from 'ideal-auth';
+
+export function createCookieBridge(cookies: Cookies): CookieBridge {
+  return {
+    get(name: string) {
+      return cookies.get(name);
+    },
+    set(name, value, options) {
+      cookies.set(name, value, {
+        ...options,
+        // SvelteKit requires an explicit path
+        path: options.path ?? '/',
+      });
+    },
+    delete(name) {
+      cookies.delete(name, { path: '/' });
+    },
+  };
+}
+```
+
+<Aside>
+  SvelteKit's `cookies.set()` requires a `path` option. The bridge passes through the path from `ideal-auth` (which defaults to `'/'`), but the fallback ensures it is always present.
+</Aside>
+
+---
+
+## Auth setup
+
+Create an `auth()` factory that accepts a SvelteKit `Cookies` object and returns an `AuthInstance`.
+
+```ts title="src/lib/server/auth.ts"
+import { createAuth, createHash } from 'ideal-auth';
+import { createCookieBridge } from './cookies';
+import { db } from '$lib/server/db';
+import { IDEAL_AUTH_SECRET } from '$env/static/private';
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+};
+
+export const hash = createHash({ rounds: 12 });
+
+export function auth(cookies: import('@sveltejs/kit').Cookies) {
+  const authFactory = createAuth<User>({
+    secret: IDEAL_AUTH_SECRET,
+    cookie: createCookieBridge(cookies),
+    hash,
+
+    async resolveUser(id) {
+      return db.user.findUnique({ where: { id } });
+    },
+
+    async resolveUserByCredentials(credentials) {
+      return db.user.findUnique({
+        where: { email: credentials.email },
+      });
+    },
+  });
+
+  return authFactory();
+}
+```
+
+<Aside type="tip">
+  Because SvelteKit creates a new `cookies` object per request, you must pass it into `auth()` each time. This keeps each request isolated.
+</Aside>
+
+---
+
+## Login (form action)
+
+```ts title="src/routes/login/+page.server.ts"
+import { fail, redirect } from '@sveltejs/kit';
+import { auth } from '$lib/server/auth';
+import type { Actions, PageServerLoad } from './$types';
+
+export const load: PageServerLoad = async ({ cookies }) => {
+  const session = auth(cookies);
+
+  if (await session.check()) {
+    redirect(303, '/dashboard');
+  }
+};
+
+export const actions: Actions = {
+  default: async ({ request, cookies }) => {
+    const data = await request.formData();
+    const email = data.get('email') as string;
+    const password = data.get('password') as string;
+    const remember = data.get('remember') === 'on';
+
+    if (!email || !password) {
+      return fail(400, { error: 'Email and password are required.', email });
+    }
+
+    const session = auth(cookies);
+    const success = await session.attempt(
+      { email, password },
+      { remember },
+    );
+
+    if (!success) {
+      return fail(400, { error: 'Invalid email or password.', email });
+    }
+
+    redirect(303, '/dashboard');
+  },
+};
+```
+
+### Login form
+
+```svelte title="src/routes/login/+page.svelte"
+<script lang="ts">
+  import { enhance } from '$app/forms';
+  import type { ActionData } from './$types';
+
+  let { form }: { form: ActionData } = $props();
+</script>
+
+<h1>Sign in</h1>
+
+{#if form?.error}
+  <p class="error">{form.error}</p>
+{/if}
+
+<form method="POST" use:enhance>
+  <label for="email">Email</label>
+  <input id="email" name="email" type="email" value={form?.email ?? ''} required />
+
+  <label for="password">Password</label>
+  <input id="password" name="password" type="password" required />
+
+  <label>
+    <input name="remember" type="checkbox" /> Remember me
+  </label>
+
+  <button type="submit">Sign in</button>
+</form>
+```
+
+---
+
+## Registration (form action)
+
+```ts title="src/routes/register/+page.server.ts"
+import { fail, redirect } from '@sveltejs/kit';
+import { auth, hash } from '$lib/server/auth';
+import { db } from '$lib/server/db';
+import type { Actions } from './$types';
+
+export const actions: Actions = {
+  default: async ({ request, cookies }) => {
+    const data = await request.formData();
+    const email = data.get('email') as string;
+    const name = data.get('name') as string;
+    const password = data.get('password') as string;
+    const passwordConfirmation = data.get('password_confirmation') as string;
+
+    if (!email || !name || !password) {
+      return fail(400, { error: 'All fields are required.', email, name });
+    }
+
+    if (password.length < 8) {
+      return fail(400, { error: 'Password must be at least 8 characters.', email, name });
+    }
+
+    if (password !== passwordConfirmation) {
+      return fail(400, { error: 'Passwords do not match.', email, name });
+    }
+
+    const existing = await db.user.findUnique({ where: { email } });
+    if (existing) {
+      return fail(400, { error: 'An account with this email already exists.', email, name });
+    }
+
+    const user = await db.user.create({
+      data: {
+        email,
+        name,
+        password: await hash.make(password),
+      },
+    });
+
+    // Log the user in immediately after registration
+    const session = auth(cookies);
+    await session.login(user);
+
+    redirect(303, '/dashboard');
+  },
+};
+```
+
+---
+
+## Logout (form action)
+
+```ts title="src/routes/logout/+page.server.ts"
+import { redirect } from '@sveltejs/kit';
+import { auth } from '$lib/server/auth';
+import type { Actions } from './$types';
+
+export const actions: Actions = {
+  default: async ({ cookies }) => {
+    const session = auth(cookies);
+    await session.logout();
+    redirect(303, '/login');
+  },
+};
+```
+
+### Logout button
+
+```svelte title="src/lib/components/LogoutButton.svelte"
+<script lang="ts">
+  import { enhance } from '$app/forms';
+</script>
+
+<form method="POST" action="/logout" use:enhance>
+  <button type="submit">Sign out</button>
+</form>
+```
+
+---
+
+## Auth guard (handle hook)
+
+Use a `handle` hook to protect routes and make the current user available throughout the application via `event.locals`.
+
+First, declare the types:
+
+```ts title="src/app.d.ts"
+declare global {
+  namespace App {
+    interface Locals {
+      user: {
+        id: string;
+        email: string;
+        name: string;
+      } | null;
+    }
+  }
+}
+
+export {};
+```
+
+Then implement the hook:
+
+```ts title="src/hooks.server.ts"
+import { redirect, type Handle } from '@sveltejs/kit';
+import { auth } from '$lib/server/auth';
+
+const protectedRoutes = ['/dashboard', '/settings', '/profile'];
+const authRoutes = ['/login', '/register'];
+
+export const handle: Handle = async ({ event, resolve }) => {
+  const session = auth(event.cookies);
+  const user = await session.user();
+
+  // Attach user to locals for access in load functions and actions
+  event.locals.user = user
+    ? { id: user.id, email: user.email, name: user.name }
+    : null;
+
+  const { pathname } = event.url;
+
+  // Redirect unauthenticated users away from protected routes
+  if (protectedRoutes.some((route) => pathname.startsWith(route))) {
+    if (!user) {
+      redirect(303, `/login?callbackUrl=${encodeURIComponent(pathname)}`);
+    }
+  }
+
+  // Redirect authenticated users away from auth routes
+  if (authRoutes.some((route) => pathname.startsWith(route))) {
+    if (user) {
+      redirect(303, '/dashboard');
+    }
+  }
+
+  return resolve(event);
+};
+```
+
+<Aside type="caution">
+  Only attach non-sensitive fields to `event.locals.user`. Do not include the password hash or other secrets.
+</Aside>
+
+---
+
+## Getting the current user
+
+### In a load function
+
+```ts title="src/routes/dashboard/+page.server.ts"
+import type { PageServerLoad } from './$types';
+
+export const load: PageServerLoad = async ({ locals }) => {
+  // user is already available from the handle hook
+  return {
+    user: locals.user,
+  };
+};
+```
+
+### In a page component
+
+```svelte title="src/routes/dashboard/+page.svelte"
+<script lang="ts">
+  import LogoutButton from '$lib/components/LogoutButton.svelte';
+  import type { PageData } from './$types';
+
+  let { data }: { data: PageData } = $props();
+</script>
+
+<h1>Welcome, {data.user?.name}</h1>
+<p>Email: {data.user?.email}</p>
+
+<LogoutButton />
+```
+
+### In a layout
+
+```ts title="src/routes/dashboard/+layout.server.ts"
+import { redirect } from '@sveltejs/kit';
+import type { LayoutServerLoad } from './$types';
+
+export const load: LayoutServerLoad = async ({ locals }) => {
+  if (!locals.user) {
+    redirect(303, '/login');
+  }
+
+  return {
+    user: locals.user,
+  };
+};
+```
+
+---
+
+## CSRF protection
+
+SvelteKit has **built-in CSRF protection**. It automatically checks the `Origin` header on all form submissions and rejects cross-origin requests with a `403` response. This is enabled by default and requires no additional configuration.
+
+If you need to customize this behavior (for example, to allow specific origins), you can configure it in `svelte.config.js`:
+
+```js title="svelte.config.js"
+const config = {
+  kit: {
+    csrf: {
+      checkOrigin: true, // this is the default
+    },
+  },
+};
+
+export default config;
+```
+
+<Aside type="caution">
+  Do not set `checkOrigin: false` in production. If you have a legitimate need for cross-origin form submissions, add the allowed origins to your configuration rather than disabling the check entirely.
+</Aside>
+
+---
+
+## Security notes
+
+- **Session secret**: Use `$env/static/private` or `$env/dynamic/private` to access the secret. Never import secrets into client-side code.
+- **HTTPS**: In production, set `NODE_ENV=production` so session cookies are automatically marked `Secure`.
+- **Cookie scope**: The default `SameSite=Lax` and `HttpOnly=true` settings protect against CSRF and XSS cookie theft.
+- **Locals safety**: Only attach non-sensitive, serializable data to `event.locals`. Data in locals is not automatically exposed to the client, but load functions that return it will serialize it.
+- **Password hashing**: `createHash` uses bcrypt with SHA-256 pre-hashing for passwords over 72 bytes. The default 12 rounds is suitable for production.
+- **Form actions vs API routes**: Prefer form actions for auth operations. They benefit from SvelteKit's built-in CSRF protection and progressive enhancement via `use:enhance`.

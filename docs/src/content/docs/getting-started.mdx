@@ -1,0 +1,217 @@
+---
+title: Getting Started
+description: Install ideal-auth and set up your first auth flow in minutes.
+---
+
+import { Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Installation
+
+<Tabs>
+  <TabItem label="bun">
+    ```bash
+    bun add ideal-auth
+    ```
+  </TabItem>
+  <TabItem label="npm">
+    ```bash
+    npm install ideal-auth
+    ```
+  </TabItem>
+  <TabItem label="pnpm">
+    ```bash
+    pnpm add ideal-auth
+    ```
+  </TabItem>
+  <TabItem label="yarn">
+    ```bash
+    yarn add ideal-auth
+    ```
+  </TabItem>
+</Tabs>
+
+## Setup
+
+<Steps>
+
+1. ### Generate a secret
+
+   ideal-auth requires a secret of at least 32 characters for encrypting sessions and signing tokens. Generate one with the built-in CLI:
+
+   ```bash
+   bunx ideal-auth secret
+   ```
+
+   Add the output to your environment variables:
+
+   ```bash title=".env"
+   IDEAL_AUTH_SECRET="your-generated-secret-here"
+   ```
+
+   :::caution
+   Never commit your secret to version control. Add `.env` to your `.gitignore`.
+   :::
+
+2. ### Create the cookie bridge
+
+   The cookie bridge is what makes ideal-auth framework agnostic. It is an object with three functions — `get`, `set`, and `delete` — that tell ideal-auth how to interact with cookies in your framework.
+
+   Here is a cookie bridge for **Next.js** (App Router):
+
+   ```ts title="lib/auth.ts"
+   import { cookies } from 'next/headers';
+   import { createAuth, createHash } from 'ideal-auth';
+
+   const cookieBridge = {
+     async get(name: string) {
+       const jar = await cookies();
+       return jar.get(name)?.value;
+     },
+     async set(name: string, value: string, options: any) {
+       const jar = await cookies();
+       jar.set(name, value, options);
+     },
+     async delete(name: string) {
+       const jar = await cookies();
+       jar.delete(name);
+     },
+   };
+   ```
+
+   :::tip
+   See [Framework Guides](/ideal-auth/frameworks/nextjs/) for complete cookie bridge examples for SvelteKit, Nuxt, TanStack Start, Express, Hono, and more.
+   :::
+
+3. ### Create the auth and hash instances
+
+   ```ts title="lib/auth.ts"
+   import { db } from './db'; // your database client
+
+   export const hash = createHash();
+
+   export const auth = createAuth({
+     secret: process.env.IDEAL_AUTH_SECRET!,
+     cookie: cookieBridge,
+
+     // Look up a user by ID (used to rehydrate sessions)
+     resolveUser: async (id) => {
+       return db.user.findUnique({ where: { id } });
+     },
+
+     // Look up a user by credentials (used by auth().attempt())
+     resolveUserByCredentials: async (credentials) => {
+       return db.user.findUnique({ where: { email: credentials.email } });
+     },
+
+     // Provide the hash instance so attempt() can verify passwords
+     hash,
+   });
+   ```
+
+   `createAuth` returns a **factory function**. Call `auth()` in each request to get a fresh `AuthInstance` scoped to that request's cookies.
+
+4. ### Implement login
+
+   ```ts title="app/login/actions.ts"
+   'use server';
+
+   import { auth } from '@/lib/auth';
+   import { redirect } from 'next/navigation';
+
+   export async function login(formData: FormData) {
+     const email = formData.get('email') as string;
+     const password = formData.get('password') as string;
+
+     const success = await auth().attempt({ email, password });
+
+     if (!success) {
+       return { error: 'Invalid email or password.' };
+     }
+
+     redirect('/dashboard');
+   }
+   ```
+
+   The `attempt` method strips the password from the credentials, passes the remaining fields to `resolveUserByCredentials`, then verifies the password hash automatically.
+
+5. ### Implement logout
+
+   ```ts title="app/logout/actions.ts"
+   'use server';
+
+   import { auth } from '@/lib/auth';
+   import { redirect } from 'next/navigation';
+
+   export async function logout() {
+     await auth().logout();
+     redirect('/login');
+   }
+   ```
+
+6. ### Protect routes with middleware
+
+   ```ts title="middleware.ts"
+   import { NextResponse } from 'next/server';
+   import type { NextRequest } from 'next/server';
+   import { auth } from '@/lib/auth';
+
+   export async function middleware(request: NextRequest) {
+     const isAuthenticated = await auth().check();
+
+     if (!isAuthenticated) {
+       return NextResponse.redirect(new URL('/login', request.url));
+     }
+
+     return NextResponse.next();
+   }
+
+   export const config = {
+     matcher: ['/dashboard/:path*', '/settings/:path*'],
+   };
+   ```
+
+</Steps>
+
+## Registering users
+
+ideal-auth does not manage user creation — that is up to your application. Use the `hash` instance to hash passwords before storing them:
+
+```ts title="app/register/actions.ts"
+'use server';
+
+import { auth, hash } from '@/lib/auth';
+import { db } from '@/lib/db';
+import { redirect } from 'next/navigation';
+
+export async function register(formData: FormData) {
+  const email = formData.get('email') as string;
+  const password = formData.get('password') as string;
+
+  const hashedPassword = await hash.make(password);
+
+  const user = await db.user.create({
+    data: { email, password: hashedPassword },
+  });
+
+  // Log the user in immediately after registration
+  await auth().login(user);
+
+  redirect('/dashboard');
+}
+```
+
+## Reading the current user
+
+Use `auth().user()` to get the full user object, or `auth().id()` to get just the user ID:
+
+```ts
+const currentUser = await auth().user();  // TUser | null
+const userId = await auth().id();          // string | null
+```
+
+## Next steps
+
+- [Configuration](/ideal-auth/configuration/) — All configuration options in detail
+- [Two-Factor Authentication](/ideal-auth/guides/two-factor-auth/) — Add TOTP 2FA to your app
+- [Rate Limiting](/ideal-auth/guides/rate-limiting/) — Protect login endpoints from brute force
+- [Security Model](/ideal-auth/security/model/) — Understand the security guarantees

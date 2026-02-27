@@ -1,0 +1,426 @@
+---
+title: Next.js
+description: Complete auth setup for Next.js App Router with ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide walks through setting up authentication in a **Next.js App Router** application using `ideal-auth`. By the end, you will have working login, registration, logout, route protection via middleware, and access to the current user in Server Components.
+
+## Installation
+
+<Steps>
+
+1. **Install ideal-auth**
+
+   ```bash
+   bun add ideal-auth
+   ```
+
+2. **Set the session secret**
+
+   Add a secret to your `.env.local` file. It must be at least 32 characters.
+
+   ```bash title=".env.local"
+   IDEAL_AUTH_SECRET="at-least-32-characters-long-secret-here"
+   ```
+
+   Generate a strong secret:
+
+   ```bash
+   bunx ideal-auth secret
+   ```
+
+</Steps>
+
+---
+
+## Cookie bridge
+
+Next.js exposes a `cookies()` helper from `next/headers`. The bridge maps it to the three functions `ideal-auth` expects.
+
+```ts title="lib/cookies.ts"
+import { cookies } from 'next/headers';
+import type { CookieBridge } from 'ideal-auth';
+
+export function createCookieBridge(): CookieBridge {
+  return {
+    async get(name: string) {
+      const cookieStore = await cookies();
+      return cookieStore.get(name)?.value;
+    },
+    async set(name, value, options) {
+      const cookieStore = await cookies();
+      cookieStore.set(name, value, options);
+    },
+    async delete(name) {
+      const cookieStore = await cookies();
+      cookieStore.delete(name);
+    },
+  };
+}
+```
+
+<Aside type="caution">
+  `cookies()` is async in Next.js 15+. If you are on Next.js 14, remove the `await` before `cookies()`.
+</Aside>
+
+---
+
+## Auth setup
+
+Create a single `auth()` factory. Every Server Action or Route Handler calls `auth()` to get a fresh `AuthInstance` bound to the current request's cookies.
+
+```ts title="lib/auth.ts"
+import { createAuth, createHash } from 'ideal-auth';
+import { createCookieBridge } from './cookies';
+import { db } from './db'; // your database client
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+};
+
+const hash = createHash({ rounds: 12 });
+
+const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  hash,
+
+  // Look up a user by their ID (used by check/user/id)
+  async resolveUser(id) {
+    return db.user.findUnique({ where: { id } });
+  },
+
+  // Look up a user by non-password credentials (used by attempt)
+  async resolveUserByCredentials(credentials) {
+    return db.user.findUnique({
+      where: { email: credentials.email },
+    });
+  },
+});
+
+export { auth, hash };
+```
+
+<Aside>
+  `createAuth` returns a **factory function**. Call `auth()` inside each Server Action to get an `AuthInstance` scoped to that request. Do not call it at module level.
+</Aside>
+
+---
+
+## Login action
+
+```ts title="app/actions/login.ts"
+'use server';
+
+import { redirect } from 'next/navigation';
+import { auth } from '@/lib/auth';
+
+export async function loginAction(_prev: unknown, formData: FormData) {
+  const email = formData.get('email') as string;
+  const password = formData.get('password') as string;
+  const remember = formData.get('remember') === 'on';
+
+  if (!email || !password) {
+    return { error: 'Email and password are required.' };
+  }
+
+  const session = auth();
+  const success = await session.attempt(
+    { email, password },
+    { remember },
+  );
+
+  if (!success) {
+    return { error: 'Invalid email or password.' };
+  }
+
+  redirect('/dashboard');
+}
+```
+
+### Login form
+
+```tsx title="app/login/page.tsx"
+'use client';
+
+import { useActionState } from 'react';
+import { loginAction } from '@/app/actions/login';
+
+export default function LoginPage() {
+  const [state, formAction, pending] = useActionState(loginAction, null);
+
+  return (
+    <form action={formAction}>
+      {state?.error && <p className="text-red-500">{state.error}</p>}
+
+      <label htmlFor="email">Email</label>
+      <input id="email" name="email" type="email" required />
+
+      <label htmlFor="password">Password</label>
+      <input id="password" name="password" type="password" required />
+
+      <label>
+        <input name="remember" type="checkbox" /> Remember me
+      </label>
+
+      <button type="submit" disabled={pending}>
+        {pending ? 'Signing in...' : 'Sign in'}
+      </button>
+    </form>
+  );
+}
+```
+
+---
+
+## Registration action
+
+```ts title="app/actions/register.ts"
+'use server';
+
+import { redirect } from 'next/navigation';
+import { auth, hash } from '@/lib/auth';
+import { db } from '@/lib/db';
+
+export async function registerAction(_prev: unknown, formData: FormData) {
+  const email = formData.get('email') as string;
+  const name = formData.get('name') as string;
+  const password = formData.get('password') as string;
+  const passwordConfirmation = formData.get('password_confirmation') as string;
+
+  if (!email || !name || !password) {
+    return { error: 'All fields are required.' };
+  }
+
+  if (password.length < 8) {
+    return { error: 'Password must be at least 8 characters.' };
+  }
+
+  if (password !== passwordConfirmation) {
+    return { error: 'Passwords do not match.' };
+  }
+
+  const existing = await db.user.findUnique({ where: { email } });
+  if (existing) {
+    return { error: 'An account with this email already exists.' };
+  }
+
+  const user = await db.user.create({
+    data: {
+      email,
+      name,
+      password: await hash.make(password),
+    },
+  });
+
+  // Log the user in immediately after registration
+  const session = auth();
+  await session.login(user);
+
+  redirect('/dashboard');
+}
+```
+
+---
+
+## Logout action
+
+```ts title="app/actions/logout.ts"
+'use server';
+
+import { redirect } from 'next/navigation';
+import { auth } from '@/lib/auth';
+
+export async function logoutAction() {
+  const session = auth();
+  await session.logout();
+  redirect('/login');
+}
+```
+
+### Logout button
+
+```tsx title="components/logout-button.tsx"
+'use client';
+
+import { logoutAction } from '@/app/actions/logout';
+
+export function LogoutButton() {
+  return (
+    <form action={logoutAction}>
+      <button type="submit">Sign out</button>
+    </form>
+  );
+}
+```
+
+---
+
+## Middleware (route protection)
+
+Next.js middleware runs on the Edge Runtime before every matching request. Because `ideal-auth` uses `iron-session` (which relies on Node.js crypto), you cannot use `auth()` directly in Edge middleware. Instead, check for the existence of the session cookie and let the server-side code handle full validation.
+
+```ts title="middleware.ts"
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+const protectedRoutes = ['/dashboard', '/settings', '/profile'];
+const authRoutes = ['/login', '/register'];
+
+export function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+  const hasSession = request.cookies.has('ideal_session');
+
+  // Redirect unauthenticated users away from protected routes
+  if (protectedRoutes.some((route) => pathname.startsWith(route))) {
+    if (!hasSession) {
+      const loginUrl = new URL('/login', request.url);
+      loginUrl.searchParams.set('callbackUrl', pathname);
+      return NextResponse.redirect(loginUrl);
+    }
+  }
+
+  // Redirect authenticated users away from auth routes
+  if (authRoutes.some((route) => pathname.startsWith(route))) {
+    if (hasSession) {
+      return NextResponse.redirect(new URL('/dashboard', request.url));
+    }
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ['/dashboard/:path*', '/settings/:path*', '/profile/:path*', '/login', '/register'],
+};
+```
+
+<Aside type="tip">
+  The middleware cookie check is a fast first pass. The actual session is cryptographically verified when `auth().check()` or `auth().user()` runs server-side. An expired or tampered cookie will fail verification there.
+</Aside>
+
+For full server-side route guards (e.g., inside layouts), you can also create a helper:
+
+```ts title="lib/auth-guard.ts"
+import { redirect } from 'next/navigation';
+import { auth } from '@/lib/auth';
+
+export async function requireAuth() {
+  const session = auth();
+  const user = await session.user();
+
+  if (!user) {
+    redirect('/login');
+  }
+
+  return user;
+}
+```
+
+---
+
+## Getting the current user
+
+### In a Server Component
+
+```tsx title="app/dashboard/page.tsx"
+import { auth } from '@/lib/auth';
+import { redirect } from 'next/navigation';
+import { LogoutButton } from '@/components/logout-button';
+
+export default async function DashboardPage() {
+  const session = auth();
+  const user = await session.user();
+
+  if (!user) {
+    redirect('/login');
+  }
+
+  return (
+    <div>
+      <h1>Welcome, {user.name}</h1>
+      <p>Email: {user.email}</p>
+      <LogoutButton />
+    </div>
+  );
+}
+```
+
+### In a Layout
+
+```tsx title="app/dashboard/layout.tsx"
+import { requireAuth } from '@/lib/auth-guard';
+
+export default async function DashboardLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const user = await requireAuth();
+
+  return (
+    <div>
+      <nav>
+        <span>Signed in as {user.email}</span>
+      </nav>
+      <main>{children}</main>
+    </div>
+  );
+}
+```
+
+### Passing user data to Client Components
+
+If a Client Component needs user data, pass it as props from a Server Component:
+
+```tsx title="app/dashboard/page.tsx"
+import { requireAuth } from '@/lib/auth-guard';
+import { DashboardClient } from './dashboard-client';
+
+export default async function DashboardPage() {
+  const user = await requireAuth();
+
+  // Only pass serializable, non-sensitive fields
+  return <DashboardClient user={{ id: user.id, name: user.name, email: user.email }} />;
+}
+```
+
+---
+
+## CSRF protection
+
+Next.js Server Actions have **built-in CSRF protection**. The framework automatically validates the `Origin` header on all Server Action requests, rejecting cross-origin submissions. No additional configuration is needed.
+
+For API Route Handlers (`app/api/*/route.ts`), if you accept form submissions or state-changing requests, you should validate the `Origin` header manually:
+
+```ts title="app/api/example/route.ts"
+import { headers } from 'next/headers';
+import { NextResponse } from 'next/server';
+
+export async function POST(request: Request) {
+  const headerStore = await headers();
+  const origin = headerStore.get('origin');
+  const host = headerStore.get('host');
+
+  if (!origin || new URL(origin).host !== host) {
+    return NextResponse.json({ error: 'Invalid origin' }, { status: 403 });
+  }
+
+  // ... handle the request
+}
+```
+
+---
+
+## Security notes
+
+- **Session secret**: Never commit `IDEAL_AUTH_SECRET` to version control. Use environment variables in your deployment platform.
+- **HTTPS**: Set `NODE_ENV=production` in production so session cookies are automatically marked `Secure`.
+- **Cookie scope**: The default `SameSite=Lax` and `HttpOnly=true` settings protect against CSRF and XSS cookie theft. Do not override `httpOnly`.
+- **Password hashing**: `createHash` uses bcrypt with SHA-256 pre-hashing for passwords over 72 bytes. The default 12 rounds is suitable for production.
+- **Edge Runtime**: The `auth()` function requires Node.js runtime. Use `export const runtime = 'nodejs'` in any Route Handler that calls `auth()`. The middleware pattern above works around this limitation.

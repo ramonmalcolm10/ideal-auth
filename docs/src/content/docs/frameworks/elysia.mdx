@@ -1,0 +1,339 @@
+---
+title: Elysia
+description: Complete auth setup for Elysia with ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Elysia is a TypeScript-first Bun web framework with end-to-end type safety. This guide covers the complete auth setup.
+
+## Cookie Bridge
+
+Elysia provides a typed cookie API via the `cookie` property on the context object.
+
+```typescript
+// src/lib/auth.ts
+import { createAuth, createHash } from 'ideal-auth';
+import type { Context } from 'elysia';
+import { db } from './db';
+
+export const hash = createHash({ rounds: 12 });
+
+export function auth(ctx: Context) {
+  const { cookie } = ctx;
+
+  return createAuth({
+    secret: process.env.IDEAL_AUTH_SECRET!,
+
+    cookie: {
+      get: (name) => cookie[name]?.value,
+      set: (name, value, opts) => {
+        cookie[name].set({
+          value,
+          httpOnly: opts.httpOnly,
+          secure: opts.secure,
+          sameSite: opts.sameSite,
+          path: opts.path,
+          maxAge: opts.maxAge,
+        });
+      },
+      delete: (name) => cookie[name].remove(),
+    },
+
+    hash,
+
+    resolveUser: async (id) => {
+      return db.user.findUnique({ where: { id } });
+    },
+
+    resolveUserByCredentials: async (creds) => {
+      return db.user.findUnique({ where: { email: creds.email } });
+    },
+  });
+}
+```
+
+<Aside type="tip">
+  Elysia's cookie API uses `cookie[name].set()` for setting and `cookie[name].remove()` for deleting. The `value` property reads the cookie.
+</Aside>
+
+## Login
+
+```typescript
+// src/routes/auth.ts
+import { Elysia, t } from 'elysia';
+import { auth } from '../lib/auth';
+
+export const authRoutes = new Elysia({ prefix: '/auth' })
+  .post(
+    '/login',
+    async (ctx) => {
+      const { email, password, remember } = ctx.body;
+      const session = auth(ctx)();
+
+      const success = await session.attempt(
+        { email, password },
+        { remember: remember ?? undefined },
+      );
+
+      if (!success) {
+        ctx.set.status = 401;
+        return { error: 'Invalid credentials' };
+      }
+
+      return { success: true };
+    },
+    {
+      body: t.Object({
+        email: t.String({ format: 'email' }),
+        password: t.String({ minLength: 8 }),
+        remember: t.Optional(t.Boolean()),
+      }),
+    },
+  );
+```
+
+## Registration
+
+```typescript
+// src/routes/auth.ts (continued)
+import { hash } from '../lib/auth';
+
+// Add to the authRoutes chain
+authRoutes.post(
+  '/register',
+  async (ctx) => {
+    const { email, password, name } = ctx.body;
+
+    const existing = await db.user.findUnique({ where: { email } });
+    if (existing) {
+      ctx.set.status = 409;
+      return { error: 'Email already registered' };
+    }
+
+    const user = await db.user.create({
+      data: {
+        email,
+        name,
+        password: await hash.make(password),
+      },
+    });
+
+    const session = auth(ctx)();
+    await session.login(user);
+
+    return { success: true, user: { id: user.id, email: user.email } };
+  },
+  {
+    body: t.Object({
+      email: t.String({ format: 'email' }),
+      password: t.String({ minLength: 8 }),
+      name: t.String(),
+    }),
+  },
+);
+```
+
+## Logout
+
+```typescript
+authRoutes.post('/logout', async (ctx) => {
+  const session = auth(ctx)();
+  await session.logout();
+  return { success: true };
+});
+```
+
+## Auth Middleware
+
+Use Elysia's `derive` to create an auth guard that injects the user into the context.
+
+```typescript
+// src/middleware/auth.ts
+import { Elysia } from 'elysia';
+import { auth } from '../lib/auth';
+
+export const requireAuth = new Elysia({ name: 'requireAuth' })
+  .derive(async (ctx) => {
+    const session = auth(ctx)();
+    const user = await session.user();
+
+    if (!user) {
+      ctx.set.status = 401;
+      throw new Error('Unauthorized');
+    }
+
+    return { user };
+  });
+
+export const optionalAuth = new Elysia({ name: 'optionalAuth' })
+  .derive(async (ctx) => {
+    const session = auth(ctx)();
+    const user = await session.user();
+    return { user };
+  });
+```
+
+### Protecting Routes
+
+```typescript
+import { Elysia } from 'elysia';
+import { requireAuth } from './middleware/auth';
+
+const app = new Elysia()
+  .use(authRoutes)
+  // Protected routes
+  .use(requireAuth)
+  .get('/me', (ctx) => {
+    return { user: ctx.user };
+  })
+  .get('/dashboard', (ctx) => {
+    return { message: `Welcome ${ctx.user.name}` };
+  })
+  .listen(3000);
+```
+
+### Guarding Specific Route Groups
+
+```typescript
+import { Elysia } from 'elysia';
+import { requireAuth, optionalAuth } from './middleware/auth';
+
+const app = new Elysia()
+  // Public routes
+  .use(authRoutes)
+  .get('/health', () => ({ status: 'ok' }))
+
+  // Optional auth — user may or may not be logged in
+  .group('/public', (app) =>
+    app.use(optionalAuth).get('/posts', (ctx) => {
+      return {
+        posts: [],
+        isLoggedIn: !!ctx.user,
+      };
+    }),
+  )
+
+  // Protected routes — must be logged in
+  .group('/api', (app) =>
+    app
+      .use(requireAuth)
+      .get('/profile', (ctx) => ({ user: ctx.user }))
+      .put('/profile', async (ctx) => {
+        // ctx.user is guaranteed to exist
+        const updated = await db.user.update({
+          where: { id: ctx.user.id },
+          data: ctx.body,
+        });
+        return { user: updated };
+      }),
+  )
+  .listen(3000);
+```
+
+## Getting the Current User
+
+```typescript
+// In any route with requireAuth applied
+app.use(requireAuth).get('/me', (ctx) => {
+  // ctx.user is typed and guaranteed to exist
+  return {
+    id: ctx.user.id,
+    email: ctx.user.email,
+    name: ctx.user.name,
+  };
+});
+
+// In any route with optionalAuth applied
+app.use(optionalAuth).get('/page', (ctx) => {
+  if (ctx.user) {
+    return { greeting: `Hello ${ctx.user.name}` };
+  }
+  return { greeting: 'Hello guest' };
+});
+```
+
+## CSRF Protection
+
+Elysia doesn't include built-in CSRF protection. For API-only backends (serving a SPA or mobile app), CSRF is mitigated by not using cookie-based auth for API requests, or by validating the `Origin` header.
+
+For cookie-based session auth (which ideal-auth uses), validate the `Origin` header:
+
+```typescript
+import { Elysia } from 'elysia';
+
+const ALLOWED_ORIGINS = [
+  'https://yourdomain.com',
+  'http://localhost:3000', // dev
+];
+
+const csrfProtection = new Elysia({ name: 'csrf' })
+  .onBeforeHandle((ctx) => {
+    if (ctx.request.method === 'GET' || ctx.request.method === 'HEAD') {
+      return; // Safe methods don't need CSRF protection
+    }
+
+    const origin = ctx.request.headers.get('origin');
+
+    if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
+      ctx.set.status = 403;
+      throw new Error('CSRF validation failed');
+    }
+  });
+
+const app = new Elysia()
+  .use(csrfProtection)
+  .use(authRoutes)
+  .listen(3000);
+```
+
+<Aside type="caution">
+  The `Origin` header is sent by all modern browsers on non-GET requests. This approach is reliable for browser-based clients but does not protect against requests from non-browser clients (which is generally acceptable since those clients can't access cookies anyway).
+</Aside>
+
+## Full Example
+
+```typescript
+import { Elysia } from 'elysia';
+import { authRoutes } from './routes/auth';
+import { requireAuth, optionalAuth } from './middleware/auth';
+
+const app = new Elysia()
+  // CSRF protection
+  .onBeforeHandle((ctx) => {
+    if (ctx.request.method === 'GET' || ctx.request.method === 'HEAD') return;
+    const origin = ctx.request.headers.get('origin');
+    const allowed = process.env.ALLOWED_ORIGINS?.split(',') ?? ['http://localhost:3000'];
+    if (!origin || !allowed.includes(origin)) {
+      ctx.set.status = 403;
+      throw new Error('CSRF validation failed');
+    }
+  })
+
+  // Public auth routes
+  .use(authRoutes)
+
+  // Protected API
+  .group('/api', (app) =>
+    app
+      .use(requireAuth)
+      .get('/me', (ctx) => ({ user: ctx.user }))
+      .post('/logout', async (ctx) => {
+        const { auth } = await import('./lib/auth');
+        const session = auth(ctx)();
+        await session.logout();
+        return { success: true };
+      }),
+  )
+
+  .listen(3000);
+
+console.log(`Running at ${app.server?.url}`);
+```
+
+## Security Notes
+
+- **Bun runtime**: Elysia runs on Bun, which ideal-auth fully supports. All crypto operations use `node:crypto` which Bun implements.
+- **Cookie security**: Elysia's cookie API supports all standard cookie attributes. ideal-auth forces `httpOnly: true` on session cookies.
+- **Type safety**: Elysia's `derive` makes the `user` property fully typed downstream. No manual type assertions needed.
+- **Error handling**: Use Elysia's `onError` hook to catch auth errors and return consistent JSON responses instead of exposing stack traces.

@@ -1,0 +1,477 @@
+---
+title: Hono
+description: Complete auth setup for Hono with ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide walks through setting up authentication in a **Hono** application using `ideal-auth`. By the end, you will have working login, registration, logout, route protection via middleware, and access to the current user in your route handlers. Hono works across runtimes, including Node.js, Bun, Cloudflare Workers, Deno, and more.
+
+## Installation
+
+<Steps>
+
+1. **Install ideal-auth**
+
+   ```bash
+   bun add ideal-auth
+   ```
+
+2. **Set the session secret**
+
+   Add a secret to your environment. It must be at least 32 characters.
+
+   <Tabs>
+     <TabItem label="Node.js / Bun">
+       ```bash title=".env"
+       IDEAL_AUTH_SECRET="at-least-32-characters-long-secret-here"
+       ```
+     </TabItem>
+     <TabItem label="Cloudflare Workers">
+       ```bash
+       npx wrangler secret put IDEAL_AUTH_SECRET
+       ```
+
+       Or add it to your `wrangler.toml` for development:
+
+       ```toml title="wrangler.toml"
+       [vars]
+       IDEAL_AUTH_SECRET = "at-least-32-characters-long-secret-here"
+       ```
+     </TabItem>
+   </Tabs>
+
+   Generate a strong secret:
+
+   ```bash
+   bunx ideal-auth secret
+   ```
+
+</Steps>
+
+---
+
+## Cookie bridge
+
+Hono provides `getCookie`, `setCookie`, and `deleteCookie` helpers from `hono/cookie`. The bridge maps these to the three functions `ideal-auth` expects.
+
+```ts title="src/lib/cookies.ts"
+import type { Context } from 'hono';
+import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
+import type { CookieBridge } from 'ideal-auth';
+
+export function createCookieBridge(c: Context): CookieBridge {
+  return {
+    get(name: string) {
+      return getCookie(c, name);
+    },
+    set(name, value, options) {
+      setCookie(c, name, value, {
+        httpOnly: options.httpOnly,
+        secure: options.secure,
+        sameSite: options.sameSite === 'lax' ? 'Lax' : options.sameSite === 'strict' ? 'Strict' : 'None',
+        path: options.path ?? '/',
+        ...(options.maxAge !== undefined && { maxAge: options.maxAge }),
+      });
+    },
+    delete(name) {
+      deleteCookie(c, name, { path: '/' });
+    },
+  };
+}
+```
+
+<Aside>
+  Hono's `setCookie` expects `sameSite` values with capital first letters (`'Lax'`, `'Strict'`, `'None'`), while `ideal-auth` uses lowercase. The bridge converts between the two formats.
+</Aside>
+
+---
+
+## Auth setup
+
+Create an `auth()` factory that accepts a Hono `Context` and returns an `AuthInstance`.
+
+```ts title="src/lib/auth.ts"
+import { createAuth, createHash } from 'ideal-auth';
+import { createCookieBridge } from './cookies';
+import { db } from './db'; // your database client
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+};
+
+export const hash = createHash({ rounds: 12 });
+
+export function auth(c: import('hono').Context) {
+  const authFactory = createAuth<User>({
+    secret: getSecret(c),
+    cookie: createCookieBridge(c),
+    hash,
+
+    async resolveUser(id) {
+      return db.user.findUnique({ where: { id } });
+    },
+
+    async resolveUserByCredentials(credentials) {
+      return db.user.findUnique({
+        where: { email: credentials.email },
+      });
+    },
+  });
+
+  return authFactory();
+}
+
+function getSecret(c: import('hono').Context): string {
+  // Works with both env vars (Node/Bun) and Cloudflare Workers bindings
+  return c.env?.IDEAL_AUTH_SECRET ?? process.env.IDEAL_AUTH_SECRET!;
+}
+```
+
+<Aside type="tip">
+  On Cloudflare Workers, environment variables are accessed via `c.env`. The `getSecret` helper checks both `c.env` and `process.env` so the same code works across runtimes.
+</Aside>
+
+---
+
+## App setup
+
+```ts title="src/index.ts"
+import { Hono } from 'hono';
+import { csrf } from 'hono/csrf';
+import { authRoutes } from './routes/auth';
+import { dashboardRoutes } from './routes/dashboard';
+import { requireAuth } from './middleware/auth';
+
+const app = new Hono();
+
+// CSRF protection for state-changing requests
+app.use(csrf());
+
+// Public auth routes
+app.route('/auth', authRoutes);
+
+// Protected routes
+app.use('/dashboard/*', requireAuth);
+app.route('/dashboard', dashboardRoutes);
+
+export default app;
+```
+
+---
+
+## Login route
+
+```ts title="src/routes/auth.ts"
+import { Hono } from 'hono';
+import { auth, hash } from '../lib/auth';
+import { db } from '../lib/db';
+
+export const authRoutes = new Hono();
+
+authRoutes.post('/login', async (c) => {
+  const body = await c.req.json();
+
+  if (!body.email || !body.password) {
+    return c.json({ error: 'Email and password are required.' }, 400);
+  }
+
+  const session = auth(c);
+  const success = await session.attempt(
+    { email: body.email, password: body.password },
+    { remember: body.remember ?? false },
+  );
+
+  if (!success) {
+    return c.json({ error: 'Invalid email or password.' }, 401);
+  }
+
+  return c.json({ success: true });
+});
+```
+
+---
+
+## Registration route
+
+```ts title="src/routes/auth.ts" ins={3-42}
+authRoutes.post('/register', async (c) => {
+  const body = await c.req.json();
+
+  if (!body.email || !body.name || !body.password) {
+    return c.json({ error: 'All fields are required.' }, 400);
+  }
+
+  if (body.password.length < 8) {
+    return c.json({ error: 'Password must be at least 8 characters.' }, 400);
+  }
+
+  if (body.password !== body.passwordConfirmation) {
+    return c.json({ error: 'Passwords do not match.' }, 400);
+  }
+
+  const existing = await db.user.findUnique({ where: { email: body.email } });
+  if (existing) {
+    return c.json({ error: 'An account with this email already exists.' }, 409);
+  }
+
+  const user = await db.user.create({
+    data: {
+      email: body.email,
+      name: body.name,
+      password: await hash.make(body.password),
+    },
+  });
+
+  // Log the user in immediately after registration
+  const session = auth(c);
+  await session.login(user);
+
+  return c.json({ success: true }, 201);
+});
+```
+
+---
+
+## Logout route
+
+```ts title="src/routes/auth.ts" ins={3-8}
+authRoutes.post('/logout', async (c) => {
+  const session = auth(c);
+  await session.logout();
+
+  return c.json({ success: true });
+});
+```
+
+---
+
+## Current user route
+
+```ts title="src/routes/auth.ts" ins={3-15}
+authRoutes.get('/me', async (c) => {
+  const session = auth(c);
+  const user = await session.user();
+
+  if (!user) {
+    return c.json({ user: null });
+  }
+
+  return c.json({
+    user: { id: user.id, email: user.email, name: user.name },
+  });
+});
+```
+
+---
+
+## Auth middleware
+
+Create a middleware that protects routes from unauthenticated access and stores the user in the Hono context.
+
+```ts title="src/middleware/auth.ts"
+import { createMiddleware } from 'hono/factory';
+import { auth } from '../lib/auth';
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+};
+
+// Extend Hono's context variables
+type Env = {
+  Variables: {
+    user: User;
+  };
+};
+
+export const requireAuth = createMiddleware<Env>(async (c, next) => {
+  const session = auth(c);
+  const user = await session.user();
+
+  if (!user) {
+    return c.json({ error: 'Authentication required.' }, 401);
+  }
+
+  // Store non-sensitive user data in context
+  c.set('user', { id: user.id, email: user.email, name: user.name });
+
+  await next();
+});
+```
+
+---
+
+## Protected route example
+
+```ts title="src/routes/dashboard.ts"
+import { Hono } from 'hono';
+
+type Env = {
+  Variables: {
+    user: { id: string; email: string; name: string };
+  };
+};
+
+export const dashboardRoutes = new Hono<Env>();
+
+dashboardRoutes.get('/', (c) => {
+  const user = c.get('user');
+  return c.json({
+    message: `Welcome, ${user.name}`,
+    user,
+  });
+});
+
+dashboardRoutes.get('/settings', (c) => {
+  const user = c.get('user');
+  return c.json({
+    message: 'Settings page',
+    user,
+  });
+});
+```
+
+---
+
+## Getting the current user
+
+### In any route handler (after middleware)
+
+```ts
+app.get('/api/profile', requireAuth, (c) => {
+  const user = c.get('user');
+  return c.json({ user });
+});
+```
+
+### Optional auth (user may or may not be logged in)
+
+```ts title="src/middleware/optional-auth.ts"
+import { createMiddleware } from 'hono/factory';
+import { auth } from '../lib/auth';
+
+type Env = {
+  Variables: {
+    user: { id: string; email: string; name: string } | null;
+  };
+};
+
+export const optionalAuth = createMiddleware<Env>(async (c, next) => {
+  const session = auth(c);
+  const user = await session.user();
+
+  c.set('user', user ? { id: user.id, email: user.email, name: user.name } : null);
+
+  await next();
+});
+```
+
+```ts
+app.get('/', optionalAuth, (c) => {
+  const user = c.get('user');
+  if (user) {
+    return c.json({ message: `Hello, ${user.name}` });
+  }
+  return c.json({ message: 'Hello, guest' });
+});
+```
+
+---
+
+## CSRF protection
+
+Hono has a **built-in `csrf()` middleware** that validates the `Origin` header on non-safe HTTP methods.
+
+```ts
+import { csrf } from 'hono/csrf';
+
+// Apply to all routes
+app.use(csrf());
+
+// Or with custom options
+app.use(
+  csrf({
+    origin: ['https://yourdomain.com', 'https://www.yourdomain.com'],
+  }),
+);
+```
+
+The `csrf()` middleware:
+- Allows `GET`, `HEAD`, and `OPTIONS` requests through
+- Validates the `Origin` header on `POST`, `PUT`, `PATCH`, and `DELETE` requests
+- Returns a `403` if the origin does not match
+
+<Aside type="tip">
+  In development, Hono's CSRF middleware allows `localhost` origins by default. In production, specify your exact origins for stricter validation.
+</Aside>
+
+---
+
+## Edge runtime considerations
+
+Hono is designed to run on edge runtimes like Cloudflare Workers. Here are the key considerations for using `ideal-auth` on the edge.
+
+### Cloudflare Workers
+
+`ideal-auth` uses `bcryptjs` (pure JavaScript bcrypt) and Node.js `crypto` APIs for session sealing. On Cloudflare Workers:
+
+- **bcryptjs** works out of the box (pure JS, no native dependencies).
+- **Node.js crypto** requires the `nodejs_compat` compatibility flag.
+
+```toml title="wrangler.toml"
+compatibility_flags = ["nodejs_compat"]
+```
+
+### Environment variables
+
+On Cloudflare Workers, access env vars via `c.env`:
+
+```ts
+const secret = c.env.IDEAL_AUTH_SECRET;
+```
+
+The `getSecret` helper in the auth setup above handles this automatically.
+
+### Database access
+
+On edge runtimes, use an edge-compatible database:
+- **Cloudflare D1** (SQLite at the edge)
+- **Turso** (distributed SQLite)
+- **PlanetScale** (serverless MySQL)
+- **Neon** (serverless Postgres)
+
+---
+
+## Complete file structure
+
+```
+src/
+  index.ts                  # Hono app entry point
+  lib/
+    auth.ts                 # Auth factory
+    cookies.ts              # Cookie bridge
+    db.ts                   # Database client
+  middleware/
+    auth.ts                 # requireAuth middleware
+    optional-auth.ts        # Optional auth middleware
+  routes/
+    auth.ts                 # Login, register, logout, me
+    dashboard.ts            # Protected dashboard routes
+```
+
+---
+
+## Security notes
+
+- **Session secret**: Store `IDEAL_AUTH_SECRET` as an environment variable. On Cloudflare Workers, use `wrangler secret put`. Never hard-code secrets.
+- **HTTPS**: On most edge platforms (Cloudflare Workers, Vercel Edge), HTTPS is enforced automatically. For Node.js/Bun deployments, set `NODE_ENV=production` so session cookies are marked `Secure`.
+- **Cookie scope**: The default `SameSite=Lax` and `HttpOnly=true` settings protect against CSRF and XSS cookie theft.
+- **Context variables**: Use Hono's `c.set()` / `c.get()` to pass the authenticated user through the middleware chain. Use TypeScript generics (`Hono<Env>`) for full type safety.
+- **CSRF middleware**: Always enable Hono's `csrf()` middleware in production. It prevents cross-origin form submissions and AJAX requests.
+- **Rate limiting**: Protect your login endpoint from brute-force attacks. Use `ideal-auth`'s `createRateLimiter` or Cloudflare's built-in rate limiting for Workers.
+- **bcrypt on edge**: `bcryptjs` is CPU-intensive. On edge runtimes with strict CPU time limits (e.g., Cloudflare Workers free tier), consider reducing bcrypt rounds to 10 if you hit timeout limits, though 12 rounds is preferable for security.

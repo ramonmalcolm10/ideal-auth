@@ -1,0 +1,557 @@
+---
+title: Two-Factor Authentication
+description: Add TOTP 2FA with recovery codes to your app.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Two-factor authentication (2FA) adds a second verification step after a password login. ideal-auth provides `createTOTP` for time-based one-time passwords (TOTP) and `generateRecoveryCodes` / `verifyRecoveryCode` for backup recovery codes.
+
+This guide covers the complete 2FA lifecycle: setup, login verification, recovery codes, replay protection, and disabling 2FA.
+
+## Setup
+
+```ts
+import {
+  createTOTP,
+  createHash,
+  generateRecoveryCodes,
+  encrypt,
+  decrypt,
+} from 'ideal-auth';
+
+const totp = createTOTP(); // defaults: 6 digits, 30s period, window ±1
+const hash = createHash();
+```
+
+You can customize the TOTP configuration:
+
+```ts
+const totp = createTOTP({
+  digits: 6,    // number of digits in the code (default: 6)
+  period: 30,   // time step in seconds (default: 30)
+  window: 1,    // accept codes ±1 time step from current (default: 1)
+});
+```
+
+## Encryption key
+
+The examples in this guide use `encrypt()` and `decrypt()` to protect TOTP secrets at rest. These functions require a secret key passed as the second argument. Generate one and add it to your environment:
+
+```bash
+bunx ideal-auth encryption-key
+```
+
+Copy the output into your `.env` file:
+
+```bash title=".env"
+ENCRYPTION_KEY="your-generated-key"
+```
+
+<Aside type="caution">
+  This should be a **separate key** from `IDEAL_AUTH_SECRET`. `IDEAL_AUTH_SECRET` is used for session encryption — `ENCRYPTION_KEY` is for encrypting data you store in your database (like TOTP secrets). Keep both secure and never commit them to version control.
+</Aside>
+
+## TOTP setup flow
+
+When a user enables 2FA, you need to generate a secret, show them a QR code, and verify they can produce a valid code before storing the secret.
+
+<Steps>
+
+1. **Generate a secret and QR URI**
+
+   ```ts
+   // POST /api/2fa/setup
+   export async function setupTwoFactor(req, res) {
+     const user = await getAuthenticatedUser(req);
+
+     const secret = totp.generateSecret();
+     const qrUri = totp.generateQrUri({
+       secret,
+       issuer: 'MyApp',
+       account: user.email,
+     });
+
+     // Store the secret temporarily until the user confirms setup.
+     // Encrypt it so it is not stored in plaintext.
+     const encryptedSecret = await encrypt(secret, process.env.ENCRYPTION_KEY);
+
+     await db.user.update({
+       where: { id: user.id },
+       data: { pendingTotpSecret: encryptedSecret },
+     });
+
+     return res.json({ qrUri });
+   }
+   ```
+
+   <Aside type="tip">
+     Use a library like [qrcode](https://www.npmjs.com/package/qrcode) to render the `qrUri` as a QR code image on the client. The URI follows the `otpauth://` format that authenticator apps like Google Authenticator and Authy understand.
+   </Aside>
+
+2. **User scans the QR code and enters a verification code**
+
+   The client displays the QR code. The user scans it with their authenticator app and submits the 6-digit code.
+
+3. **Verify the code and activate 2FA**
+
+   ```ts
+   // POST /api/2fa/confirm
+   export async function confirmTwoFactor(req, res) {
+     const user = await getAuthenticatedUser(req);
+     const { code } = req.body;
+
+     if (!user.pendingTotpSecret) {
+       return res.status(400).json({ error: 'No pending 2FA setup' });
+     }
+
+     // Decrypt the pending secret
+     const secret = await decrypt(
+       user.pendingTotpSecret,
+       process.env.ENCRYPTION_KEY,
+     );
+
+     // Verify the code from the authenticator app
+     if (!totp.verify(code, secret)) {
+       return res.status(400).json({ error: 'Invalid code' });
+     }
+
+     // Encrypt the confirmed secret for permanent storage
+     const encryptedSecret = await encrypt(secret, process.env.ENCRYPTION_KEY);
+
+     // Generate recovery codes
+     const { codes, hashed } = await generateRecoveryCodes(hash);
+
+     await db.user.update({
+       where: { id: user.id },
+       data: {
+         totpSecret: encryptedSecret,
+         pendingTotpSecret: null,
+         recoveryCodeHashes: hashed,
+         twoFactorEnabled: true,
+       },
+     });
+
+     // Show recovery codes to the user ONCE
+     return res.json({
+       message: '2FA enabled',
+       recoveryCodes: codes,
+     });
+   }
+   ```
+
+</Steps>
+
+<Aside type="caution">
+  Recovery codes must be shown to the user exactly once during setup. Store only the hashed versions in your database. If a user loses their codes, they will need to generate new ones.
+</Aside>
+
+## TOTP login verification
+
+After a user logs in with their password, you need to check whether they have 2FA enabled. If they do, **do not complete the session** until 2FA is verified. The pattern uses a short-lived pending cookie to track the intermediate state.
+
+### Step 1: Password login sets a pending cookie
+
+```ts
+import { createAuth, createHash, createTokenVerifier } from 'ideal-auth';
+
+const hash = createHash();
+const auth = createAuth({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  hash,
+  resolveUser: (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+
+// Token verifier for the 2FA pending state (short-lived)
+const pendingVerifier = createTokenVerifier({
+  secret: process.env.SESSION_SECRET,
+  expiryMs: 5 * 60 * 1000, // 5 minutes
+});
+
+// POST /api/login
+export async function login(req, res) {
+  const { email, password, remember } = req.body;
+  const session = auth();
+
+  // Find the user and verify password manually
+  // (don't use attempt() yet because we might need to gate on 2FA)
+  const user = await db.user.findUnique({ where: { email } });
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  const valid = await hash.verify(password, user.password);
+  if (!valid) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  // If 2FA is enabled, set a pending cookie instead of logging in
+  if (user.twoFactorEnabled) {
+    const pendingToken = pendingVerifier.createToken(String(user.id));
+
+    await cookieBridge.set('2fa_pending', pendingToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 300, // 5 minutes
+    });
+
+    return res.json({ requiresTwoFactor: true });
+  }
+
+  // No 2FA — log in directly
+  await session.login(user, { remember });
+  return res.json({ success: true });
+}
+```
+
+### Step 2: Verify the TOTP code and complete login
+
+```ts
+// POST /api/2fa/verify
+export async function verifyTwoFactor(req, res) {
+  const { code, remember } = req.body;
+
+  // Read the pending cookie
+  const pendingToken = await cookieBridge.get('2fa_pending');
+  if (!pendingToken) {
+    return res.status(401).json({ error: 'No pending 2FA session' });
+  }
+
+  // Verify the pending token
+  const result = pendingVerifier.verifyToken(pendingToken);
+  if (!result) {
+    return res.status(401).json({ error: '2FA session expired' });
+  }
+
+  const user = await db.user.findUnique({ where: { id: result.userId } });
+  if (!user || !user.twoFactorEnabled) {
+    return res.status(401).json({ error: 'Invalid session' });
+  }
+
+  // Decrypt the TOTP secret and verify the code
+  const secret = await decrypt(user.totpSecret, process.env.ENCRYPTION_KEY);
+
+  if (!totp.verify(code, secret)) {
+    return res.status(400).json({ error: 'Invalid 2FA code' });
+  }
+
+  // Delete the pending cookie and create a real session
+  await cookieBridge.delete('2fa_pending');
+
+  const session = auth();
+  await session.login(user, { remember });
+
+  return res.json({ success: true });
+}
+```
+
+### Step 3: Middleware to redirect pending users
+
+In frameworks with middleware (Next.js, SvelteKit), redirect users who have a pending 2FA cookie to the verification page:
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts
+    // middleware.ts
+    import { NextResponse } from 'next/server';
+    import type { NextRequest } from 'next/server';
+
+    export function middleware(request: NextRequest) {
+      const hasPending = request.cookies.has('2fa_pending');
+      const isOnTwoFactorPage = request.nextUrl.pathname === '/2fa';
+      const isApiRoute = request.nextUrl.pathname.startsWith('/api/');
+
+      // User has a pending 2FA cookie but isn't on the 2FA page
+      if (hasPending && !isOnTwoFactorPage && !isApiRoute) {
+        return NextResponse.redirect(new URL('/2fa', request.url));
+      }
+
+      // User is on the 2FA page without a pending cookie
+      if (!hasPending && isOnTwoFactorPage) {
+        return NextResponse.redirect(new URL('/login', request.url));
+      }
+
+      return NextResponse.next();
+    }
+
+    export const config = {
+      matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+    };
+    ```
+  </TabItem>
+  <TabItem label="SvelteKit">
+    ```ts
+    // src/hooks.server.ts
+    import { redirect } from '@sveltejs/kit';
+    import type { Handle } from '@sveltejs/kit';
+
+    export const handle: Handle = async ({ event, resolve }) => {
+      const hasPending = event.cookies.get('2fa_pending');
+      const isOnTwoFactorPage = event.url.pathname === '/2fa';
+      const isApiRoute = event.url.pathname.startsWith('/api/');
+
+      if (hasPending && !isOnTwoFactorPage && !isApiRoute) {
+        throw redirect(302, '/2fa');
+      }
+
+      if (!hasPending && isOnTwoFactorPage) {
+        throw redirect(302, '/login');
+      }
+
+      return resolve(event);
+    };
+    ```
+  </TabItem>
+</Tabs>
+
+## Recovery codes
+
+Recovery codes allow users to log in when they lose access to their authenticator app. ideal-auth generates 8 codes by default, each formatted as `xxxxxxxx-xxxxxxxx`.
+
+### Generating recovery codes
+
+Recovery codes are generated during 2FA setup (shown above) or when a user regenerates them:
+
+```ts
+import { generateRecoveryCodes, createHash } from 'ideal-auth';
+
+const hash = createHash();
+const { codes, hashed } = await generateRecoveryCodes(hash);
+
+// codes:  ['a1b2c3d4-e5f6a7b8', '...', ...]  — show to user
+// hashed: ['$2a$12$...', '$2a$12$...', ...]    — store in database
+```
+
+You can pass a custom count:
+
+```ts
+const { codes, hashed } = await generateRecoveryCodes(hash, 12);
+```
+
+### Verifying a recovery code
+
+```ts
+import { verifyRecoveryCode } from 'ideal-auth';
+
+// POST /api/2fa/recover
+export async function recoverWithCode(req, res) {
+  const { code, remember } = req.body;
+
+  // Read and verify the pending cookie (same as TOTP verify)
+  const pendingToken = await cookieBridge.get('2fa_pending');
+  if (!pendingToken) {
+    return res.status(401).json({ error: 'No pending 2FA session' });
+  }
+
+  const result = pendingVerifier.verifyToken(pendingToken);
+  if (!result) {
+    return res.status(401).json({ error: '2FA session expired' });
+  }
+
+  const user = await db.user.findUnique({ where: { id: result.userId } });
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid session' });
+  }
+
+  // Verify the recovery code
+  const { valid, remaining } = await verifyRecoveryCode(
+    code,
+    user.recoveryCodeHashes,
+    hash,
+  );
+
+  if (!valid) {
+    return res.status(400).json({ error: 'Invalid recovery code' });
+  }
+
+  // Update the stored hashes — the used code is removed from `remaining`
+  await db.user.update({
+    where: { id: user.id },
+    data: { recoveryCodeHashes: remaining },
+  });
+
+  // Delete the pending cookie and create a real session
+  await cookieBridge.delete('2fa_pending');
+
+  const session = auth();
+  await session.login(user, { remember });
+
+  return res.json({
+    success: true,
+    remainingCodes: remaining.length,
+  });
+}
+```
+
+<Aside type="caution">
+  Always update the stored hashes to `remaining` after a successful verification. The `remaining` array is the original array with the used code removed. If you skip this step, the same recovery code can be used multiple times.
+</Aside>
+
+### Regenerating recovery codes
+
+Users should be able to regenerate their recovery codes. This invalidates all previous codes:
+
+```ts
+// POST /api/2fa/regenerate-codes
+export async function regenerateCodes(req, res) {
+  const user = await getAuthenticatedUser(req);
+
+  if (!user.twoFactorEnabled) {
+    return res.status(400).json({ error: '2FA is not enabled' });
+  }
+
+  const { codes, hashed } = await generateRecoveryCodes(hash);
+
+  await db.user.update({
+    where: { id: user.id },
+    data: { recoveryCodeHashes: hashed },
+  });
+
+  // Show new codes to the user
+  return res.json({ recoveryCodes: codes });
+}
+```
+
+## Replay protection
+
+TOTP codes are valid for the current time step plus any steps within the configured `window`. With the default settings (30-second period, window of 1), a code is valid for up to 90 seconds (the previous, current, and next time steps). This means a code could be reused within that window.
+
+To prevent replay attacks, store the last used time step for each user and reject codes at or before that step.
+
+### Implementation
+
+```ts
+function getCurrentTimeStep(period: number = 30): number {
+  return Math.floor(Date.now() / 1000 / period);
+}
+
+// POST /api/2fa/verify (enhanced with replay protection)
+export async function verifyTwoFactorWithReplayProtection(req, res) {
+  const { code, remember } = req.body;
+
+  const pendingToken = await cookieBridge.get('2fa_pending');
+  if (!pendingToken) {
+    return res.status(401).json({ error: 'No pending 2FA session' });
+  }
+
+  const result = pendingVerifier.verifyToken(pendingToken);
+  if (!result) {
+    return res.status(401).json({ error: '2FA session expired' });
+  }
+
+  const user = await db.user.findUnique({ where: { id: result.userId } });
+  if (!user || !user.twoFactorEnabled) {
+    return res.status(401).json({ error: 'Invalid session' });
+  }
+
+  const secret = await decrypt(user.totpSecret, process.env.ENCRYPTION_KEY);
+
+  // Verify the TOTP code
+  if (!totp.verify(code, secret)) {
+    return res.status(400).json({ error: 'Invalid 2FA code' });
+  }
+
+  // Check for replay: reject if the current time step has already been used
+  const currentStep = getCurrentTimeStep();
+  if (user.lastTotpStep && currentStep <= user.lastTotpStep) {
+    return res.status(400).json({ error: 'Code already used' });
+  }
+
+  // Record the time step to prevent replay
+  await db.user.update({
+    where: { id: user.id },
+    data: { lastTotpStep: currentStep },
+  });
+
+  // Delete the pending cookie and create a real session
+  await cookieBridge.delete('2fa_pending');
+
+  const session = auth();
+  await session.login(user, { remember });
+
+  return res.json({ success: true });
+}
+```
+
+### Database schema addition
+
+Add a column to track the last used time step:
+
+```sql
+ALTER TABLE users ADD COLUMN last_totp_step BIGINT;
+```
+
+<Aside>
+  Replay protection is most important in scenarios where an attacker might intercept a valid TOTP code (e.g., shoulder surfing, compromised clipboard). For most applications, the short validity window of TOTP codes already provides reasonable protection, but adding replay protection is a best practice.
+</Aside>
+
+## Disabling 2FA
+
+Always require the user's current password before disabling 2FA. This prevents an attacker who has access to an active session from removing the second factor.
+
+```ts
+// POST /api/2fa/disable
+export async function disableTwoFactor(req, res) {
+  const user = await getAuthenticatedUser(req);
+  const { password } = req.body;
+
+  if (!user.twoFactorEnabled) {
+    return res.status(400).json({ error: '2FA is not enabled' });
+  }
+
+  // Verify current password
+  const valid = await hash.verify(password, user.password);
+  if (!valid) {
+    return res.status(401).json({ error: 'Invalid password' });
+  }
+
+  // Clear all 2FA data
+  await db.user.update({
+    where: { id: user.id },
+    data: {
+      twoFactorEnabled: false,
+      totpSecret: null,
+      pendingTotpSecret: null,
+      recoveryCodeHashes: null,
+      lastTotpStep: null,
+    },
+  });
+
+  return res.json({ message: '2FA disabled' });
+}
+```
+
+## Complete database schema
+
+Here is a reference schema with all the columns needed for 2FA:
+
+```sql
+CREATE TABLE users (
+  id            TEXT PRIMARY KEY,
+  email         TEXT UNIQUE NOT NULL,
+  password      TEXT NOT NULL,
+
+  -- 2FA fields
+  two_factor_enabled    BOOLEAN DEFAULT FALSE,
+  totp_secret           TEXT,           -- encrypted with encrypt()
+  pending_totp_secret   TEXT,           -- encrypted, temporary during setup
+  recovery_code_hashes  TEXT[],         -- array of bcrypt hashes
+  last_totp_step        BIGINT          -- replay protection
+);
+```
+
+## Security checklist
+
+- Always encrypt the TOTP secret at rest using `encrypt()` from ideal-auth
+- Never log or expose the TOTP secret after initial setup
+- Show recovery codes exactly once; store only the bcrypt hashes
+- Use a short-lived pending cookie (5 minutes or less) for the 2FA intermediate state
+- Implement replay protection by tracking the last used time step
+- Require password verification before disabling 2FA
+- Rate limit 2FA verification attempts to prevent brute force
+- Use the `2fa_pending` cookie only over HTTPS in production

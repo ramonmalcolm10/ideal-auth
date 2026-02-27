@@ -1,0 +1,425 @@
+---
+title: Migrating from Auth.js
+description: Step-by-step guide to migrate from Auth.js (NextAuth) to ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+This guide walks through migrating an existing Auth.js (NextAuth.js) application to ideal-auth. The migration can be done incrementally — you can run both libraries side by side during the transition.
+
+---
+
+## Why migrate?
+
+**Auth.js is opinionated about data access.** It requires database adapters (Prisma adapter, Drizzle adapter, etc.) that manage your schema and queries. ideal-auth is bring-your-own — you write the database queries, you control the schema, you decide what ORM to use (or none).
+
+**Auth.js bundles everything.** OAuth providers, email/password, magic links, database sessions, JWT sessions — all in one package. If you only need session auth with email/password, you carry the weight of features you do not use. ideal-auth focuses on session auth primitives and lets you compose other tools (e.g., [Arctic](https://arcticjs.dev) for OAuth).
+
+**Simpler mental model.** Auth.js has providers, callbacks (`signIn`, `jwt`, `session`, `redirect`), adapter interfaces, and strategy-specific configuration. ideal-auth has `createAuth`, `createHash`, and explicit methods like `session.attempt()`, `session.login()`, `session.logout()`. You call what you need, when you need it.
+
+**No magic.** Auth.js injects routes (`/api/auth/*`), manages CSRF tokens internally, and handles redirects behind configuration. ideal-auth does not inject routes, does not manage CSRF (that is framework-level), and does not redirect — you call `redirect()` yourself.
+
+---
+
+## Key differences
+
+| Concept | Auth.js | ideal-auth |
+|---------|---------|------------|
+| Session storage | Database session or JWT | Encrypted cookie (iron-session) |
+| Database access | Adapter pattern (Prisma, Drizzle, etc.) | You write the queries (`resolveUser`, `resolveUserByCredentials`) |
+| Password hashing | Not built-in (you handle it in `authorize`) | Built-in (`createHash` with bcrypt + SHA-256 prehash) |
+| Login | `signIn("credentials", { ... })` | `session.attempt({ email, password })` |
+| Logout | `signOut()` | `session.logout()` |
+| Session check | `auth()` or `getSession()` returns session | `session.check()` returns boolean, `session.user()` returns user |
+| OAuth | Built-in providers | Not included — use [Arctic](https://arcticjs.dev) |
+| CSRF | Built-in (managed internally) | Framework-level (see [CSRF guide](/ideal-auth/security/csrf/)) |
+| Route protection | Middleware with `auth()` | Middleware with cookie check + server-side `session.user()` |
+| Cookie control | Limited (some options exposed) | Full control via `ConfigurableCookieOptions` (except `httpOnly`, which is forced) |
+| 2FA | Not built-in | Built-in (`createTOTP`, `generateRecoveryCodes`) |
+| Rate limiting | Not built-in | Built-in (`createRateLimiter`) |
+| Token verification | Not built-in | Built-in (`createTokenVerifier`) |
+
+---
+
+## Migration steps
+
+<Steps>
+
+1. ### Install ideal-auth alongside Auth.js
+
+   Keep Auth.js running while you set up ideal-auth. This allows you to migrate incrementally without breaking existing functionality.
+
+   ```bash
+   bun add ideal-auth
+   ```
+
+2. ### Create the auth configuration
+
+   ```ts title="lib/ideal-auth.ts"
+   import { createAuth, createHash } from 'ideal-auth';
+   import { cookies } from 'next/headers';
+   import { db } from './db';
+
+   type User = {
+     id: string;
+     email: string;
+     name: string;
+     password: string;
+   };
+
+   export const hash = createHash({ rounds: 12 });
+
+   export const auth = createAuth<User>({
+     secret: process.env.IDEAL_AUTH_SECRET!,
+     cookie: {
+       async get(name) {
+         const jar = await cookies();
+         return jar.get(name)?.value;
+       },
+       async set(name, value, options) {
+         const jar = await cookies();
+         jar.set(name, value, options);
+       },
+       async delete(name) {
+         const jar = await cookies();
+         jar.delete(name);
+       },
+     },
+     hash,
+
+     async resolveUser(id) {
+       return db.user.findUnique({ where: { id } });
+     },
+
+     async resolveUserByCredentials(credentials) {
+       return db.user.findUnique({
+         where: { email: credentials.email },
+       });
+     },
+   });
+   ```
+
+   <Aside>
+     If your Auth.js setup uses a different password field name (e.g., `hashedPassword`), set the `passwordField` option in `createAuth`:
+
+     ```ts
+     export const auth = createAuth<User>({
+       // ...
+       passwordField: 'hashedPassword',
+     });
+     ```
+   </Aside>
+
+3. ### Migrate resolveUser to use your existing queries
+
+   If you were using Auth.js with a database adapter, you already have a users table. Point `resolveUser` at it:
+
+   **Prisma example:**
+   ```ts
+   async resolveUser(id) {
+     return db.user.findUnique({ where: { id } });
+   },
+   ```
+
+   **Drizzle example:**
+   ```ts
+   async resolveUser(id) {
+     const [user] = await db.select().from(users).where(eq(users.id, id));
+     return user ?? null;
+   },
+   ```
+
+   **Raw SQL example:**
+   ```ts
+   async resolveUser(id) {
+     const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+     return rows[0] ?? null;
+   },
+   ```
+
+4. ### Replace signIn with session.attempt
+
+   **Before (Auth.js):**
+   ```ts
+   import { signIn } from 'next-auth/react';
+
+   // Client-side
+   await signIn('credentials', {
+     email,
+     password,
+     redirect: false,
+   });
+
+   // Or server-side (Auth.js v5)
+   import { signIn } from '@/auth';
+   await signIn('credentials', { email, password });
+   ```
+
+   **After (ideal-auth):**
+   ```ts title="app/actions/login.ts"
+   'use server';
+
+   import { redirect } from 'next/navigation';
+   import { auth } from '@/lib/ideal-auth';
+
+   export async function loginAction(_prev: unknown, formData: FormData) {
+     const email = formData.get('email') as string;
+     const password = formData.get('password') as string;
+
+     const session = auth();
+     const success = await session.attempt({ email, password });
+
+     if (!success) {
+       return { error: 'Invalid email or password.' };
+     }
+
+     redirect('/dashboard');
+   }
+   ```
+
+5. ### Replace signOut with session.logout
+
+   **Before (Auth.js):**
+   ```ts
+   import { signOut } from 'next-auth/react';
+   await signOut({ redirect: true, callbackUrl: '/login' });
+   ```
+
+   **After (ideal-auth):**
+   ```ts title="app/actions/logout.ts"
+   'use server';
+
+   import { redirect } from 'next/navigation';
+   import { auth } from '@/lib/ideal-auth';
+
+   export async function logoutAction() {
+     const session = auth();
+     await session.logout();
+     redirect('/login');
+   }
+   ```
+
+6. ### Replace session checks
+
+   **Before (Auth.js):**
+   ```ts
+   import { auth } from '@/auth';
+
+   // In a Server Component
+   const session = await auth();
+   if (!session) redirect('/login');
+   const user = session.user;
+   ```
+
+   **After (ideal-auth):**
+   ```ts
+   import { auth } from '@/lib/ideal-auth';
+
+   // In a Server Component
+   const session = auth();
+   const user = await session.user();
+   if (!user) redirect('/login');
+   ```
+
+   **Before (Auth.js client-side):**
+   ```tsx
+   import { useSession } from 'next-auth/react';
+
+   function Dashboard() {
+     const { data: session, status } = useSession();
+     if (status === 'loading') return <p>Loading...</p>;
+     if (!session) redirect('/login');
+     return <p>Welcome, {session.user.name}</p>;
+   }
+   ```
+
+   **After (ideal-auth):**
+
+   ideal-auth does not have a client-side session hook. Fetch the user server-side and pass it as props:
+
+   ```tsx title="app/dashboard/page.tsx"
+   import { auth } from '@/lib/ideal-auth';
+   import { redirect } from 'next/navigation';
+   import { DashboardClient } from './dashboard-client';
+
+   export default async function DashboardPage() {
+     const session = auth();
+     const user = await session.user();
+     if (!user) redirect('/login');
+
+     return <DashboardClient user={{ id: user.id, name: user.name, email: user.email }} />;
+   }
+   ```
+
+7. ### Update middleware
+
+   **Before (Auth.js):**
+   ```ts
+   export { auth as middleware } from '@/auth';
+
+   export const config = {
+     matcher: ['/dashboard/:path*'],
+   };
+   ```
+
+   **After (ideal-auth):**
+
+   Since ideal-auth uses iron-session (Node.js crypto), you cannot decrypt the session in Edge middleware. Instead, check for the cookie's existence:
+
+   ```ts title="middleware.ts"
+   import { NextResponse } from 'next/server';
+   import type { NextRequest } from 'next/server';
+
+   export function middleware(request: NextRequest) {
+     const hasSession = request.cookies.has('ideal_session');
+
+     if (!hasSession) {
+       const loginUrl = new URL('/login', request.url);
+       loginUrl.searchParams.set('redirect', request.nextUrl.pathname);
+       return NextResponse.redirect(loginUrl);
+     }
+
+     return NextResponse.next();
+   }
+
+   export const config = {
+     matcher: ['/dashboard/:path*', '/settings/:path*'],
+   };
+   ```
+
+   <Aside type="tip">
+     The middleware cookie check is a fast first pass. The actual session is cryptographically verified when `session.user()` or `session.check()` runs server-side. An expired or tampered cookie will fail there.
+   </Aside>
+
+8. ### Handle OAuth separately
+
+   ideal-auth does not include OAuth. If your Auth.js setup uses OAuth providers (Google, GitHub, etc.), you have two options:
+
+   **Option A: Keep Auth.js for OAuth only.** Remove the credentials provider from Auth.js and keep it exclusively for OAuth. Use ideal-auth for email/password login. Both can coexist — they use different session cookies.
+
+   **Option B: Switch to Arctic.** [Arctic](https://arcticjs.dev) is a lightweight OAuth 2.0 library that provides provider-specific helpers without the adapter/session layer. You handle the OAuth flow yourself and call `session.login(user)` with ideal-auth after verifying the OAuth token.
+
+   ```ts title="Example: GitHub OAuth with Arctic + ideal-auth"
+   import { GitHub } from 'arctic';
+   import { auth } from '@/lib/ideal-auth';
+
+   const github = new GitHub(
+     process.env.GITHUB_CLIENT_ID!,
+     process.env.GITHUB_CLIENT_SECRET!,
+     null,
+   );
+
+   // After the OAuth callback
+   export async function handleGitHubCallback(code: string) {
+     const tokens = await github.validateAuthorizationCode(code);
+     const githubUser = await fetchGitHubUser(tokens.accessToken());
+
+     // Find or create user in your database
+     let user = await db.user.findUnique({
+       where: { githubId: githubUser.id },
+     });
+
+     if (!user) {
+       user = await db.user.create({
+         data: {
+           email: githubUser.email,
+           name: githubUser.name,
+           githubId: githubUser.id,
+         },
+       });
+     }
+
+     // Log them in with ideal-auth
+     const session = auth();
+     await session.login(user);
+   }
+   ```
+
+9. ### Remove Auth.js
+
+   Once all flows are migrated:
+
+   ```bash
+   bun remove next-auth @auth/prisma-adapter  # or your adapter
+   ```
+
+   Delete:
+   - `auth.ts` or `auth.config.ts` (Auth.js configuration)
+   - `app/api/auth/[...nextauth]/route.ts` (Auth.js API route)
+   - `SessionProvider` wrapper in your layout (no longer needed)
+   - Any `useSession` or `getSession` imports
+
+</Steps>
+
+---
+
+## Code comparison
+
+| Operation | Auth.js | ideal-auth |
+|-----------|---------|------------|
+| Initialize | `NextAuth({ providers: [...], adapter: ... })` | `createAuth({ secret, cookie, resolveUser, ... })` |
+| Login | `signIn("credentials", { email, password })` | `auth().attempt({ email, password })` |
+| Logout | `signOut()` | `auth().logout()` |
+| Get session | `auth()` / `getSession()` | `auth().check()` (boolean) |
+| Get user | `(await auth())?.user` | `await auth().user()` |
+| Get user ID | `(await auth())?.user?.id` | `await auth().id()` |
+| Login with user object | Not directly available | `auth().login(user)` |
+| Hash password | Manual (`bcrypt.hash()`) | `hash.make(password)` |
+| Verify password | Manual (`bcrypt.compare()`) | `hash.verify(password, hash)` |
+
+---
+
+## Handling OAuth users without passwords
+
+If you have existing users who signed up via OAuth and have no password in your database, they need a way to authenticate with ideal-auth. Two approaches:
+
+**1. "Set password" flow.** After migration, prompt OAuth users to set a password. Send them to a page where they enter a new password, which you hash and store. They can then log in with email/password.
+
+**2. Keep OAuth separate.** Use Arctic (or keep Auth.js) for OAuth login. After verifying the OAuth token, look up the user and call `session.login(user)` with ideal-auth. The user never needs a password.
+
+<Aside>
+  Approach 2 is recommended if you have a significant number of OAuth-only users. Forcing them to set a password is poor user experience.
+</Aside>
+
+---
+
+## Password rehashing
+
+If your Auth.js application used a different hashing algorithm (e.g., `argon2` or `scrypt` directly), you need to rehash passwords as users log in:
+
+```ts title="lib/ideal-auth.ts"
+export const auth = createAuth<User>({
+  // ...
+
+  // Use attemptUser for custom hash migration logic
+  async attemptUser(credentials) {
+    const { password, ...lookup } = credentials;
+    const user = await db.user.findUnique({
+      where: { email: lookup.email },
+    });
+    if (!user || !user.password) return null;
+
+    // Check if the hash is already bcrypt (starts with $2a$ or $2b$)
+    if (user.password.startsWith('$2')) {
+      // Already bcrypt — use ideal-auth's hash.verify
+      const valid = await hash.verify(password, user.password);
+      return valid ? user : null;
+    }
+
+    // Legacy hash — verify with old algorithm
+    const valid = await verifyLegacyHash(password, user.password);
+    if (!valid) return null;
+
+    // Rehash with bcrypt for next time
+    const newHash = await hash.make(password);
+    await db.user.update({
+      where: { id: user.id },
+      data: { password: newHash },
+    });
+
+    return user;
+  },
+});
+```
+
+This transparently migrates password hashes on each login until all users have been rehashed.

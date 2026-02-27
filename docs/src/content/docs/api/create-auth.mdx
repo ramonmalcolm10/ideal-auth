@@ -1,0 +1,415 @@
+---
+title: createAuth
+description: API reference for createAuth — the core session auth factory.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Signature
+
+```typescript
+function createAuth<TUser>(config: AuthConfig<TUser>): () => AuthInstance<TUser>
+```
+
+`createAuth` is the main entry point for session-based authentication. It accepts an `AuthConfig` object and returns a **factory function**. Each call to the factory produces an `AuthInstance` scoped to the current request's cookies.
+
+```typescript
+import { createAuth, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+const auth = createAuth({
+  secret: process.env.AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+  hash,
+});
+
+// In a request handler:
+const session = auth();
+const user = await session.user();
+```
+
+:::caution
+Call `auth()` **once per request** and reuse the returned `AuthInstance`. The instance caches the session and user internally — calling `auth()` multiple times creates separate instances that do not share cached state.
+:::
+
+:::danger
+The `secret` must be at least **32 characters**. `createAuth` throws immediately if the secret is shorter.
+:::
+
+## AuthConfig
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `secret` | `string` | Yes | — |
+| `cookie` | [`CookieBridge`](#cookiebridge) | Yes | — |
+| `session.cookieName` | `string` | No | `'ideal_session'` |
+| `session.maxAge` | `number` (seconds) | No | `604800` (7 days) |
+| `session.rememberMaxAge` | `number` (seconds) | No | `2592000` (30 days) |
+| `session.cookie` | `Partial<ConfigurableCookieOptions>` | No | `secure` in production, `sameSite: 'lax'`, `path: '/'` |
+| `resolveUser` | `(id: string) => Promise<TUser \| null>` | Yes | — |
+| `resolveUserByCredentials` | `(credentials: Record<string, unknown>) => Promise<TUser \| null>` | No | — |
+| `hash` | [`HashInstance`](/ideal-auth/api/create-hash/) | No | — |
+| `credentialKey` | `string` | No | `'password'` |
+| `passwordField` | `string` | No | `'password'` |
+| `attemptUser` | `(credentials: Record<string, unknown>) => Promise<TUser \| null>` | No | — |
+
+### secret
+
+A string of at least 32 characters used to encrypt session cookies. Generate one with the CLI:
+
+```bash
+bunx ideal-auth secret
+```
+
+### cookie
+
+A [`CookieBridge`](#cookiebridge) object that tells ideal-auth how to interact with cookies in your framework.
+
+### session
+
+Optional session configuration. The defaults work well for most applications.
+
+- **`cookieName`** — Name of the session cookie stored in the browser.
+- **`maxAge`** — Lifetime of the session cookie in seconds. Used when `remember` is not specified in login options.
+- **`rememberMaxAge`** — Lifetime of the session cookie in seconds when `remember: true` is passed to login.
+- **`cookie`** — Partial cookie options merged with the defaults. You can override `sameSite`, `path`, `domain`, and `secure`. The `httpOnly` flag is always forced to `true` and cannot be overridden.
+
+### resolveUser
+
+Called when the session is read to hydrate the full user object from a user ID. Must return the user object or `null` if the user no longer exists.
+
+```typescript
+resolveUser: async (id) => {
+  return db.user.findUnique({ where: { id } });
+}
+```
+
+### resolveUserByCredentials
+
+Used by `attempt()` in [Laravel-style mode](#laravel-style-mode) to look up a user by the non-password fields of the credentials object. The `credentialKey` field (default `'password'`) is stripped before the object is passed to this function.
+
+```typescript
+resolveUserByCredentials: async (credentials) => {
+  // credentials = { email: "user@example.com" }
+  // (password was already stripped)
+  return db.user.findUnique({ where: { email: credentials.email } });
+}
+```
+
+### hash
+
+A [`HashInstance`](/ideal-auth/api/create-hash/) created by `createHash()`. Required for the Laravel-style `attempt()` mode.
+
+### credentialKey
+
+The key in the credentials object that contains the password. Defaults to `'password'`. This key is stripped from credentials before passing them to `resolveUserByCredentials`.
+
+### passwordField
+
+The property name on the user object that stores the hashed password. Defaults to `'password'`. Used by `attempt()` to read the stored hash for verification.
+
+### attemptUser
+
+A function for [manual mode](#manual-mode) that receives the full credentials object and returns a user if authentication succeeds. Takes precedence over the Laravel-style flow if both are configured.
+
+---
+
+## AuthInstance
+
+The object returned by calling the factory function. All methods are async.
+
+### login
+
+```typescript
+login(user: TUser, options?: LoginOptions): Promise<void>
+```
+
+Sets the session cookie with the given user. The user object must have an `id` property (string).
+
+```typescript
+const session = auth();
+const user = await db.user.findUnique({ where: { email } });
+
+if (user) {
+  await session.login(user);
+}
+```
+
+### loginById
+
+```typescript
+loginById(id: string, options?: LoginOptions): Promise<void>
+```
+
+Resolves a user by ID using `resolveUser`, then sets the session cookie. Throws an error with the message `'Login failed'` if the user is not found.
+
+```typescript
+const session = auth();
+
+try {
+  await session.loginById('user_abc123');
+} catch (error) {
+  // error.message === 'Login failed'
+}
+```
+
+### attempt
+
+```typescript
+attempt(
+  credentials: Record<string, unknown>,
+  options?: LoginOptions,
+): Promise<boolean>
+```
+
+Finds a user by credentials, verifies the password, and logs the user in if valid. Returns `true` on success, `false` on failure. See [Attempt Modes](#attempt-modes) for details.
+
+```typescript
+const session = auth();
+const success = await session.attempt({
+  email: 'user@example.com',
+  password: 'correct-password',
+});
+
+if (!success) {
+  return { error: 'Invalid credentials.' };
+}
+```
+
+### logout
+
+```typescript
+logout(): Promise<void>
+```
+
+Deletes the session cookie, ending the user's session.
+
+```typescript
+const session = auth();
+await session.logout();
+```
+
+### check
+
+```typescript
+check(): Promise<boolean>
+```
+
+Returns `true` if the current request has a valid session with a resolvable user. Does not throw.
+
+```typescript
+const session = auth();
+
+if (await session.check()) {
+  // user is authenticated
+}
+```
+
+### user
+
+```typescript
+user(): Promise<TUser | null>
+```
+
+Returns the authenticated user object or `null` if no valid session exists. The result is cached for the lifetime of the `AuthInstance` — subsequent calls return the same object without re-querying.
+
+```typescript
+const session = auth();
+const currentUser = await session.user();
+
+if (!currentUser) {
+  redirect('/login');
+}
+```
+
+### id
+
+```typescript
+id(): Promise<string | null>
+```
+
+Returns the user ID from the session cookie or `null` if no valid session exists. This reads only the session cookie and does **not** call `resolveUser`.
+
+```typescript
+const session = auth();
+const userId = await session.id();
+```
+
+---
+
+## LoginOptions
+
+```typescript
+interface LoginOptions {
+  remember?: boolean;
+}
+```
+
+Controls the lifetime of the session cookie set during login.
+
+| Value | Behavior | Cookie maxAge |
+|---|---|---|
+| `true` | Long-lived session | `rememberMaxAge` (default 30 days) |
+| `false` | Session cookie (browser close) | `undefined` (no maxAge) |
+| omitted | Default session lifetime | `maxAge` (default 7 days) |
+
+```typescript
+// "Remember me" checked — 30-day session
+await session.login(user, { remember: true });
+
+// "Remember me" unchecked — session ends when browser closes
+await session.login(user, { remember: false });
+
+// Default — 7-day session
+await session.login(user);
+```
+
+---
+
+## CookieBridge
+
+```typescript
+interface CookieBridge {
+  get(name: string): Promise<string | undefined> | string | undefined;
+  set(name: string, value: string, options: CookieOptions): Promise<void> | void;
+  delete(name: string): Promise<void> | void;
+}
+```
+
+The cookie bridge is how ideal-auth interacts with your framework's cookie API. Each method can be synchronous or asynchronous.
+
+**Next.js (App Router) example:**
+
+```typescript
+import { cookies } from 'next/headers';
+
+const cookieBridge = {
+  async get(name: string) {
+    const jar = await cookies();
+    return jar.get(name)?.value;
+  },
+  async set(name: string, value: string, options: any) {
+    const jar = await cookies();
+    jar.set(name, value, options);
+  },
+  async delete(name: string) {
+    const jar = await cookies();
+    jar.delete(name);
+  },
+};
+```
+
+**Express example:**
+
+```typescript
+function createCookieBridge(req, res) {
+  return {
+    get(name: string) {
+      return req.cookies[name];
+    },
+    set(name: string, value: string, options: any) {
+      res.cookie(name, value, options);
+    },
+    delete(name: string) {
+      res.clearCookie(name);
+    },
+  };
+}
+```
+
+---
+
+## Attempt Modes
+
+The `attempt()` method supports two modes for resolving and verifying users.
+
+### Laravel-style mode
+
+Provide `hash` and `resolveUserByCredentials` in the config. When `attempt()` is called:
+
+1. The `credentialKey` (default `'password'`) is stripped from the credentials object.
+2. The remaining fields are passed to `resolveUserByCredentials` to look up the user.
+3. The password is verified against `user[passwordField]` using the `hash` instance.
+4. If verification succeeds, the user is logged in.
+
+```typescript
+import { createAuth, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+const auth = createAuth({
+  secret: process.env.AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: async (credentials) => {
+    // credentials = { email: "user@example.com" }
+    return db.user.findUnique({ where: { email: credentials.email } });
+  },
+  hash,
+  // credentialKey: 'password',  // default
+  // passwordField: 'password',  // default
+});
+
+// Usage
+const success = await auth().attempt({
+  email: 'user@example.com',
+  password: 'their-password',
+});
+```
+
+### Manual mode
+
+Provide `attemptUser` for full control over credential resolution and password verification. This takes precedence over the Laravel-style flow if both are configured.
+
+```typescript
+import { createAuth, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+const auth = createAuth({
+  secret: process.env.AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  attemptUser: async (credentials) => {
+    const user = await db.user.findUnique({
+      where: { email: credentials.email as string },
+    });
+
+    if (!user) return null;
+
+    const valid = await hash.verify(
+      credentials.password as string,
+      user.password,
+    );
+
+    return valid ? user : null;
+  },
+});
+
+// Usage is identical
+const success = await auth().attempt({
+  email: 'user@example.com',
+  password: 'their-password',
+});
+```
+
+---
+
+## Types
+
+All types are available as type-only exports:
+
+```typescript
+import type {
+  AuthConfig,
+  AuthInstance,
+  CookieBridge,
+  CookieOptions,
+  ConfigurableCookieOptions,
+  LoginOptions,
+} from 'ideal-auth';
+```

@@ -1,0 +1,277 @@
+---
+title: Rate Limiter
+description: API reference for createRateLimiter and MemoryRateLimitStore.
+---
+
+## createRateLimiter
+
+### Signature
+
+```typescript
+function createRateLimiter(config: RateLimiterConfig): {
+  attempt(key: string): Promise<RateLimitResult>;
+  reset(key: string): Promise<void>;
+}
+```
+
+Creates a rate limiter with a sliding window strategy. Returns an object with `attempt` and `reset` methods.
+
+```typescript
+import { createRateLimiter } from 'ideal-auth';
+
+const loginLimiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+});
+```
+
+---
+
+### RateLimiterConfig
+
+```typescript
+interface RateLimiterConfig {
+  maxAttempts: number;
+  windowMs: number;
+  store?: RateLimitStore;
+}
+```
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `maxAttempts` | `number` | Yes | — |
+| `windowMs` | `number` (milliseconds) | Yes | — |
+| `store` | [`RateLimitStore`](#ratelimitstore-interface) | No | [`MemoryRateLimitStore`](#memoryratelimitstore) |
+
+- **`maxAttempts`** — Maximum number of attempts allowed within the window before rate limiting takes effect.
+- **`windowMs`** — Duration of the sliding window in milliseconds. The attempt count resets after this period.
+- **`store`** — A backing store for tracking attempt counts. Defaults to an in-memory store. Provide a custom implementation for multi-process or distributed deployments.
+
+---
+
+### attempt
+
+```typescript
+attempt(key: string): Promise<RateLimitResult>
+```
+
+Records an attempt for the given key and returns the rate limit status.
+
+```typescript
+const result = await loginLimiter.attempt('user@example.com');
+
+if (!result.allowed) {
+  return {
+    error: `Too many attempts. Try again after ${result.resetAt.toISOString()}.`,
+  };
+}
+
+// Proceed with login logic
+```
+
+#### RateLimitResult
+
+```typescript
+interface RateLimitResult {
+  allowed: boolean;
+  remaining: number;
+  resetAt: Date;
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `allowed` | `boolean` | `true` if the attempt is within the limit, `false` if rate limited |
+| `remaining` | `number` | Number of attempts remaining in the current window (never goes negative) |
+| `resetAt` | `Date` | When the current window expires and the count resets |
+
+```typescript
+const limiter = createRateLimiter({
+  maxAttempts: 3,
+  windowMs: 60_000,
+});
+
+await limiter.attempt('key'); // { allowed: true,  remaining: 2, resetAt: ... }
+await limiter.attempt('key'); // { allowed: true,  remaining: 1, resetAt: ... }
+await limiter.attempt('key'); // { allowed: true,  remaining: 0, resetAt: ... }
+await limiter.attempt('key'); // { allowed: false, remaining: 0, resetAt: ... }
+```
+
+---
+
+### reset
+
+```typescript
+reset(key: string): Promise<void>
+```
+
+Clears the rate limit for the given key, resetting its attempt count to zero. Useful after a successful action (e.g., clearing the login limiter after a successful login).
+
+```typescript
+const success = await auth().attempt({ email, password });
+
+if (success) {
+  // Clear rate limit on successful login
+  await loginLimiter.reset(email);
+  redirect('/dashboard');
+}
+```
+
+---
+
+## MemoryRateLimitStore
+
+```typescript
+import { MemoryRateLimitStore } from 'ideal-auth';
+```
+
+The default in-memory store used by `createRateLimiter` when no `store` option is provided. Suitable for single-process deployments.
+
+### Behavior
+
+| Property | Value |
+|---|---|
+| Maximum entries | 10,000 |
+| Cleanup interval | Every 60 seconds |
+| Eviction | Expired entries are removed first |
+| Full store | New keys are rejected when the store is full of non-expired entries |
+
+- **Single-process only** — The store is not shared across processes or servers. Rate limits reset when the process restarts.
+- **10,000 entry cap** — When the store reaches capacity, it first evicts expired entries. If no entries have expired and the store is still full, new keys are rejected (the `attempt` call still returns a result with `allowed: false`).
+- **Periodic cleanup** — A background interval runs every 60 seconds to remove expired entries, preventing memory leaks from accumulated stale data.
+
+```typescript
+import { createRateLimiter, MemoryRateLimitStore } from 'ideal-auth';
+
+// Explicitly passing the default store
+const store = new MemoryRateLimitStore();
+
+const limiter = createRateLimiter({
+  maxAttempts: 10,
+  windowMs: 60_000,
+  store,
+});
+```
+
+---
+
+## RateLimitStore interface
+
+```typescript
+interface RateLimitStore {
+  increment(
+    key: string,
+    windowMs: number,
+  ): Promise<{ count: number; resetAt: Date }>;
+  reset(key: string): Promise<void>;
+}
+```
+
+Implement this interface to use a custom backing store (Redis, database, etc.) for rate limiting in multi-process or distributed environments.
+
+| Method | Description |
+|---|---|
+| `increment(key, windowMs)` | Increment the attempt count for `key`. If the key does not exist, initialize it with a count of `1` and a `resetAt` time of `Date.now() + windowMs`. Return the current count and reset time. |
+| `reset(key)` | Remove the rate limit entry for `key`. |
+
+---
+
+## Custom store: Redis example
+
+```typescript
+import { createRateLimiter } from 'ideal-auth';
+import type { RateLimitStore } from 'ideal-auth';
+import Redis from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+const redisStore: RateLimitStore = {
+  async increment(key: string, windowMs: number) {
+    const redisKey = `rate_limit:${key}`;
+
+    const count = await redis.incr(redisKey);
+
+    if (count === 1) {
+      // First attempt — set the expiry
+      await redis.pexpire(redisKey, windowMs);
+    }
+
+    const ttl = await redis.pttl(redisKey);
+    const resetAt = new Date(Date.now() + Math.max(ttl, 0));
+
+    return { count, resetAt };
+  },
+
+  async reset(key: string) {
+    await redis.del(`rate_limit:${key}`);
+  },
+};
+
+const loginLimiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000,
+  store: redisStore,
+});
+```
+
+---
+
+## Full example: protecting a login endpoint
+
+```typescript
+import { createAuth, createHash, createRateLimiter } from 'ideal-auth';
+
+const hash = createHash();
+
+const auth = createAuth({
+  secret: process.env.AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+  hash,
+});
+
+const loginLimiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+});
+
+async function login(email: string, password: string) {
+  // Check rate limit before attempting login
+  const limit = await loginLimiter.attempt(email);
+
+  if (!limit.allowed) {
+    return {
+      error: 'Too many login attempts. Please try again later.',
+      retryAfter: limit.resetAt,
+    };
+  }
+
+  const success = await auth().attempt({ email, password });
+
+  if (!success) {
+    return {
+      error: 'Invalid email or password.',
+      remaining: limit.remaining,
+    };
+  }
+
+  // Clear rate limit on successful login
+  await loginLimiter.reset(email);
+
+  return { success: true };
+}
+```
+
+---
+
+## Types
+
+```typescript
+import type {
+  RateLimiterConfig,
+  RateLimitResult,
+  RateLimitStore,
+} from 'ideal-auth';
+```

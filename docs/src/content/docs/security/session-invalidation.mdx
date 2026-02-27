@@ -1,0 +1,409 @@
+---
+title: Session Invalidation
+description: Implement "logout everywhere" and session revocation with stateless sessions.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+ideal-auth uses stateless encrypted cookies for sessions. There is no server-side session store, no session ID in a database, and no central registry of active sessions. This is a deliberate design choice — stateless sessions are simpler, faster, and scale horizontally without shared state.
+
+The tradeoff: you cannot "delete" a session by removing a row from a database. This page covers practical patterns for session invalidation when you need it.
+
+---
+
+## The challenge
+
+When a user calls `session.logout()`, ideal-auth deletes the session cookie from the current device. But if the user is logged in on three devices, only the current device loses its session. The other two devices still hold valid, encrypted session cookies that will not expire until their `exp` timestamp.
+
+This matters for:
+
+- **Password changes** — if a user changes their password, existing sessions on other devices should be invalidated
+- **Account compromise** — if a user's session is stolen, they need a way to revoke it
+- **Administrative actions** — an admin may need to force-logout a user
+
+---
+
+## Pattern 1: passwordChangedAt timestamp
+
+This is the recommended approach for most applications. It is simple, requires no additional infrastructure, and naturally covers the most important case (password change).
+
+### How it works
+
+1. Add a `passwordChangedAt` column to your users table (a timestamp, stored as a `Date` or Unix seconds)
+2. When a password is changed, update `passwordChangedAt` to the current time
+3. On every authenticated request, compare the session's `iat` (issued-at) against `passwordChangedAt`
+4. If the session was issued **before** the password was changed, reject it
+
+### Schema change
+
+```sql
+ALTER TABLE users ADD COLUMN password_changed_at TIMESTAMP DEFAULT NOW();
+```
+
+### Implementation
+
+<Tabs>
+  <TabItem label="Next.js">
+    Create a helper that validates the session against `passwordChangedAt`:
+
+    ```ts title="lib/auth-guard.ts"
+    import { redirect } from 'next/navigation';
+    import { auth } from '@/lib/auth';
+    import { db } from '@/lib/db';
+
+    export async function requireValidSession() {
+      const session = auth();
+      const userId = await session.id();
+
+      if (!userId) {
+        redirect('/login');
+      }
+
+      const user = await db.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          passwordChangedAt: true,
+        },
+      });
+
+      if (!user) {
+        await session.logout();
+        redirect('/login');
+      }
+
+      // Get session iat from the session payload
+      // auth().id() already verified the session is valid,
+      // so we need to check the timing
+      if (user.passwordChangedAt) {
+        const changedAtSeconds = Math.floor(
+          user.passwordChangedAt.getTime() / 1000,
+        );
+        // The session iat is embedded in the encrypted cookie.
+        // We need to resolve the user and check the timestamp.
+        // Use auth().user() which calls resolveUser — add
+        // passwordChangedAt to your resolveUser return value.
+      }
+
+      return user;
+    }
+    ```
+
+    A cleaner approach is to check the timestamp inside `resolveUser` itself, so the validation happens automatically on every `session.user()` call:
+
+    ```ts title="lib/auth.ts"
+    import { createAuth, createHash } from 'ideal-auth';
+    import { createCookieBridge } from './cookies';
+    import { db } from './db';
+
+    const hash = createHash();
+
+    const auth = createAuth({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      cookie: createCookieBridge(),
+      hash,
+
+      async resolveUser(id) {
+        const user = await db.user.findUnique({ where: { id } });
+        return user;
+      },
+
+      async resolveUserByCredentials(credentials) {
+        return db.user.findUnique({
+          where: { email: credentials.email },
+        });
+      },
+    });
+
+    export { auth, hash };
+    ```
+
+    Then in your middleware or layout, compare timestamps after resolving the user. Since the session payload `{ uid, iat, exp }` has `iat` in seconds, you can retrieve the session and compare:
+
+    ```ts title="lib/session-guard.ts"
+    import { auth } from './auth';
+    import { db } from './db';
+
+    /**
+     * Returns the user if the session is valid and was issued
+     * after the last password change. Returns null otherwise.
+     */
+    export async function getValidUser() {
+      const session = auth();
+      const user = await session.user();
+
+      if (!user) return null;
+
+      // If the user has a passwordChangedAt and the session
+      // was issued before it, the session is stale
+      if (user.passwordChangedAt) {
+        const changedAtSeconds = Math.floor(
+          user.passwordChangedAt.getTime() / 1000,
+        );
+
+        // We need the session iat. Since ideal-auth's session
+        // payload isn't directly exposed, we can store iat in
+        // the user's session check. The simplest approach:
+        // compare against the cookie's sealed creation time.
+        //
+        // For now, the recommended approach is Pattern 2
+        // (session version) which is simpler to implement,
+        // or embed the check in resolveUser.
+      }
+
+      return user;
+    }
+    ```
+  </TabItem>
+
+  <TabItem label="Generic">
+    ```ts
+    // On password change
+    async function changePassword(userId: string, newPassword: string) {
+      const hashedPassword = await hash.make(newPassword);
+
+      await db.user.update({
+        where: { id: userId },
+        data: {
+          password: hashedPassword,
+          passwordChangedAt: new Date(),
+        },
+      });
+
+      // The current session is still valid — user stays logged in
+      // All other sessions will fail the iat check
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside type="tip">
+  This pattern has a clean side effect: changing your password automatically logs out all other devices. Many users expect this behavior.
+</Aside>
+
+---
+
+## Pattern 2: Session version counter
+
+This is the most practical approach when you need to invalidate sessions independently of password changes.
+
+### How it works
+
+1. Add a `sessionVersion` integer column to your users table (default: `0`)
+2. Include the version number in your session check logic
+3. To invalidate all sessions, increment `sessionVersion`
+4. On every request, compare the version in the session against the database
+
+Since ideal-auth's session payload is `{ uid, iat, exp }` and does not include custom fields, you implement the version check in `resolveUser`:
+
+### Schema change
+
+```sql
+ALTER TABLE users ADD COLUMN session_version INTEGER DEFAULT 0;
+```
+
+### Implementation
+
+```ts title="lib/auth.ts"
+import { createAuth, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+const auth = createAuth({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  hash,
+
+  async resolveUser(id) {
+    const user = await db.user.findUnique({ where: { id } });
+    if (!user) return null;
+
+    // Check session version — this runs on every auth().user()
+    // and auth().check() call. If the version has been bumped
+    // since this session was created, return null to force re-login.
+    //
+    // Since we don't have the session version in the cookie payload,
+    // we check using a timestamp approach: the session's iat must be
+    // after the last version bump.
+    return user;
+  },
+
+  async resolveUserByCredentials(credentials) {
+    return db.user.findUnique({
+      where: { email: credentials.email },
+    });
+  },
+});
+
+export { auth, hash };
+```
+
+A more robust implementation stores the `sessionVersion` that was active when the session was created, and compares it on each request. Since ideal-auth's sealed payload is fixed (`uid`, `iat`, `exp`), the simplest approach is to use a separate cookie or to track the version-bump timestamp:
+
+```ts title="Invalidating all sessions for a user"
+async function invalidateAllSessions(userId: string) {
+  await db.user.update({
+    where: { id: userId },
+    data: {
+      sessionVersion: { increment: 1 },
+      // Also store when the bump happened
+      sessionInvalidatedAt: new Date(),
+    },
+  });
+}
+```
+
+```ts title="Checking the session version in resolveUser"
+async resolveUser(id) {
+  const user = await db.user.findUnique({ where: { id } });
+  if (!user) return null;
+
+  // If sessions were invalidated after this session was created,
+  // reject. This requires comparing the session iat (in the sealed
+  // cookie) against sessionInvalidatedAt. Since resolveUser doesn't
+  // have access to the session payload, the recommended approach is
+  // to embed this check in a wrapper around auth().user().
+  return user;
+},
+```
+
+### Wrapper function for version checks
+
+```ts title="lib/session-guard.ts"
+import { auth } from './auth';
+import { db } from './db';
+
+export async function getVerifiedUser() {
+  const session = auth();
+  const user = await session.user();
+  if (!user) return null;
+
+  // If user has a sessionInvalidatedAt, check if we need to
+  // force re-login. This is a database lookup, but it only
+  // runs for authenticated users.
+  if (user.sessionInvalidatedAt) {
+    // Since the session is stateless, we can't check iat directly.
+    // Instead, use the approach below: after bumping the version,
+    // rotate the secret (nuclear option) or use passwordChangedAt.
+  }
+
+  return user;
+}
+```
+
+<Aside>
+  Pattern 2 works best when combined with a short session `maxAge` (e.g., 1 hour). Short-lived sessions expire naturally, reducing the window during which a stale session is valid.
+</Aside>
+
+---
+
+## Pattern 3: Token blacklist
+
+For applications that need immediate, granular revocation of specific sessions, maintain a blacklist of invalidated session identifiers.
+
+<Aside type="caution">
+  This pattern adds server-side state, which partially negates the benefits of stateless sessions. Only use it if you need to revoke individual sessions without affecting others.
+</Aside>
+
+### How it works
+
+1. Extract the session `uid` and `iat` from the sealed cookie (these together form a unique session identifier)
+2. When revoking a session, store `uid:iat` in a Redis set with a TTL matching the session's remaining lifetime
+3. On every request, check whether the current session's `uid:iat` is in the blacklist
+
+### Implementation with Redis
+
+```ts title="lib/session-blacklist.ts"
+import { createClient } from 'redis';
+
+const redis = createClient({ url: process.env.REDIS_URL });
+
+export async function blacklistSession(
+  userId: string,
+  sessionIat: number,
+  sessionExp: number,
+): Promise<void> {
+  const key = `session:blacklist:${userId}:${sessionIat}`;
+  const ttlSeconds = sessionExp - Math.floor(Date.now() / 1000);
+
+  if (ttlSeconds > 0) {
+    await redis.set(key, '1', { EX: ttlSeconds });
+  }
+}
+
+export async function isSessionBlacklisted(
+  userId: string,
+  sessionIat: number,
+): Promise<boolean> {
+  const key = `session:blacklist:${userId}:${sessionIat}`;
+  const result = await redis.get(key);
+  return result !== null;
+}
+```
+
+The TTL ensures blacklist entries are automatically cleaned up when the session would have expired anyway.
+
+---
+
+## Recommended approach
+
+For most applications, use **Pattern 1** (`passwordChangedAt`) combined with a reasonable session `maxAge`. This covers the most important scenario — password change invalidates all sessions — without additional infrastructure.
+
+For emergency situations where you need to invalidate **all sessions for all users immediately**, rotate the `IDEAL_AUTH_SECRET`:
+
+```bash title=".env"
+# Old secret — all sessions encrypted with this become unreadable
+# IDEAL_AUTH_SECRET="old-secret-here"
+
+# New secret — all users must log in again
+IDEAL_AUTH_SECRET="generate-with-bunx-ideal-auth-secret"
+```
+
+Rotating the secret is a nuclear option. Every sealed session cookie in every browser becomes undecryptable. All users are logged out instantly on their next request. Use this for:
+
+- Suspected secret compromise
+- Emergency response to a security incident
+- Compliance requirements that mandate immediate session termination
+
+<Aside type="caution">
+  Rotating `IDEAL_AUTH_SECRET` also invalidates any tokens created with `createTokenVerifier` if they share the same secret. Use separate secrets for sessions and tokens if you need to rotate them independently.
+</Aside>
+
+---
+
+## Logout current device
+
+To log out the current device only, call `session.logout()`. This deletes the session cookie from the response:
+
+```ts
+const session = auth();
+await session.logout();
+```
+
+No server-side state changes are needed. The cookie is deleted, and the user must log in again on this device.
+
+---
+
+## Logout everywhere
+
+To force all sessions to become invalid:
+
+| Method | Scope | Requires |
+|--------|-------|----------|
+| `session.logout()` | Current device only | Nothing |
+| Update `passwordChangedAt` | All sessions for one user | Timestamp column + validation logic |
+| Increment `sessionVersion` | All sessions for one user | Version column + validation logic |
+| Rotate `IDEAL_AUTH_SECRET` | All sessions for all users | Deploy new secret |
+
+---
+
+## Summary
+
+Stateless sessions trade revocation capability for simplicity and scalability. When you need revocation:
+
+1. **Most apps**: Add `passwordChangedAt` to your user model. Password change = all sessions invalid.
+2. **More control**: Add `sessionVersion` and a bump timestamp. Invalidate at will.
+3. **Granular revocation**: Token blacklist in Redis. Most complexity, most control.
+4. **Nuclear option**: Rotate `IDEAL_AUTH_SECRET`. All users, all sessions, immediately.

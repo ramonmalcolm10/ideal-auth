@@ -1,0 +1,166 @@
+---
+title: createHash
+description: API reference for createHash — bcrypt password hashing.
+---
+
+## Signature
+
+```typescript
+function createHash(config?: HashConfig): HashInstance
+```
+
+Creates a password hashing instance powered by bcrypt. Uses `bcryptjs` (pure JavaScript, edge runtime compatible) under the hood.
+
+```typescript
+import { createHash } from 'ideal-auth';
+
+const hash = createHash();
+```
+
+---
+
+## HashConfig
+
+```typescript
+interface HashConfig {
+  rounds?: number;
+}
+```
+
+| Field | Type | Required | Default |
+|---|---|---|---|
+| `rounds` | `number` | No | `12` |
+
+The `rounds` parameter controls the bcrypt cost factor. Higher values are more secure but slower. Each increment roughly doubles the computation time.
+
+```typescript
+const hash = createHash({ rounds: 14 });
+```
+
+---
+
+## HashInstance
+
+### make
+
+```typescript
+make(password: string): Promise<string>
+```
+
+Hashes a password using bcrypt and returns the hash string. Throws if the password is empty.
+
+Each call produces a **different hash** because bcrypt generates a random salt every time.
+
+```typescript
+const hash = createHash();
+
+const hashed = await hash.make('my-secure-password');
+// "$2a$12$..."
+
+// Each call produces a different result
+const hashed2 = await hash.make('my-secure-password');
+// "$2a$12$..." (different from hashed)
+```
+
+:::danger
+`make()` throws an error if the password is an empty string. Always validate input before hashing.
+:::
+
+```typescript
+try {
+  await hash.make('');
+} catch (error) {
+  // Error: password must not be empty
+}
+```
+
+### verify
+
+```typescript
+verify(password: string, hash: string): Promise<boolean>
+```
+
+Compares a plain-text password against a bcrypt hash. Returns `true` if they match, `false` otherwise.
+
+```typescript
+const hash = createHash();
+
+const hashed = await hash.make('my-secure-password');
+
+await hash.verify('my-secure-password', hashed); // true
+await hash.verify('wrong-password', hashed);     // false
+```
+
+---
+
+## Prehash behavior
+
+Passwords longer than **72 UTF-8 bytes** are automatically SHA-256 prehashed before being passed to bcrypt. This is because bcrypt truncates input at 72 bytes — without prehashing, two passwords that share the same first 72 bytes would produce identical hashes.
+
+The prehash is transparent. You do not need to do anything special; `make()` and `verify()` handle it automatically.
+
+```typescript
+const hash = createHash();
+
+// This 100-character password exceeds 72 UTF-8 bytes.
+// It is automatically SHA-256 prehashed before bcrypt processes it.
+const longPassword = 'a'.repeat(100);
+const hashed = await hash.make(longPassword);
+
+// Verification works identically — prehash is applied automatically
+await hash.verify(longPassword, hashed); // true
+```
+
+---
+
+## Usage with createAuth
+
+Pass the `HashInstance` to `createAuth` to enable the Laravel-style `attempt()` flow:
+
+```typescript
+import { createAuth, createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+const auth = createAuth({
+  secret: process.env.AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+  hash,
+});
+```
+
+---
+
+## Registration example
+
+Use `make()` to hash passwords before storing them in your database:
+
+```typescript
+import { createHash } from 'ideal-auth';
+
+const hash = createHash();
+
+async function registerUser(email: string, password: string) {
+  const hashedPassword = await hash.make(password);
+
+  const user = await db.user.create({
+    data: {
+      email,
+      password: hashedPassword,
+    },
+  });
+
+  return user;
+}
+```
+
+---
+
+## Types
+
+```typescript
+import type { HashConfig, HashInstance } from 'ideal-auth';
+```

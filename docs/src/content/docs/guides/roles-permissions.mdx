@@ -1,0 +1,479 @@
+---
+title: Roles & Permissions
+description: Implement role-based and permission-based access control with ideal-auth.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+ideal-auth intentionally does not include a roles and permissions system. Access control schemas vary significantly between applications — flat roles, hierarchical RBAC, fine-grained permissions, attribute-based access control — and baking one into the library would either be too simple for real use cases or too opinionated.
+
+Instead, ideal-auth gives you the building blocks: `resolveUser` fetches your user from the database (with whatever role/permission data you need), and you write the access control checks that match your schema.
+
+This guide covers recommended patterns you can adopt.
+
+## Why it's not built in
+
+Different applications need fundamentally different models:
+
+- A blog might need `admin` / `editor` / `viewer` roles
+- A SaaS platform might need per-resource permissions like `invoices.create`, `invoices.delete`
+- A multi-tenant system might need organization-scoped roles (`org:admin`, `org:member`)
+- An enterprise system might need attribute-based policies ("users in department X can access resource Y during business hours")
+
+Any built-in system would either cover only the simplest case or impose a schema you would eventually fight against. By keeping roles and permissions in your application layer, you get full control over your data model and access checks.
+
+## Simple roles pattern
+
+The simplest approach: each user has a single `role` field.
+
+### Database schema
+
+```sql
+CREATE TABLE users (
+  id       TEXT PRIMARY KEY,
+  email    TEXT UNIQUE NOT NULL,
+  password TEXT NOT NULL,
+  role     TEXT NOT NULL DEFAULT 'viewer'  -- 'admin', 'editor', 'viewer'
+);
+```
+
+### Helper functions
+
+```ts
+type Role = 'admin' | 'editor' | 'viewer';
+
+function hasRole(user: { role: string }, role: Role): boolean {
+  return user.role === role;
+}
+
+function hasMinRole(user: { role: string }, minRole: Role): boolean {
+  const hierarchy: Role[] = ['viewer', 'editor', 'admin'];
+  return hierarchy.indexOf(user.role as Role) >= hierarchy.indexOf(minRole);
+}
+```
+
+### Usage in a route handler
+
+```ts
+import { createAuth } from 'ideal-auth';
+
+const auth = createAuth({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  resolveUser: (id) => db.user.findUnique({ where: { id } }),
+  // ...
+});
+
+// POST /api/admin/users
+export async function manageUsers(req, res) {
+  const session = auth();
+  const user = await session.user();
+
+  if (!user) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+
+  if (!hasRole(user, 'admin')) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  // ... admin-only logic
+}
+```
+
+## Permission-based pattern
+
+For finer-grained control, assign permissions directly to users.
+
+### Database schema
+
+```sql
+CREATE TABLE users (
+  id          TEXT PRIMARY KEY,
+  email       TEXT UNIQUE NOT NULL,
+  password    TEXT NOT NULL,
+  permissions TEXT[] NOT NULL DEFAULT '{}'
+  -- e.g., ['posts.create', 'posts.delete', 'users.manage']
+);
+```
+
+### Helper functions
+
+```ts
+function hasPermission(
+  user: { permissions: string[] },
+  permission: string,
+): boolean {
+  return user.permissions.includes(permission);
+}
+
+function hasAnyPermission(
+  user: { permissions: string[] },
+  permissions: string[],
+): boolean {
+  return permissions.some((p) => user.permissions.includes(p));
+}
+
+function hasAllPermissions(
+  user: { permissions: string[] },
+  permissions: string[],
+): boolean {
+  return permissions.every((p) => user.permissions.includes(p));
+}
+```
+
+### Usage
+
+```ts
+// POST /api/posts
+export async function createPost(req, res) {
+  const session = auth();
+  const user = await session.user();
+
+  if (!user) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+
+  if (!hasPermission(user, 'posts.create')) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
+  // ... create post
+}
+```
+
+## Role + permission hybrid
+
+The most flexible approach: roles define groups of permissions, but access checks use permissions. This lets you add or remove capabilities from roles without changing your authorization code.
+
+### Permission mapping
+
+```ts
+const ROLE_PERMISSIONS: Record<string, string[]> = {
+  admin: [
+    'posts.create',
+    'posts.edit',
+    'posts.delete',
+    'posts.publish',
+    'users.list',
+    'users.manage',
+    'settings.manage',
+  ],
+  editor: [
+    'posts.create',
+    'posts.edit',
+    'posts.delete',
+    'posts.publish',
+  ],
+  viewer: [
+    'posts.create',
+  ],
+};
+
+function getPermissionsForRole(role: string): string[] {
+  return ROLE_PERMISSIONS[role] ?? [];
+}
+
+function userHasPermission(
+  user: { role: string },
+  permission: string,
+): boolean {
+  return getPermissionsForRole(user.role).includes(permission);
+}
+```
+
+### Middleware factory
+
+Create a reusable middleware function that checks permissions:
+
+```ts
+function requirePermission(permission: string) {
+  return async (req, res, next) => {
+    const session = auth();
+    const user = await session.user();
+
+    if (!user) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    if (!userHasPermission(user, permission)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    req.user = user;
+    next();
+  };
+}
+
+// Usage
+app.post('/api/posts', requirePermission('posts.create'), createPost);
+app.delete('/api/posts/:id', requirePermission('posts.delete'), deletePost);
+app.get('/api/admin/users', requirePermission('users.manage'), listUsers);
+```
+
+<Aside type="tip">
+  Check permissions, not roles, in your route handlers and middleware. Roles are for grouping permissions. If you check roles directly, adding a new role means updating every authorization check in your codebase.
+</Aside>
+
+## Database schema patterns
+
+### Simple: role column on users table
+
+Best for applications with a small, fixed set of roles.
+
+```sql
+CREATE TABLE users (
+  id       TEXT PRIMARY KEY,
+  email    TEXT UNIQUE NOT NULL,
+  password TEXT NOT NULL,
+  role     TEXT NOT NULL DEFAULT 'viewer'
+);
+```
+
+### Medium: roles table with join table
+
+Best when roles are dynamic and managed through an admin interface.
+
+```sql
+CREATE TABLE roles (
+  id   TEXT PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL  -- 'admin', 'editor', 'viewer'
+);
+
+CREATE TABLE user_roles (
+  user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  role_id TEXT REFERENCES roles(id) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, role_id)
+);
+```
+
+```ts
+// resolveUser fetches roles
+async function resolveUser(id: string) {
+  const user = await db.user.findUnique({
+    where: { id },
+    include: {
+      userRoles: {
+        include: { role: true },
+      },
+    },
+  });
+
+  if (!user) return null;
+
+  return {
+    ...user,
+    roles: user.userRoles.map((ur) => ur.role.name),
+  };
+}
+```
+
+### Advanced: roles + permissions + role_permissions
+
+Best for complex applications where permissions can be assigned independently of roles.
+
+```sql
+CREATE TABLE roles (
+  id   TEXT PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL
+);
+
+CREATE TABLE permissions (
+  id   TEXT PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL  -- 'posts.create', 'users.manage'
+);
+
+CREATE TABLE role_permissions (
+  role_id       TEXT REFERENCES roles(id) ON DELETE CASCADE,
+  permission_id TEXT REFERENCES permissions(id) ON DELETE CASCADE,
+  PRIMARY KEY (role_id, permission_id)
+);
+
+CREATE TABLE user_roles (
+  user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+  role_id TEXT REFERENCES roles(id) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, role_id)
+);
+
+-- Optional: direct user-level permission overrides
+CREATE TABLE user_permissions (
+  user_id       TEXT REFERENCES users(id) ON DELETE CASCADE,
+  permission_id TEXT REFERENCES permissions(id) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, permission_id)
+);
+```
+
+```ts
+async function resolveUser(id: string) {
+  const user = await db.user.findUnique({ where: { id } });
+  if (!user) return null;
+
+  // Collect permissions from roles
+  const rolePermissions = await db.$queryRaw`
+    SELECT DISTINCT p.name
+    FROM user_roles ur
+    JOIN role_permissions rp ON rp.role_id = ur.role_id
+    JOIN permissions p ON p.id = rp.permission_id
+    WHERE ur.user_id = ${id}
+  `;
+
+  // Collect direct user permissions
+  const directPermissions = await db.$queryRaw`
+    SELECT p.name
+    FROM user_permissions up
+    JOIN permissions p ON p.id = up.permission_id
+    WHERE up.user_id = ${id}
+  `;
+
+  const allPermissions = new Set([
+    ...rolePermissions.map((r) => r.name),
+    ...directPermissions.map((r) => r.name),
+  ]);
+
+  return {
+    ...user,
+    permissions: [...allPermissions],
+  };
+}
+```
+
+## Framework integration examples
+
+### Next.js middleware
+
+```ts
+// middleware.ts
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+// Define which routes require which roles
+const PROTECTED_ROUTES: Record<string, string[]> = {
+  '/admin': ['admin'],
+  '/editor': ['admin', 'editor'],
+};
+
+export async function middleware(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  // Check if this route requires a role
+  for (const [route, allowedRoles] of Object.entries(PROTECTED_ROUTES)) {
+    if (pathname.startsWith(route)) {
+      // Role checking must happen in a server component or API route
+      // because middleware cannot access the database directly.
+      // Use a lightweight check here (e.g., a role claim in the cookie)
+      // and do the authoritative check in the server component.
+      const hasSession = request.cookies.has('ideal_session');
+      if (!hasSession) {
+        return NextResponse.redirect(new URL('/login', request.url));
+      }
+    }
+  }
+
+  return NextResponse.next();
+}
+```
+
+```ts
+// app/admin/page.tsx (Server Component — authoritative check)
+import { auth } from '@/lib/auth';
+import { redirect } from 'next/navigation';
+
+export default async function AdminPage() {
+  const session = auth();
+  const user = await session.user();
+
+  if (!user || user.role !== 'admin') {
+    redirect('/');
+  }
+
+  return <div>Admin panel</div>;
+}
+```
+
+### SvelteKit hooks
+
+```ts
+// src/hooks.server.ts
+import { redirect } from '@sveltejs/kit';
+import type { Handle } from '@sveltejs/kit';
+import { auth } from '$lib/auth';
+
+export const handle: Handle = async ({ event, resolve }) => {
+  const session = auth();
+  const user = await session.user();
+
+  event.locals.user = user;
+
+  // Protect admin routes
+  if (event.url.pathname.startsWith('/admin')) {
+    if (!user || user.role !== 'admin') {
+      throw redirect(302, '/');
+    }
+  }
+
+  return resolve(event);
+};
+```
+
+### Server action guard pattern
+
+```ts
+// lib/guards.ts
+import { auth } from './auth';
+
+export async function requireRole(role: string) {
+  const session = auth();
+  const user = await session.user();
+
+  if (!user) {
+    throw new Error('Not authenticated');
+  }
+
+  if (user.role !== role) {
+    throw new Error('Forbidden');
+  }
+
+  return user;
+}
+
+export async function requirePermission(permission: string) {
+  const session = auth();
+  const user = await session.user();
+
+  if (!user) {
+    throw new Error('Not authenticated');
+  }
+
+  if (!userHasPermission(user, permission)) {
+    throw new Error('Forbidden');
+  }
+
+  return user;
+}
+```
+
+```ts
+// app/actions.ts
+'use server';
+import { requirePermission } from '@/lib/guards';
+
+export async function deletePost(postId: string) {
+  const user = await requirePermission('posts.delete');
+
+  await db.post.delete({ where: { id: postId } });
+}
+```
+
+## Security notes
+
+<Aside type="danger">
+  Always check roles and permissions on the server. Client-side checks (hiding buttons, conditional rendering) are a UX convenience, not a security measure. An attacker can call your API directly.
+</Aside>
+
+- **Do not store roles or permissions in the session cookie.** Session cookies contain only `{ uid, iat, exp }`. If you store a role in the cookie and the user's role changes, the cookie will be stale until it expires. Always fetch the current role from the database via `resolveUser`.
+
+- **Fetch fresh permissions on every request.** The `resolveUser` function is called each time you call `session.user()`. This means permission changes take effect immediately — no need to force a logout or wait for the session to expire.
+
+- **Prefer permission checks over role checks.** Checking `hasPermission(user, 'posts.delete')` is more maintainable than `user.role === 'admin' || user.role === 'editor'`. When you add a new role, you only need to update the role-to-permissions mapping, not every authorization check.
+
+- **Fail closed.** If a user's role cannot be determined (e.g., the database query fails), deny access. Never default to allowing access on error.

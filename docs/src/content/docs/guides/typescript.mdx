@@ -1,0 +1,347 @@
+---
+title: TypeScript
+description: Type-safe auth with ideal-auth generics.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+ideal-auth is written in TypeScript and exports generic types that flow through the entire auth lifecycle. When you provide a user type to `createAuth`, every method that returns or accepts a user is typed accordingly.
+
+## Typing your user
+
+The `createAuth` function accepts a generic type parameter `TUser` that must extend `AnyUser`:
+
+```ts
+type AnyUser = { id: string | number; [key: string]: any };
+```
+
+This means your user type needs at least an `id` field that is a `string` or `number`. Everything else is up to you.
+
+```ts
+import { createAuth } from 'ideal-auth';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  role: 'admin' | 'user';
+  password: string;
+}
+
+const auth = createAuth<User>({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  resolveUser: (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+  hash,
+});
+
+const session = auth();
+const user = await session.user(); // User | null
+
+if (user) {
+  user.role;  // 'admin' | 'user' — fully typed
+  user.email; // string
+  user.name;  // string
+}
+```
+
+The generic flows through every method on the auth instance:
+
+- `session.user()` returns `Promise<User | null>`
+- `session.login(user)` expects a `User`
+- `session.attempt(creds)` resolves the user through your `resolveUserByCredentials`, which must return `Promise<User | null>`
+
+## Narrowing after check()
+
+`check()` returns `Promise<boolean>` and `user()` returns `Promise<TUser | null>`. They are separate calls because `check()` is a lightweight session-validity check, while `user()` calls `resolveUser` to fetch the full user from your database.
+
+The recommended pattern is to call `user()` and null-check the result:
+
+```ts
+const session = auth();
+const user = await session.user();
+
+if (!user) {
+  return res.status(401).json({ error: 'Not authenticated' });
+}
+
+// TypeScript narrows `user` to `User` here
+console.log(user.role);
+```
+
+If you only need to know whether the user is authenticated without fetching user data, use `check()`:
+
+```ts
+const session = auth();
+
+if (!(await session.check())) {
+  return res.status(401).json({ error: 'Not authenticated' });
+}
+
+// If you also need the user, call user() separately
+const user = await session.user(); // still User | null — check() doesn't narrow this
+```
+
+<Aside type="tip">
+  Prefer the `user()` + null-check pattern when you need the user object. It avoids a redundant `check()` call and gives you TypeScript narrowing in one step.
+</Aside>
+
+## Typing resolveUser and resolveUserByCredentials
+
+Both `resolveUser` and `resolveUserByCredentials` must return `Promise<TUser | null>` matching your generic. TypeScript enforces this at the config level.
+
+### Prisma
+
+```ts
+import { createAuth, createHash } from 'ideal-auth';
+import { db } from './db';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  password: string;
+}
+
+const hash = createHash();
+
+const auth = createAuth<User>({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  hash,
+  resolveUser: (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+```
+
+### Drizzle
+
+```ts
+import { eq } from 'drizzle-orm';
+import { createAuth, createHash } from 'ideal-auth';
+import { db } from './db';
+import { users } from './schema';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+}
+
+const hash = createHash();
+
+const auth = createAuth<User>({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  hash,
+  resolveUser: async (id) => {
+    const rows = await db.select().from(users).where(eq(users.id, id));
+    return (rows[0] as User) ?? null;
+  },
+  resolveUserByCredentials: async (creds) => {
+    const rows = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, creds.email));
+    return (rows[0] as User) ?? null;
+  },
+});
+```
+
+### Raw SQL
+
+```ts
+import { createAuth, createHash } from 'ideal-auth';
+import { pool } from './db';
+
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+}
+
+const hash = createHash();
+
+const auth = createAuth<User>({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  hash,
+  resolveUser: async (id) => {
+    const { rows } = await pool.query<User>(
+      'SELECT * FROM users WHERE id = $1',
+      [id],
+    );
+    return rows[0] ?? null;
+  },
+  resolveUserByCredentials: async (creds) => {
+    const { rows } = await pool.query<User>(
+      'SELECT * FROM users WHERE email = $1',
+      [creds.email],
+    );
+    return rows[0] ?? null;
+  },
+});
+```
+
+## Omitting password from the user type
+
+A common pattern is that your database model includes a `password` field, but you want the `User` type returned by `session.user()` to exclude it. There are two approaches.
+
+### Approach 1: Omit at the type level
+
+Define a `DBUser` type that includes the password and a `User` type that omits it. Use `DBUser` internally and `User` as the generic:
+
+```ts
+interface DBUser {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+}
+
+type User = Omit<DBUser, 'password'>;
+
+const auth = createAuth<User>({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  hash,
+  resolveUser: async (id) => {
+    const row = await db.user.findUnique({ where: { id } });
+    if (!row) return null;
+    const { password, ...user } = row;
+    return user;
+  },
+  resolveUserByCredentials: async (creds) => {
+    // This function MUST return the password field for attempt() to work.
+    // ideal-auth reads it via passwordField before stripping it from the session.
+    return db.user.findUnique({ where: { email: creds.email } }) as any;
+  },
+  passwordField: 'password', // ideal-auth reads this field from the resolved user
+});
+```
+
+<Aside type="caution">
+  When using `Omit<DBUser, 'password'>` as your generic, `resolveUserByCredentials` still needs to return the password hash for `attempt()` to verify. The `passwordField` option tells ideal-auth which field to read for hash verification. You may need a type assertion (`as any`) here since the returned object includes a field not in the `User` type.
+</Aside>
+
+### Approach 2: Keep password in the type, strip in resolveUser
+
+A simpler approach is to include `password` in your type and strip it only in `resolveUser` (which is what `session.user()` calls):
+
+```ts
+interface User {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+}
+
+const auth = createAuth<User>({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  hash,
+  resolveUser: async (id) => {
+    const user = await db.user.findUnique({
+      where: { id },
+      select: { id: true, email: true, name: true }, // omit password from select
+    });
+    return user as User | null;
+  },
+  resolveUserByCredentials: (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+```
+
+This way, `resolveUserByCredentials` returns the full object (including the password hash for `attempt()`), while `resolveUser` returns only the fields you want in the session.
+
+## Exported types
+
+ideal-auth exports all of its types so you can use them in your application code. Import them with the `type` keyword:
+
+```ts
+import type { AuthConfig, AuthInstance, HashInstance } from 'ideal-auth';
+```
+
+Here is the full list:
+
+| Type | Description |
+|------|-------------|
+| `AnyUser` | Base user constraint: `{ id: string \| number; [key: string]: any }` |
+| `CookieBridge` | Interface for the cookie adapter: `get`, `set`, `delete` |
+| `CookieOptions` | Full cookie options: `httpOnly`, `secure`, `sameSite`, `path`, `maxAge`, `expires`, `domain` |
+| `ConfigurableCookieOptions` | `Omit<CookieOptions, 'httpOnly'>` — options you can override in config |
+| `SessionPayload` | JWT-like payload stored in the cookie: `{ uid, iat, exp }` |
+| `AuthConfig<TUser>` | Configuration object for `createAuth` |
+| `LoginOptions` | Options for `login()` and `attempt()`: `{ remember?: boolean }` |
+| `AuthInstance<TUser>` | The session object returned by `auth()` |
+| `HashConfig` | Configuration for `createHash`: `{ rounds?: number }` |
+| `HashInstance` | Hash object with `make(password)` and `verify(password, hash)` |
+| `TokenVerifierConfig` | Configuration for `createTokenVerifier`: `{ secret, expiryMs? }` |
+| `TokenVerifierInstance` | Token verifier with `createToken(userId)` and `verifyToken(token)` |
+| `RateLimitStore` | Interface for custom rate limit stores: `increment` and `reset` |
+| `RateLimiterConfig` | Configuration for `createRateLimiter`: `{ maxAttempts, windowMs, store? }` |
+| `RateLimitResult` | Result of `attempt()`: `{ allowed, remaining, resetAt }` |
+| `TOTPConfig` | Configuration for `createTOTP`: `{ digits?, period?, window? }` |
+| `TOTPInstance` | TOTP object with `generateSecret`, `generateQrUri`, `verify` |
+| `RecoveryCodeResult` | Result of `verifyRecoveryCode`: `{ valid, remaining }` |
+
+## ConfigurableCookieOptions
+
+`ConfigurableCookieOptions` is defined as:
+
+```ts
+type ConfigurableCookieOptions = Omit<CookieOptions, 'httpOnly'>;
+```
+
+The `httpOnly` flag is excluded because ideal-auth always forces `httpOnly: true` on session cookies. This prevents client-side JavaScript from reading the session cookie, which is a critical XSS protection.
+
+Use `ConfigurableCookieOptions` when typing session cookie overrides in your auth config:
+
+```ts
+import type { ConfigurableCookieOptions } from 'ideal-auth';
+
+const cookieOverrides: Partial<ConfigurableCookieOptions> = {
+  secure: true,
+  sameSite: 'strict',
+  domain: '.example.com',
+};
+
+const auth = createAuth<User>({
+  secret: process.env.SESSION_SECRET,
+  cookie: cookieBridge,
+  session: {
+    cookie: cookieOverrides,
+  },
+  resolveUser: (id) => db.user.findUnique({ where: { id } }),
+});
+```
+
+You can also use it when building wrappers or utility functions that accept cookie options:
+
+```ts
+import type { ConfigurableCookieOptions } from 'ideal-auth';
+
+function createAuthWithDefaults(
+  cookieOptions?: Partial<ConfigurableCookieOptions>,
+) {
+  return createAuth<User>({
+    secret: process.env.SESSION_SECRET,
+    cookie: cookieBridge,
+    session: {
+      cookie: {
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'lax',
+        path: '/',
+        ...cookieOptions,
+      },
+    },
+    resolveUser: (id) => db.user.findUnique({ where: { id } }),
+  });
+}
+```

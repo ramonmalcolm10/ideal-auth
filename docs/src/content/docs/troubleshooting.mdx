@@ -1,0 +1,523 @@
+---
+title: Troubleshooting
+description: Common issues and solutions when using ideal-auth.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+This page covers the most common issues developers run into when using ideal-auth. Each section describes a symptom, explains why it happens, and gives you a concrete fix.
+
+---
+
+## Session not persisting between requests
+
+The session cookie is set on login, but subsequent requests act as if the user is not authenticated.
+
+### Missing `await` on `cookies()` in Next.js App Router
+
+In Next.js 15+, `cookies()` returns a `Promise`. If you forget to `await` it, the cookie bridge methods silently fail because you are calling `.get()` on a Promise object instead of the cookie jar.
+
+```ts
+// Wrong — cookies() is not awaited
+const cookieBridge = {
+  get(name: string) {
+    return cookies().get(name)?.value; // returns undefined
+  },
+  // ...
+};
+
+// Correct
+const cookieBridge = {
+  async get(name: string) {
+    const jar = await cookies();
+    return jar.get(name)?.value;
+  },
+  async set(name: string, value: string, options: any) {
+    const jar = await cookies();
+    jar.set(name, value, options);
+  },
+  async delete(name: string) {
+    const jar = await cookies();
+    jar.delete(name);
+  },
+};
+```
+
+<Aside type="tip">
+If you are on Next.js 14 or earlier, `cookies()` is synchronous and does not need `await`. Check your Next.js version if you are unsure.
+</Aside>
+
+### Cookie bridge `set` is not actually setting the cookie
+
+Your `set` function must call your framework's cookie-setting API correctly. A common mistake is forgetting to pass the `options` parameter through, which means the cookie gets set without the right attributes (expiry, path, etc.) and may be silently discarded by the browser.
+
+Double-check that your bridge's `set` function passes all three arguments — `name`, `value`, and `options` — to the framework's underlying cookie method.
+
+### Cookie path mismatch
+
+If the session cookie is set with `path: '/api'` (or any path other than `'/'`), the browser will not send it on requests to other paths like `/dashboard`.
+
+The default path in ideal-auth is `'/'`. If you have overridden it, make sure it covers all routes that need to read the session:
+
+```ts
+const auth = createAuth({
+  // ...
+  session: {
+    cookie: {
+      path: '/', // default — covers all routes
+    },
+  },
+});
+```
+
+---
+
+## Login works in development but not production
+
+Everything works on `localhost`, but after deploying, users cannot log in or sessions immediately expire.
+
+### `IDEAL_AUTH_SECRET` is not set in the production environment
+
+If the secret is `undefined` in production, `createAuth` will throw an error. Verify the variable is set in your hosting provider's environment settings (Vercel, Railway, Fly.io, etc.) and that it is available at runtime, not just build time.
+
+```bash
+# Verify on the server
+echo $IDEAL_AUTH_SECRET | wc -c
+# Should print 33 or more (32 chars + newline)
+```
+
+### Secret differs between instances or deploys
+
+If you have multiple server instances (e.g., multiple Vercel serverless functions, or a multi-replica deployment), they must all use the **same** `IDEAL_AUTH_SECRET`. If the secret changes between deploys, all existing sessions become unreadable because iron-session cannot decrypt them with a different key.
+
+<Aside type="caution">
+Rotating `IDEAL_AUTH_SECRET` will invalidate all active sessions. This is by design — there is no way to decrypt sessions encrypted with the old secret.
+</Aside>
+
+### `secure` flag mismatch
+
+By default, ideal-auth sets `secure: true` when `NODE_ENV === 'production'`. If your production environment does not set `NODE_ENV` to `"production"`, the cookie will be sent over HTTP. Conversely, if your reverse proxy terminates TLS and forwards plain HTTP to your app, the `secure` flag must still be `true` (the browser sees HTTPS).
+
+Make sure `NODE_ENV=production` is set in your deployment environment, or explicitly set `secure` in your config:
+
+```ts
+session: {
+  cookie: {
+    secure: true, // force HTTPS-only cookies
+  },
+},
+```
+
+---
+
+## Cookie not being set on localhost
+
+The login request succeeds, but the browser does not store the cookie.
+
+### `secure: true` on plain HTTP localhost
+
+Browsers refuse to store cookies with the `Secure` attribute when the page is served over `http://`. In development, `NODE_ENV` is typically not `"production"`, so ideal-auth defaults `secure` to `false`. But if you have explicitly set `secure: true` in your config, the cookie will be rejected on `http://localhost`.
+
+**Fix:** Either remove the explicit `secure: true` override (letting the default kick in), or use HTTPS in local development.
+
+### `sameSite: 'none'` requires `secure: true`
+
+If you set `sameSite: 'none'` without `secure: true`, modern browsers will reject the cookie entirely. This combination only works over HTTPS:
+
+```ts
+session: {
+  cookie: {
+    sameSite: 'none',
+    secure: true, // required when sameSite is 'none'
+  },
+},
+```
+
+### Browser blocking third-party cookies
+
+If your frontend and API are on different origins (e.g., `localhost:3000` and `localhost:8080`), the browser may treat the session cookie as a third-party cookie and block it. In development, use a single origin or configure a proxy so both the frontend and API are served from the same host and port.
+
+---
+
+## "secret must be at least 32 characters" error
+
+This error is thrown by `createAuth` or `createTokenVerifier` at initialization time.
+
+### `IDEAL_AUTH_SECRET` is undefined
+
+The most common cause is that your `.env` file is not being loaded. Check the following:
+
+<Steps>
+
+1. Verify the `.env` file exists in your project root.
+2. Confirm your framework or tooling loads it automatically (Next.js does, but plain Node.js does not — you may need `dotenv`).
+3. Check for typos in the variable name: it must be exactly `IDEAL_AUTH_SECRET`.
+4. Ensure the value is at least 32 characters with no surrounding quotes that might be included as part of the value.
+
+</Steps>
+
+```bash
+# Generate a valid secret
+bunx ideal-auth secret
+```
+
+### `process.env` not available in edge runtime
+
+In Next.js edge middleware or edge API routes, `process.env` may not include variables from `.env` files unless they are prefixed or explicitly configured. For Next.js edge runtime, add the variable to your `next.config.js`:
+
+```js title="next.config.js"
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  env: {
+    IDEAL_AUTH_SECRET: process.env.IDEAL_AUTH_SECRET,
+  },
+};
+
+module.exports = nextConfig;
+```
+
+<Aside type="tip">
+On Vercel, environment variables set in the dashboard are available in both Node.js and edge runtimes without extra configuration.
+</Aside>
+
+---
+
+## `attempt()` always returns false
+
+You call `auth().attempt({ email, password })` and it consistently returns `false`, even with correct credentials.
+
+### `resolveUserByCredentials` is not returning the user object
+
+The `attempt()` method strips the password key from the credentials object, then passes the remaining fields to `resolveUserByCredentials`. If that function returns `null` or `undefined`, the attempt fails.
+
+Add a log to verify:
+
+```ts
+resolveUserByCredentials: async (creds) => {
+  console.log('Looking up user with:', creds);
+  // creds will be { email: '...' } — password is already stripped
+  const user = await db.user.findUnique({ where: { email: creds.email } });
+  console.log('Found user:', user);
+  return user;
+},
+```
+
+### User object is missing the password field
+
+By default, `attempt()` reads the bcrypt hash from `user.password`. If your database column is named differently (e.g., `hashedPassword` or `passwordHash`), you must tell ideal-auth:
+
+```ts
+const auth = createAuth({
+  // ...
+  passwordField: 'hashedPassword', // match your database column
+});
+```
+
+### Password was stored unhashed
+
+`attempt()` uses bcrypt to compare the plaintext password against the stored hash. If the password in your database is plaintext (not a bcrypt hash starting with `$2a$` or `$2b$`), the comparison will always fail.
+
+Make sure you hash passwords with `hash.make()` during registration:
+
+```ts
+const hashedPassword = await hash.make(plaintextPassword);
+await db.user.create({ data: { email, password: hashedPassword } });
+```
+
+### `credentialKey` does not match the credentials object
+
+The `credentialKey` option (default: `'password'`) tells `attempt()` which key holds the plaintext password. If you pass credentials with a different key, the password will not be stripped correctly:
+
+```ts
+// If your credentials use 'pass' instead of 'password':
+await auth().attempt({ email, pass: 'secret123' });
+
+// Then configure credentialKey to match:
+const auth = createAuth({
+  // ...
+  credentialKey: 'pass',
+});
+```
+
+---
+
+## "Login failed" error from `loginById()`
+
+Calling `auth().loginById(id)` throws or fails to create a session.
+
+### `resolveUser` is returning null
+
+`loginById()` calls `resolveUser(id)` internally. If that function returns `null`, the login fails because ideal-auth cannot create a session for a user that does not exist.
+
+Common causes:
+
+- **Wrong ID type.** Your database expects a number but you are passing a string, or vice versa. Check the type of the `id` parameter in your `resolveUser` function.
+- **User was deleted.** The user ID does not exist in the database.
+- **ID format mismatch.** UUIDs vs. auto-increment integers — make sure the ID you pass matches what your database stores.
+
+```ts
+resolveUser: async (id) => {
+  console.log('Resolving user by ID:', id, typeof id);
+  // If your DB uses numeric IDs:
+  return db.user.findUnique({ where: { id: Number(id) } });
+},
+```
+
+<Aside>
+Session payloads store the user ID as a string (`uid`). If your database uses numeric IDs, cast the ID back to a number in `resolveUser`.
+</Aside>
+
+---
+
+## Token verifier returns null for valid-looking tokens
+
+`verifyToken()` returns `null` even though the token was just created.
+
+### Different secrets between creation and verification
+
+Both `createToken()` and `verifyToken()` must use the same secret. If you have separate services for token creation (e.g., a password reset endpoint) and verification (e.g., a reset confirmation page), they must share the same `IDEAL_AUTH_SECRET`.
+
+### Token has expired
+
+Check the `expiryMs` value. The default is `3600000` (1 hour). If more time than `expiryMs` has passed since the token was created, `verifyToken()` returns `null`.
+
+```ts
+const verifier = createTokenVerifier({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  expiryMs: 1000 * 60 * 60 * 24, // extend to 24 hours if needed
+});
+```
+
+You can also inspect when the token was issued by decoding it before expiry:
+
+```ts
+const result = verifier.verifyToken(token);
+if (result) {
+  console.log('Token issued at:', new Date(result.iatMs));
+  // iatMs is in milliseconds
+}
+```
+
+### Token was created with a rotated secret
+
+If you rotated `IDEAL_AUTH_SECRET` after the token was created but before it was verified, the signature will not match. Tokens created with an old secret cannot be verified with a new one.
+
+<Aside type="caution">
+When rotating secrets, consider a grace period where you verify against both the old and new secret, or invalidate all outstanding tokens and ask users to request new ones.
+</Aside>
+
+---
+
+## Rate limiter not working in production
+
+The rate limiter works in development but does not seem to limit requests in production.
+
+### `MemoryRateLimitStore` is per-process and resets on restart
+
+The default `MemoryRateLimitStore` keeps counters in the process memory. This means:
+
+- **Serverless deployments** (Vercel, AWS Lambda): Each cold start gets a fresh store. Rate limits are effectively never enforced.
+- **Multi-instance deployments**: Each server instance has its own counters. An attacker's requests are distributed across instances.
+- **Any restart**: All counters are lost.
+
+The memory store also caps at 10,000 entries to prevent unbounded memory growth.
+
+### Use a Redis-backed store for production
+
+Implement the `RateLimitStore` interface with Redis (or any shared data store) so all instances share the same counters:
+
+```ts
+import { createRateLimiter, type RateLimitStore } from 'ideal-auth';
+
+const redisStore: RateLimitStore = {
+  async increment(key, windowMs) {
+    const count = await redis.incr(key);
+    if (count === 1) {
+      await redis.pexpire(key, windowMs);
+    }
+    const ttl = await redis.pttl(key);
+    return {
+      count,
+      resetAt: new Date(Date.now() + ttl),
+    };
+  },
+  async reset(key) {
+    await redis.del(key);
+  },
+};
+
+const limiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000,
+  store: redisStore,
+});
+```
+
+<Aside type="tip">
+Even a simple Redis-backed store is dramatically more effective than the memory store in production. If you do not have Redis, consider using your database with a `rate_limits` table as an alternative.
+</Aside>
+
+---
+
+## TOTP codes not verifying
+
+The user enters the code from their authenticator app, but `totp.verify()` returns `false`.
+
+### Server clock drift
+
+TOTP codes are time-based. If your server's clock is out of sync with the authenticator app's clock by more than the configured window, verification will fail. The default window of `1` allows codes from the previous, current, and next 30-second step (a 90-second effective window).
+
+**Fix:** Ensure your server uses NTP to keep the clock synchronized:
+
+```bash
+# Check if NTP is active (Linux)
+timedatectl status
+
+# Force sync (Linux)
+sudo timedatectl set-ntp true
+```
+
+<Aside type="caution">
+Cloud providers (AWS, GCP, Vercel) generally keep server clocks in sync, but self-hosted or on-premise servers may drift. Clock drift of more than 30 seconds will cause TOTP failures even with the default window.
+</Aside>
+
+### Window is too small
+
+If you set `window: 0`, only the exact current 30-second step is accepted. This is too strict for real-world use because users need a few seconds to read and type the code.
+
+```ts
+const totp = createTOTP({
+  window: 1, // accepts previous, current, and next step (default)
+});
+```
+
+### Secret was stored or retrieved incorrectly
+
+TOTP secrets are Base32-encoded strings. If the secret is corrupted during storage or retrieval (e.g., truncated, extra whitespace, wrong encoding), the generated codes will not match.
+
+Verify the secret round-trips correctly:
+
+```ts
+const secret = totp.generateSecret();
+console.log('Generated secret:', secret);
+
+// Store in database...
+// Retrieve from database...
+
+const storedSecret = await db.user.findUnique({ where: { id } });
+console.log('Retrieved secret:', storedSecret.totpSecret);
+console.log('Match:', secret === storedSecret.totpSecret);
+```
+
+---
+
+## Session lost after deploying
+
+Users are logged out every time you deploy.
+
+### `IDEAL_AUTH_SECRET` changed between deploys
+
+Session cookies are encrypted with `IDEAL_AUTH_SECRET`. If the secret changes, iron-session cannot decrypt existing cookies, and all sessions are effectively invalidated.
+
+This is **by design** — it is the same principle as rotating encryption keys. To avoid this:
+
+- Use a stable secret stored in your hosting provider's environment variable settings, not generated at build time.
+- Do not use random secret generation in your deployment pipeline.
+- If you need to rotate the secret, understand that all users will need to log in again.
+
+<Aside>
+There is no way to migrate sessions from one secret to another because the old secret is required to decrypt them. If you must rotate secrets, plan for a full session invalidation.
+</Aside>
+
+---
+
+## TypeScript errors with user type
+
+You get type errors when accessing properties on the user object returned by `auth().user()`.
+
+### Not passing a generic to `createAuth`
+
+By default, `createAuth` uses `AnyUser` as the user type, which is `{ id: string | number; [key: string]: any }`. To get proper type inference, pass your user type as a generic:
+
+```ts
+interface User {
+  id: number;
+  email: string;
+  name: string;
+  password: string;
+}
+
+const auth = createAuth<User>({
+  // ...
+});
+
+// Now auth().user() returns User | null with full type safety
+const user = await auth().user();
+user?.email; // string -- no type error
+```
+
+### User type does not extend `AnyUser`
+
+Your custom type must have an `id` field of type `string` or `number` and allow additional properties. If TypeScript reports a constraint error, make sure your type satisfies the base shape:
+
+```ts
+// This will cause a type error:
+interface BadUser {
+  odnoklassniki_id: string; // no 'id' field
+  email: string;
+}
+
+// Fix: include 'id'
+interface GoodUser {
+  id: string;
+  email: string;
+  name: string;
+  password: string;
+}
+```
+
+---
+
+## Cookies not working in iframe or cross-origin
+
+Your app is embedded in an iframe or makes cross-origin requests, and session cookies are not being sent.
+
+### `sameSite: 'lax'` blocks cookies in iframes
+
+The default `sameSite: 'lax'` prevents cookies from being sent in cross-origin iframe requests. If your app is embedded in another site, the session cookie will not be included.
+
+To allow cross-origin cookies, set `sameSite: 'none'` with `secure: true`:
+
+```ts
+session: {
+  cookie: {
+    sameSite: 'none',
+    secure: true, // required for sameSite: 'none'
+  },
+},
+```
+
+### Third-party cookie blocking
+
+Most modern browsers (Safari, Firefox, and increasingly Chrome) block or partition third-party cookies by default. This means `sameSite: 'none'` may not be sufficient.
+
+Alternatives to third-party cookies:
+
+- **Use a shared parent domain.** If both the embedding site and your app are on subdomains of the same domain (e.g., `app.example.com` in an iframe on `site.example.com`), set `domain: '.example.com'` on the cookie. This makes it a first-party cookie.
+- **Use token-based authentication for the iframe.** Pass a short-lived token in the iframe URL and exchange it for a session on the embedded origin.
+- **Use the Storage Access API.** This browser API allows embedded iframes to request access to their first-party cookies, but requires user interaction and is not universally supported.
+
+<Aside type="caution">
+Third-party cookies are being phased out across all major browsers. If your architecture relies on cross-origin cookies in iframes, consider redesigning to avoid this dependency.
+</Aside>
+
+---
+
+## Still stuck?
+
+If your issue is not covered here:
+
+1. Check the [Configuration](/ideal-auth/configuration/) reference to verify your setup.
+2. Review the [Security Model](/ideal-auth/security/model/) for details on how sessions and encryption work.
+3. Check the [Production Checklist](/ideal-auth/security/production-checklist/) to make sure nothing is misconfigured.
+4. [Open an issue](https://github.com/ramonmalcolm10/ideal-auth/issues) with a minimal reproduction.

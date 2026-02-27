@@ -1,0 +1,408 @@
+---
+title: Rate Limiting
+description: Protect auth endpoints from brute force attacks.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Rate limiting prevents brute force attacks by restricting how many times an action can be performed within a time window. ideal-auth provides `createRateLimiter` with a pluggable store interface and a built-in `MemoryRateLimitStore`.
+
+## Basic setup
+
+```ts
+import { createRateLimiter } from 'ideal-auth';
+
+const loginLimiter = createRateLimiter({
+  maxAttempts: 5,        // allow 5 attempts
+  windowMs: 15 * 60 * 1000, // per 15-minute window
+});
+```
+
+The `attempt()` method increments the counter for a given key and returns whether the action is allowed:
+
+```ts
+const result = await loginLimiter.attempt('login:192.168.1.1');
+
+result.allowed;    // boolean — true if under the limit
+result.remaining;  // number — attempts left in the window
+result.resetAt;    // Date — when the window resets
+```
+
+Call `reset()` to clear the counter for a key (e.g., after a successful login):
+
+```ts
+await loginLimiter.reset('login:192.168.1.1');
+```
+
+## Login rate limiting
+
+Login endpoints are the most common brute force target. Rate limit by IP address, email address, or both.
+
+### By IP address
+
+Prevents an attacker from trying many passwords for any account from the same IP.
+
+```ts
+const loginLimiter = createRateLimiter({
+  maxAttempts: 10,
+  windowMs: 15 * 60 * 1000, // 15 minutes
+});
+
+// POST /api/auth/login
+export async function login(req, res) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+  const result = await loginLimiter.attempt(`login:ip:${ip}`);
+  if (!result.allowed) {
+    return res.status(429).json({
+      error: 'Too many login attempts. Try again later.',
+      retryAfter: result.resetAt.toISOString(),
+    });
+  }
+
+  const session = auth();
+  const success = await session.attempt({ email: req.body.email, password: req.body.password });
+
+  if (!success) {
+    return res.status(401).json({
+      error: 'Invalid credentials',
+      remaining: result.remaining,
+    });
+  }
+
+  // Reset the counter on successful login
+  await loginLimiter.reset(`login:ip:${ip}`);
+
+  return res.json({ success: true });
+}
+```
+
+### By email address
+
+Prevents an attacker from trying many passwords for a specific account, even from rotating IPs.
+
+```ts
+const emailLimiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000,
+});
+
+// In the login handler:
+const email = req.body.email.toLowerCase();
+const emailResult = await emailLimiter.attempt(`login:email:${email}`);
+if (!emailResult.allowed) {
+  return res.status(429).json({
+    error: 'Too many login attempts for this account. Try again later.',
+    retryAfter: emailResult.resetAt.toISOString(),
+  });
+}
+```
+
+### Composite key (IP + email)
+
+For the strongest protection, use both. The IP limit catches broad attacks and the email limit catches targeted attacks:
+
+```ts
+const loginLimiter = createRateLimiter({
+  maxAttempts: 10,
+  windowMs: 15 * 60 * 1000,
+});
+
+const accountLimiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000,
+});
+
+export async function login(req, res) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const email = req.body.email.toLowerCase();
+
+  // Check IP limit first
+  const ipResult = await loginLimiter.attempt(`login:ip:${ip}`);
+  if (!ipResult.allowed) {
+    return res.status(429).json({
+      error: 'Too many requests. Try again later.',
+      retryAfter: ipResult.resetAt.toISOString(),
+    });
+  }
+
+  // Check account limit
+  const emailResult = await accountLimiter.attempt(`login:email:${email}`);
+  if (!emailResult.allowed) {
+    return res.status(429).json({
+      error: 'Too many attempts for this account. Try again later.',
+      retryAfter: emailResult.resetAt.toISOString(),
+    });
+  }
+
+  const session = auth();
+  const success = await session.attempt({ email, password: req.body.password });
+
+  if (!success) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  // Reset both counters on success
+  await loginLimiter.reset(`login:ip:${ip}`);
+  await accountLimiter.reset(`login:email:${email}`);
+
+  return res.json({ success: true });
+}
+```
+
+## Registration rate limiting
+
+Prevent automated account creation:
+
+```ts
+const registrationLimiter = createRateLimiter({
+  maxAttempts: 3,
+  windowMs: 60 * 60 * 1000, // 3 registrations per hour per IP
+});
+
+export async function register(req, res) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+
+  const result = await registrationLimiter.attempt(`register:ip:${ip}`);
+  if (!result.allowed) {
+    return res.status(429).json({
+      error: 'Too many registration attempts. Try again later.',
+      retryAfter: result.resetAt.toISOString(),
+    });
+  }
+
+  // ... create account
+}
+```
+
+## Password reset rate limiting
+
+Prevent attackers from flooding a user's inbox or enumerating registered emails:
+
+```ts
+const resetLimiter = createRateLimiter({
+  maxAttempts: 3,
+  windowMs: 15 * 60 * 1000,
+});
+
+export async function forgotPassword(req, res) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  const email = req.body.email.toLowerCase();
+
+  // Rate limit by IP
+  const ipResult = await resetLimiter.attempt(`reset:ip:${ip}`);
+  if (!ipResult.allowed) {
+    return res.status(429).json({
+      error: 'Too many requests. Try again later.',
+    });
+  }
+
+  // Rate limit by email
+  const emailResult = await resetLimiter.attempt(`reset:email:${email}`);
+  if (!emailResult.allowed) {
+    // Return 200 to avoid leaking whether the email exists
+    return res.json({ message: 'If that email exists, a reset link was sent.' });
+  }
+
+  // ... send reset email
+  return res.json({ message: 'If that email exists, a reset link was sent.' });
+}
+```
+
+See the [Password Reset](/ideal-auth/guides/password-reset/) guide for the complete flow.
+
+## Custom store for Redis
+
+The default `MemoryRateLimitStore` works for development and single-process deployments, but for production you should use a shared store like Redis. Implement the `RateLimitStore` interface:
+
+```ts
+import type { RateLimitStore } from 'ideal-auth';
+
+export class RedisRateLimitStore implements RateLimitStore {
+  private redis: RedisClient;
+
+  constructor(redis: RedisClient) {
+    this.redis = redis;
+  }
+
+  async increment(
+    key: string,
+    windowMs: number,
+  ): Promise<{ count: number; resetAt: Date }> {
+    const redisKey = `ratelimit:${key}`;
+    const windowSeconds = Math.ceil(windowMs / 1000);
+
+    // Increment the counter. If the key doesn't exist, Redis creates it with value 1.
+    const count = await this.redis.incr(redisKey);
+
+    // Set expiry only on the first increment (when count is 1).
+    // This ensures the window starts from the first request.
+    if (count === 1) {
+      await this.redis.expire(redisKey, windowSeconds);
+    }
+
+    // Get the remaining TTL to calculate resetAt
+    const ttl = await this.redis.ttl(redisKey);
+    const resetAt = new Date(Date.now() + ttl * 1000);
+
+    return { count, resetAt };
+  }
+
+  async reset(key: string): Promise<void> {
+    await this.redis.del(`ratelimit:${key}`);
+  }
+}
+```
+
+### Using the custom store
+
+```ts
+import { createRateLimiter } from 'ideal-auth';
+import { createClient } from 'redis';
+import { RedisRateLimitStore } from './redis-rate-limit-store';
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+const loginLimiter = createRateLimiter({
+  maxAttempts: 10,
+  windowMs: 15 * 60 * 1000,
+  store: new RedisRateLimitStore(redis),
+});
+```
+
+### The `RateLimitStore` interface
+
+Any store must implement two methods:
+
+```ts
+interface RateLimitStore {
+  increment(
+    key: string,
+    windowMs: number,
+  ): Promise<{ count: number; resetAt: Date }>;
+
+  reset(key: string): Promise<void>;
+}
+```
+
+- `increment` is called on every `attempt()`. It should atomically increment a counter for the given key and return the new count and when the window resets.
+- `reset` is called to clear the counter for a key (e.g., after a successful login).
+
+## IP address considerations
+
+<Aside type="caution">
+  Only trust `x-forwarded-for` if your application is behind a reverse proxy you control (Nginx, Cloudflare, AWS ALB, etc.). If your application is directly internet-facing, an attacker can spoof this header.
+</Aside>
+
+### Behind a trusted reverse proxy
+
+```ts
+// Trust the first IP in x-forwarded-for (set by your proxy)
+function getClientIp(req): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    // x-forwarded-for can contain multiple IPs: "client, proxy1, proxy2"
+    // The first one is the client's IP (if your proxy is trusted)
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket.remoteAddress;
+}
+```
+
+### Directly internet-facing
+
+```ts
+// Only use the socket address — x-forwarded-for can be spoofed
+function getClientIp(req): string {
+  return req.socket.remoteAddress;
+}
+```
+
+### Framework-specific
+
+Some frameworks provide the client IP through their own APIs:
+
+```ts
+// Next.js (App Router)
+import { headers } from 'next/headers';
+const ip = headers().get('x-forwarded-for')?.split(',')[0] ?? 'unknown';
+
+// Express (with trust proxy)
+app.set('trust proxy', 1);
+const ip = req.ip; // uses x-forwarded-for when trust proxy is set
+
+// Hono
+const ip = c.req.header('x-forwarded-for')?.split(',')[0] ?? 'unknown';
+```
+
+## Memory store limitations
+
+The built-in `MemoryRateLimitStore` has several limitations to be aware of:
+
+| Limitation | Impact |
+|-----------|--------|
+| **10,000 entry cap** | When the store reaches 10,000 entries, new keys are immediately rate limited until expired entries are evicted. This prevents memory exhaustion. |
+| **Single-process only** | Each process has its own store. In a multi-process or clustered deployment, rate limits are per-process, not global. An attacker can potentially get `N x maxAttempts` across N processes. |
+| **Resets on restart** | All counters are lost when the process restarts. An attacker could trigger a restart to reset their limits. |
+| **No persistence** | Rate limit data is not persisted to disk. |
+
+The memory store runs automatic cleanup every 60 seconds, evicting expired entries.
+
+### When the memory store is acceptable
+
+- Development and testing
+- Single-process deployments with low traffic
+- Non-critical applications where approximate rate limiting is sufficient
+
+### When to use Redis
+
+- Multi-process or clustered deployments (PM2, Kubernetes, etc.)
+- Production applications where accurate rate limiting matters
+- Applications where rate limits must survive restarts
+
+## Recommended limits
+
+These are starting points. Adjust based on your application's needs:
+
+| Endpoint | Max attempts | Window | Key |
+|----------|-------------|--------|-----|
+| Login | 10 | 15 min | IP |
+| Login | 5 | 15 min | Email |
+| Registration | 3 | 1 hour | IP |
+| Password reset | 5 | 15 min | IP |
+| Password reset | 3 | 15 min | Email |
+| Email verification resend | 3 | 15 min | User ID |
+| 2FA verification | 5 | 5 min | User ID |
+
+## Setting response headers
+
+It is good practice to include rate limit information in your response headers so clients know their limits:
+
+```ts
+function setRateLimitHeaders(res, result) {
+  res.setHeader('X-RateLimit-Remaining', result.remaining);
+  res.setHeader('X-RateLimit-Reset', result.resetAt.toISOString());
+  if (!result.allowed) {
+    res.setHeader(
+      'Retry-After',
+      Math.ceil((result.resetAt.getTime() - Date.now()) / 1000),
+    );
+  }
+}
+```
+
+```ts
+export async function login(req, res) {
+  const ip = getClientIp(req);
+  const result = await loginLimiter.attempt(`login:ip:${ip}`);
+
+  setRateLimitHeaders(res, result);
+
+  if (!result.allowed) {
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+
+  // ... handle login
+}
+```

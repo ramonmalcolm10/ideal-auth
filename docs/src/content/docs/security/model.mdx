@@ -1,0 +1,192 @@
+---
+title: Security Model
+description: How ideal-auth protects your application and what guarantees it provides.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This page describes the security guarantees that ideal-auth provides, the threats it defends against, and the responsibilities that remain with you. If you are evaluating ideal-auth for a production application, start here.
+
+---
+
+## Design philosophy
+
+ideal-auth is built around three principles:
+
+**Minimal surface area.** The library provides auth primitives — session management, password hashing, token verification, TOTP, recovery codes, rate limiting, and low-level crypto utilities. It does not include database adapters, ORM integrations, or framework coupling. A smaller API means fewer places for bugs to hide.
+
+**Defense in depth.** Security is enforced at multiple levels. TypeScript types prevent misuse at compile time, but ideal-auth goes further with runtime guards. For example, `httpOnly` is always forced to `true` on session cookies — even if a consumer passes `httpOnly: false` in their configuration, the library overrides it:
+
+```ts
+// session/cookie.ts — httpOnly is applied last, overriding any user input
+return {
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax',
+  path: '/',
+  ...overrides,
+  httpOnly: true,  // always last — cannot be overridden
+};
+```
+
+The `ConfigurableCookieOptions` type also omits `httpOnly` from the public API, so TypeScript users never see it as an option. But even if you bypass TypeScript (e.g., plain JavaScript, a type cast), the runtime guard still applies.
+
+**No implicit behavior.** You control the authentication flow — when to log in, when to log out, how to resolve users, what database to query. ideal-auth handles the cryptography and session management. There are no hidden database calls, no automatic redirects, no middleware injected behind your back.
+
+---
+
+## Cryptographic guarantees
+
+### Session encryption
+
+Sessions are encrypted using [iron-session](https://github.com/vvo/iron-session), which implements the Iron protocol:
+
+- **AES-256-CBC** for encryption of the session payload
+- **HMAC-SHA256** for integrity verification
+- A sealed session cannot be read or tampered with without the secret
+
+The session payload contains only `{ uid, iat, exp }` — the user ID, issued-at timestamp, and expiry timestamp (both in seconds). No sensitive data is stored in the cookie.
+
+### Password hashing
+
+Passwords are hashed with **bcrypt** (via `bcryptjs`) with a configurable cost factor (default: 12 rounds). For passwords exceeding 72 bytes (bcrypt's maximum input length), ideal-auth automatically applies a **SHA-256 prehash** before bcrypt:
+
+```ts
+// If password exceeds 72 bytes, prehash with SHA-256
+const input = Buffer.byteLength(password, 'utf8') > 72
+  ? createHash('sha256').update(password).digest('base64')
+  : password;
+```
+
+This prevents silent truncation of long passwords — a known weakness in naive bcrypt implementations.
+
+### AES-256-GCM encryption
+
+The `encrypt` and `decrypt` utilities use AES-256-GCM with scrypt key derivation:
+
+| Parameter | Value |
+|-----------|-------|
+| Algorithm | AES-256-GCM |
+| Key derivation | scrypt |
+| scrypt N (cost) | 32,768 (above OWASP minimum) |
+| scrypt r (block size) | 8 |
+| scrypt p (parallelism) | 1 |
+| IV length | 12 bytes (96 bits) |
+| Auth tag length | 16 bytes (128 bits) |
+| Salt length | 16 bytes (128 bits) |
+
+Each encryption operation generates a fresh random salt and IV via `node:crypto.randomBytes` (CSPRNG). The output format is `salt + iv + authTag + ciphertext`, base64url-encoded.
+
+### Token signing
+
+`createTokenVerifier` uses **HMAC-SHA256** to sign tokens. The token format is five dot-separated parts:
+
+```
+encodedUserId.id.iat.exp.signature
+```
+
+- `encodedUserId` — base64url-encoded user ID
+- `id` — 20 random bytes (hex-encoded) for uniqueness
+- `iat` — issued-at timestamp in milliseconds
+- `exp` — expiry timestamp in milliseconds
+- `signature` — HMAC-SHA256 of the first four parts
+
+The `verifyToken` method returns `{ userId, iatMs }` where `iatMs` is the issued-at time in milliseconds — useful for checking whether a token was issued before a relevant event (e.g., password change).
+
+### Timing-safe comparisons
+
+All string comparisons in security-critical paths use `node:crypto.timingSafeEqual`. This includes HMAC signature verification, TOTP code validation, and the public `timingSafeEqual` utility.
+
+### Random generation
+
+All random values (tokens, salts, IVs, TOTP secrets, recovery codes) are generated via `node:crypto.randomBytes`, which draws from the operating system's CSPRNG.
+
+---
+
+## What ideal-auth protects against
+
+### Session hijacking
+
+Session cookies are encrypted with AES-256-CBC and authenticated with HMAC-SHA256 (iron-session). An attacker who intercepts the cookie cannot read or modify the session payload. The `httpOnly` flag is forced at runtime, preventing JavaScript access to the cookie — even if your application has an XSS vulnerability, the session cookie cannot be exfiltrated via `document.cookie`.
+
+### Password brute force
+
+bcrypt's cost factor (default: 12 rounds) makes each password verification take approximately 250ms, rendering large-scale brute force attacks impractical. The built-in rate limiter adds a second layer of defense at the application level.
+
+### Timing attacks
+
+All comparisons of secrets, signatures, and codes use constant-time comparison via `node:crypto.timingSafeEqual`. An attacker cannot determine how many characters of a value are correct by measuring response time.
+
+### Token tampering
+
+Tokens produced by `createTokenVerifier` are signed with HMAC-SHA256. Modifying any part of the token (user ID, timestamps, random ID) invalidates the signature. Expired tokens are rejected automatically.
+
+### XSS session theft
+
+The `httpOnly` flag on session cookies cannot be disabled — not through configuration, not through TypeScript type overrides, not at runtime. This is a hard guarantee: `document.cookie` will never expose the session.
+
+### Long password bypass
+
+bcrypt silently truncates input to 72 bytes. ideal-auth detects passwords exceeding this limit and applies SHA-256 prehash, ensuring the full password contributes to the hash. Two passwords that are identical in the first 72 bytes but differ afterward will produce different hashes.
+
+---
+
+## What ideal-auth does NOT protect against
+
+These are your responsibility. ideal-auth is deliberately scoped to auth primitives — the following concerns belong to your application and framework.
+
+### CSRF (Cross-Site Request Forgery)
+
+CSRF protection must be implemented at the framework level. Most modern frameworks provide built-in CSRF protection for form submissions (Next.js Server Actions, SvelteKit form actions). API routes typically require manual protection.
+
+See the [CSRF Protection](/ideal-auth/security/csrf/) guide for framework-specific strategies.
+
+### SQL injection
+
+ideal-auth never executes database queries. Your `resolveUser` and `resolveUserByCredentials` callbacks handle all database access. Use parameterized queries or an ORM to prevent injection.
+
+### XSS (Cross-Site Scripting)
+
+While ideal-auth prevents XSS from stealing session cookies (via `httpOnly`), XSS can still compromise your application in other ways — reading page content, making authenticated requests, modifying the DOM. Sanitize all user-generated content and use framework-provided escaping.
+
+### Session invalidation / logout everywhere
+
+ideal-auth uses stateless encrypted cookies. There is no server-side session store, which means there is no session ID to revoke. Logging out on one device does not affect sessions on other devices.
+
+See the [Session Invalidation](/ideal-auth/security/session-invalidation/) guide for patterns to implement "logout everywhere."
+
+### Rate limiting persistence
+
+The default `MemoryRateLimitStore` is in-memory with a 10,000-entry cap and automatic eviction. It resets when the process restarts and does not share state across multiple server instances. For production, implement a `RateLimitStore` backed by Redis or your database.
+
+### Password policy enforcement
+
+ideal-auth rejects empty passwords but does not enforce minimum length, complexity requirements, or breach database checks. Implement these in your registration and password-change flows.
+
+---
+
+## Dependency audit
+
+ideal-auth has exactly **two runtime dependencies**:
+
+| Dependency | Purpose | Why |
+|-----------|---------|-----|
+| [iron-session](https://github.com/vvo/iron-session) | Session encryption (Iron protocol) | Battle-tested sealed cookie implementation used by thousands of production apps |
+| [bcryptjs](https://github.com/nicolo-ribaudo/bcryptjs) | Password hashing | Pure JavaScript bcrypt — no native compilation required, runs everywhere |
+
+All other cryptographic operations use **`node:crypto`** exclusively — no third-party crypto libraries. This means:
+
+- No supply chain risk from transitive crypto dependencies
+- Crypto implementations are maintained by the Node.js team and audited as part of OpenSSL
+- FIPS compliance is inherited from the platform when Node.js is built with FIPS-enabled OpenSSL
+
+The full source code is open source and available at [github.com/ramonmalcolm10/ideal-auth](https://github.com/ramonmalcolm10/ideal-auth).
+
+<Aside type="tip">
+  Run `npm ls --production` or `bun pm ls` to verify the dependency tree yourself. You should see exactly two direct dependencies.
+</Aside>
+
+---
+
+## Security reporting
+
+If you discover a security vulnerability in ideal-auth, please report it responsibly. Open an issue on GitHub or contact the maintainers directly. Do not disclose vulnerabilities publicly until a fix is available.
