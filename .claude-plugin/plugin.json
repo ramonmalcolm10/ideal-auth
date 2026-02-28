@@ -1,0 +1,5 @@
+{
+  "name": "ideal-auth",
+  "description": "Auth primitives for the JS ecosystem. Provides complete API reference, cookie bridge patterns for every framework, security best practices, and implementation guides for ideal-auth.",
+  "author": "Ramon Malcolm"
+}
