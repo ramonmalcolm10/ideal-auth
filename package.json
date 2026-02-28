@@ -20,7 +20,9 @@
     "ideal-auth": "./dist/bin/ideal-auth.js"
   },
   "files": [
-    "dist"
+    "dist",
+    ".claude-plugin",
+    "skills"
   ],
   "dependencies": {
     "iron-session": "^8.0.4",
