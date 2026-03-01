@@ -1,0 +1,960 @@
+---
+title: Multi-Tenant Authentication
+description: Cross-domain authentication for multi-tenant applications using ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Multi-tenant applications often serve each tenant on a different domain or subdomain (e.g., `acme.yourapp.com`, `widgets.yourapp.com`). Because cookies are scoped to a single domain, a session cookie set on your central login page cannot be read by a tenant domain. This guide covers how to implement secure cross-domain authentication using `ideal-auth`'s crypto primitives and a short-lived, one-time-use database token.
+
+<Aside type="tip">
+  If all your tenants share the same parent domain (e.g., `acme.app.com` and `widgets.app.com`), you can set `domain: '.app.com'` on your session cookie and skip this guide entirely — the browser will send the cookie to all subdomains.
+</Aside>
+
+---
+
+## Overview
+
+The pattern works in three phases:
+
+1. **Tenant redirects to central login.** The tenant app detects an unauthenticated user and sends them to a central login page hosted on your identity domain.
+2. **Central login authenticates and issues a transfer token.** After the user logs in (via email/password or OAuth), the central app generates a random lookup ID and a separate validation token, stores them in a `login_sessions` table, and redirects back to the tenant with both values.
+3. **Tenant validates the token and creates a local session.** The tenant's callback endpoint looks up the session by ID, verifies the token using a timing-safe HMAC comparison, deletes the row (one-time use), and calls `attemptUser` to create a session cookie on the tenant's domain.
+
+```
+Tenant Domain                    Central Login Domain
+─────────────                    ────────────────────
+
+User visits /dashboard
+        │
+        ▼
+   No session cookie?
+   Redirect to central ──────►  /login?callbackUrl=https://tenant.com/auth/callback
+                                        │
+                                        ▼
+                                 Validate callbackUrl against tenant allowlist
+                                 User logs in (email/password or OAuth)
+                                        │
+                                        ▼
+                                 Generate id (lookup) + token (validation)
+                                 Store id, HMAC(token), userId in login_sessions
+                                        │
+                                        ▼
+◄────────────────────────────── Redirect to tenant callback with id + token
+        │
+        ▼
+  /auth/callback?id=xxx&token=yyy
+  Look up by id
+  Verify HMAC(token) matches stored hash (timing-safe)
+  Verify timestamp (< 5 min)
+  Delete row (one-time use)
+        │
+        ▼
+  attemptUser → create session
+  Redirect to /dashboard
+```
+
+---
+
+## Email/password tenants
+
+If a tenant uses standard email/password authentication without cross-domain redirects, the setup is identical to any single-domain `ideal-auth` app. Use `attempt()` with `resolveUserByCredentials` and `hash` as described in the [Getting Started](/ideal-auth/getting-started/) guide. No changes needed.
+
+The cross-domain flow below is only required when authentication happens on a different domain than the one that needs the session cookie.
+
+---
+
+## Database schema
+
+Create a `login_sessions` table to store short-lived transfer tokens. The table uses a two-part design: a random `id` for fast database lookup and a `token_hash` (HMAC of the validation token) for cryptographic verification. The plaintext token is never stored — a database breach does not expose usable tokens.
+
+<Tabs>
+  <TabItem label="SQL">
+    ```sql
+    CREATE TABLE login_sessions (
+      id         TEXT PRIMARY KEY,          -- random lookup key
+      token_hash TEXT NOT NULL,             -- HMAC-SHA256 of the validation token
+      user_id    TEXT NOT NULL,             -- user who authenticated
+      created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    );
+
+    -- Clean up expired tokens periodically
+    CREATE INDEX idx_login_sessions_created_at ON login_sessions (created_at);
+    ```
+  </TabItem>
+  <TabItem label="Drizzle">
+    ```ts title="db/schema.ts"
+    import { pgTable, text, timestamp } from 'drizzle-orm/pg-core';
+
+    export const loginSessions = pgTable('login_sessions', {
+      id: text('id').primaryKey(),                   // random lookup key
+      tokenHash: text('token_hash').notNull(),       // HMAC of validation token
+      userId: text('user_id').notNull(),             // user who authenticated
+      createdAt: timestamp('created_at', {
+        withTimezone: true,
+        mode: 'date',
+      }).notNull().defaultNow(),
+    });
+    ```
+  </TabItem>
+  <TabItem label="Prisma">
+    ```prisma title="prisma/schema.prisma"
+    model LoginSession {
+      id        String   @id                         // random lookup key
+      tokenHash String   @map("token_hash")          // HMAC of validation token
+      userId    String   @map("user_id")             // user who authenticated
+      createdAt DateTime @default(now()) @map("created_at")
+
+      @@map("login_sessions")
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside>
+  The `userId` is stored in plaintext — it is not a secret (it already exists in your users table). Encrypting it would add scrypt key derivation overhead (~50-100ms) on every token creation and validation for no meaningful security benefit. The real protection comes from the HMAC'd token hash, one-time use, and short expiry.
+</Aside>
+
+---
+
+## Shared secret
+
+Both the central login app and every tenant app must share the same secret. This secret is used to:
+
+- HMAC the validation token (to generate and verify the `token_hash` stored in the database)
+
+```bash title=".env"
+# Must be the same value on the central app and all tenant apps
+TRANSFER_TOKEN_SECRET="generate-with-bunx-ideal-auth-secret"
+```
+
+Generate a strong secret:
+
+```bash
+bunx ideal-auth secret
+```
+
+<Aside type="caution">
+  This secret is separate from `IDEAL_AUTH_SECRET` (which encrypts session cookies). Using a different secret for transfer tokens limits the blast radius if one is compromised — an attacker with the transfer secret cannot forge session cookies, and vice versa.
+</Aside>
+
+---
+
+## Central login app
+
+The central login app handles user authentication and issues transfer tokens. It can authenticate users via email/password, OAuth providers, or any other method.
+
+### Setup
+
+```ts title="lib/transfer-token.ts"
+import {
+  generateToken,
+  signData,
+  timingSafeEqual,
+} from 'ideal-auth';
+import { db } from './db';
+import { loginSessions } from './schema';
+import { eq, lt } from 'drizzle-orm';
+
+const TOKEN_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+const secret = process.env.TRANSFER_TOKEN_SECRET!;
+
+/**
+ * Create a transfer token after successful authentication.
+ *
+ * Returns an { id, token } pair to include in the redirect URL.
+ * - `id` is a random lookup key (database primary key)
+ * - `token` is a random validation secret (HMAC stored in database)
+ *
+ * Both are needed to validate — `id` alone cannot authenticate,
+ * and `token` alone cannot be looked up.
+ */
+export async function createTransferToken(userId: string) {
+  // 1. Generate a random lookup ID and a separate validation token
+  const id = generateToken(20);    // 40 hex characters — lookup key
+  const token = generateToken(32); // 64 hex characters — validation secret
+
+  // 2. HMAC the token for safe storage (plaintext never hits the database)
+  const tokenHash = signData(token, secret);
+
+  // 3. Store in database — userId is plaintext (not a secret)
+  await db.insert(loginSessions).values({
+    id,
+    tokenHash,
+    userId,
+  });
+
+  return { id, token };
+}
+
+/**
+ * Validate a transfer token from a tenant callback.
+ *
+ * Looks up the session by `id`, then verifies `token` against
+ * the stored HMAC using a timing-safe comparison.
+ *
+ * Returns the userId if valid, or null if the token is invalid,
+ * expired, or already used. The row is deleted on successful
+ * validation (one-time use).
+ */
+export async function validateTransferToken(id: string, token: string) {
+  // 1. Look up by id and delete in one operation (one-time use)
+  const deleted = await db
+    .delete(loginSessions)
+    .where(eq(loginSessions.id, id))
+    .returning({
+      tokenHash: loginSessions.tokenHash,
+      userId: loginSessions.userId,
+      createdAt: loginSessions.createdAt,
+    });
+
+  if (deleted.length === 0) {
+    return null;
+  }
+
+  const row = deleted[0];
+
+  // 2. Check expiry
+  if (row.createdAt.getTime() < Date.now() - TOKEN_EXPIRY_MS) {
+    return null;
+  }
+
+  // 3. Verify the token using timing-safe HMAC comparison
+  const candidateHash = signData(token, secret);
+  if (!timingSafeEqual(candidateHash, row.tokenHash)) {
+    return null;
+  }
+
+  return { userId: row.userId };
+}
+
+/**
+ * Remove expired tokens. Run on a schedule (e.g., hourly cron job).
+ */
+export async function cleanupExpiredTokens() {
+  const cutoff = new Date(Date.now() - TOKEN_EXPIRY_MS);
+  await db.delete(loginSessions).where(lt(loginSessions.createdAt, cutoff));
+}
+```
+
+<Aside type="tip">
+  The two-part design separates concerns: the `id` provides fast, constant-time database lookup (no computation), while the `token` provides cryptographic proof via timing-safe HMAC comparison. An attacker who can enumerate database rows (e.g., via SQL injection) still cannot forge the validation token.
+</Aside>
+
+### Tenant domain allowlist
+
+The central app **must** validate the `callbackUrl` against an allowlist of known tenant domains before redirecting. Without this, an attacker can craft a login link that redirects the transfer token to their own domain.
+
+```ts title="lib/safe-tenant-redirect.ts"
+// Load from environment or database
+const ALLOWED_TENANT_DOMAINS = process.env.ALLOWED_TENANT_DOMAINS!.split(',');
+// e.g., "acme.yourapp.com,widgets.yourapp.com"
+
+/**
+ * Validate that a callback URL points to a known tenant domain.
+ * Returns null if the URL is invalid or the domain is not in the allowlist.
+ */
+export function validateTenantCallbackUrl(
+  url: string | null | undefined,
+): string | null {
+  if (!url) return null;
+
+  try {
+    const parsed = new URL(url);
+
+    // Must be HTTPS in production
+    if (process.env.NODE_ENV === 'production' && parsed.protocol !== 'https:') {
+      return null;
+    }
+
+    if (!ALLOWED_TENANT_DOMAINS.includes(parsed.host)) {
+      return null;
+    }
+
+    return url;
+  } catch {
+    return null;
+  }
+}
+```
+
+<Aside type="caution">
+  This is the most critical security check in the entire flow. Without it, an attacker can craft `?callbackUrl=https://evil.com/steal` and intercept the transfer token. Always validate before redirecting.
+</Aside>
+
+### Login and redirect
+
+After the user authenticates on the central app (via any method), validate the callback URL, generate a transfer token, and redirect to the tenant.
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/actions/login.ts"
+    'use server';
+
+    import { hash } from '@/lib/auth';
+    import { createTransferToken } from '@/lib/transfer-token';
+    import { validateTenantCallbackUrl } from '@/lib/safe-tenant-redirect';
+    import { redirect } from 'next/navigation';
+    import { db } from '@/lib/db';
+
+    export async function centralLoginAction(
+      _prev: unknown,
+      formData: FormData,
+    ) {
+      const email = formData.get('email') as string;
+      const password = formData.get('password') as string;
+      const callbackUrl = formData.get('callbackUrl') as string;
+
+      if (!email || !password) {
+        return { error: 'Email and password are required.' };
+      }
+
+      // Validate the callback URL against tenant allowlist
+      const validatedCallbackUrl = validateTenantCallbackUrl(callbackUrl);
+      if (!validatedCallbackUrl) {
+        return { error: 'Invalid callback URL.' };
+      }
+
+      // Authenticate on the central app
+      const user = await db.user.findUnique({ where: { email } });
+      if (!user || !(await hash.verify(password, user.password))) {
+        return { error: 'Invalid email or password.' };
+      }
+
+      // Generate transfer token (two-part: id for lookup, token for validation)
+      const { id, token } = await createTransferToken(user.id);
+
+      // Redirect to the tenant's callback with both values
+      const url = new URL(validatedCallbackUrl);
+      url.searchParams.set('id', id);
+      url.searchParams.set('token', token);
+      redirect(url.toString());
+    }
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/routes/central-login.ts"
+    import { Router } from 'express';
+    import { hash } from '../lib/auth';
+    import { createTransferToken } from '../lib/transfer-token';
+    import { validateTenantCallbackUrl } from '../lib/safe-tenant-redirect';
+    import { db } from '../lib/db';
+
+    const router = Router();
+
+    router.post('/login', async (req, res) => {
+      const { email, password, callbackUrl } = req.body;
+
+      if (!email || !password || !callbackUrl) {
+        return res.status(400).json({ error: 'Missing required fields.' });
+      }
+
+      // Validate the callback URL against tenant allowlist
+      const validatedCallbackUrl = validateTenantCallbackUrl(callbackUrl);
+      if (!validatedCallbackUrl) {
+        return res.status(400).json({ error: 'Invalid callback URL.' });
+      }
+
+      const user = await db.user.findUnique({ where: { email } });
+      if (!user || !(await hash.verify(password, user.password))) {
+        return res.status(401).json({ error: 'Invalid credentials.' });
+      }
+
+      const { id, token } = await createTransferToken(user.id);
+
+      const url = new URL(validatedCallbackUrl);
+      url.searchParams.set('id', id);
+      url.searchParams.set('token', token);
+      res.redirect(url.toString());
+    });
+
+    export default router;
+    ```
+  </TabItem>
+</Tabs>
+
+### OAuth provider redirect
+
+If the central app uses an OAuth provider (Google, GitHub, etc.), the flow adds one more hop. After the OAuth provider redirects back to your central app with the authenticated user, generate the transfer token and redirect to the tenant.
+
+```ts title="app/api/auth/callback/route.ts"
+import { createTransferToken } from '@/lib/transfer-token';
+import { validateTenantCallbackUrl } from '@/lib/safe-tenant-redirect';
+import { db } from '@/lib/db';
+
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get('code');
+  const state = url.searchParams.get('state');
+
+  // 1. Exchange the OAuth code for tokens (provider-specific)
+  const oauthTokens = await exchangeCodeForTokens(code);
+  const profile = await fetchUserProfile(oauthTokens.accessToken);
+
+  // 2. Find or create the user in your database
+  let user = await db.user.findUnique({
+    where: { email: profile.email },
+  });
+
+  if (!user) {
+    user = await db.user.create({
+      data: {
+        email: profile.email,
+        name: profile.name,
+        // No password for OAuth users
+      },
+    });
+  }
+
+  // 3. Decode and validate the callback URL from OAuth state
+  const callbackUrl = validateTenantCallbackUrl(
+    decodeCallbackFromState(state),
+  );
+
+  if (!callbackUrl) {
+    return new Response('Invalid callback URL', { status: 400 });
+  }
+
+  // 4. Generate transfer token and redirect to tenant
+  const { id, token } = await createTransferToken(user.id);
+
+  const redirectUrl = new URL(callbackUrl);
+  redirectUrl.searchParams.set('id', id);
+  redirectUrl.searchParams.set('token', token);
+  return Response.redirect(redirectUrl.toString());
+}
+```
+
+<Aside>
+  Store the tenant's `callbackUrl` in the OAuth `state` parameter (or a server-side session) before redirecting to the OAuth provider. This preserves the tenant's origin through the OAuth flow.
+</Aside>
+
+---
+
+## Tenant app
+
+The tenant app redirects unauthenticated users to the central login and handles the callback.
+
+### Auth setup with `attemptUser`
+
+The tenant uses `attemptUser` to verify the transfer token and create a local session. This is the escape hatch that gives you full control over the authentication logic — no password verification needed since the central app already authenticated the user.
+
+```ts title="lib/auth.ts"
+import { createAuth } from 'ideal-auth';
+import { validateTransferToken } from './transfer-token';
+import { db } from './db';
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+};
+
+const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(), // your framework's cookie bridge
+
+  resolveUser: async (id) => {
+    return db.user.findUnique({ where: { id } });
+  },
+
+  // Use attemptUser for cross-domain token exchange
+  attemptUser: async (credentials) => {
+    const { id, token } = credentials;
+
+    // Validate the transfer token (two-part: id for lookup, token for verification)
+    const data = await validateTransferToken(id, token);
+    if (!data) return null;
+
+    // Find or create the user in the tenant's database
+    let user = await db.user.findUnique({
+      where: { id: data.userId },
+    });
+
+    if (!user) {
+      // For new users, fetch profile from your central user API or
+      // include additional fields in the login_sessions table
+      user = await db.user.create({
+        data: { id: data.userId },
+      });
+    }
+
+    return user;
+  },
+});
+
+export { auth };
+```
+
+### Callback endpoint
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/api/auth/callback/route.ts"
+    import { auth } from '@/lib/auth';
+    import { safeRedirect } from '@/lib/safe-redirect';
+    import { NextResponse } from 'next/server';
+    import type { NextRequest } from 'next/server';
+
+    export async function GET(request: NextRequest) {
+      const id = request.nextUrl.searchParams.get('id');
+      const token = request.nextUrl.searchParams.get('token');
+      const callbackUrl = request.nextUrl.searchParams.get('callbackUrl');
+
+      if (!id || !token) {
+        return NextResponse.redirect(new URL('/login-failed', request.url));
+      }
+
+      const session = auth();
+      const success = await session.attempt({ id, token });
+
+      if (!success) {
+        return NextResponse.redirect(new URL('/login-failed', request.url));
+      }
+
+      return NextResponse.redirect(
+        new URL(safeRedirect(callbackUrl, '/dashboard'), request.url),
+      );
+    }
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/routes/auth-callback.ts"
+    import { Router } from 'express';
+    import { auth } from '../lib/auth';
+    import { safeRedirect } from '../lib/safe-redirect';
+
+    const router = Router();
+
+    router.get('/auth/callback', async (req, res) => {
+      const { id, token, callbackUrl } = req.query;
+
+      if (!id || !token || typeof id !== 'string' || typeof token !== 'string') {
+        return res.redirect('/login-failed');
+      }
+
+      const session = auth(req, res);
+      const success = await session.attempt({ id, token });
+
+      if (!success) {
+        return res.redirect('/login-failed');
+      }
+
+      res.redirect(safeRedirect(callbackUrl as string, '/dashboard'));
+    });
+
+    export default router;
+    ```
+  </TabItem>
+  <TabItem label="SvelteKit">
+    ```ts title="src/routes/auth/callback/+server.ts"
+    import { redirect } from '@sveltejs/kit';
+    import { auth } from '$lib/server/auth';
+    import { safeRedirect } from '$lib/server/safe-redirect';
+    import type { RequestHandler } from './$types';
+
+    export const GET: RequestHandler = async ({ url, cookies }) => {
+      const id = url.searchParams.get('id');
+      const token = url.searchParams.get('token');
+      const callbackUrl = url.searchParams.get('callbackUrl');
+
+      if (!id || !token) {
+        redirect(303, '/login-failed');
+      }
+
+      const session = auth(cookies);
+      const success = await session.attempt({ id, token });
+
+      if (!success) {
+        redirect(303, '/login-failed');
+      }
+
+      redirect(303, safeRedirect(callbackUrl, '/dashboard'));
+    };
+    ```
+  </TabItem>
+  <TabItem label="Hono">
+    ```ts title="src/routes/auth-callback.ts"
+    import { Hono } from 'hono';
+    import { auth } from '../lib/auth';
+    import { safeRedirect } from '../lib/safe-redirect';
+
+    const app = new Hono();
+
+    app.get('/auth/callback', async (c) => {
+      const id = c.req.query('id');
+      const token = c.req.query('token');
+      const callbackUrl = c.req.query('callbackUrl');
+
+      if (!id || !token) {
+        return c.redirect('/login-failed');
+      }
+
+      const session = auth(c);
+      const success = await session.attempt({ id, token });
+
+      if (!success) {
+        return c.redirect('/login-failed');
+      }
+
+      return c.redirect(safeRedirect(callbackUrl, '/dashboard'));
+    });
+
+    export default app;
+    ```
+  </TabItem>
+  <TabItem label="Nuxt">
+    ```ts title="server/api/auth/callback.get.ts"
+    import { safeRedirect } from '~/server/utils/safe-redirect';
+
+    export default defineEventHandler(async (event) => {
+      const query = getQuery(event);
+      const id = query.id as string;
+      const token = query.token as string;
+      const callbackUrl = query.callbackUrl as string;
+
+      if (!id || !token) {
+        return sendRedirect(event, '/login-failed');
+      }
+
+      const session = auth(event);
+      const success = await session.attempt({ id, token });
+
+      if (!success) {
+        return sendRedirect(event, '/login-failed');
+      }
+
+      return sendRedirect(
+        event,
+        safeRedirect(callbackUrl, '/dashboard'),
+      );
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+### Redirecting unauthenticated users to central login
+
+When a user visits a protected route on a tenant domain without a session, redirect them to the central login page. Include the tenant's callback URL so the central app knows where to send the user back.
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="middleware.ts"
+    import { NextResponse } from 'next/server';
+    import type { NextRequest } from 'next/server';
+
+    const CENTRAL_LOGIN_URL = process.env.CENTRAL_LOGIN_URL!;
+    const protectedRoutes = ['/dashboard', '/settings', '/account'];
+
+    export function middleware(request: NextRequest) {
+      const { pathname } = request.nextUrl;
+      const hasSession = request.cookies.has('ideal_session');
+
+      if (protectedRoutes.some((r) => pathname.startsWith(r)) && !hasSession) {
+        // Build the callback URL — the tenant endpoint that will receive the token
+        const callbackUrl = new URL('/api/auth/callback', request.url);
+        // Preserve the original destination so we can redirect after login
+        callbackUrl.searchParams.set('callbackUrl', pathname);
+
+        // Redirect to central login
+        const loginUrl = new URL(CENTRAL_LOGIN_URL);
+        loginUrl.searchParams.set(
+          'callbackUrl',
+          callbackUrl.toString(),
+        );
+
+        return NextResponse.redirect(loginUrl);
+      }
+
+      return NextResponse.next();
+    }
+
+    export const config = {
+      matcher: ['/dashboard/:path*', '/settings/:path*', '/account/:path*'],
+    };
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/middleware/redirect-to-central.ts"
+    import type { Request, Response, NextFunction } from 'express';
+
+    const CENTRAL_LOGIN_URL = process.env.CENTRAL_LOGIN_URL!;
+
+    export function redirectToCentral(
+      req: Request,
+      res: Response,
+      next: NextFunction,
+    ) {
+      if (req.cookies.ideal_session) {
+        return next();
+      }
+
+      const callbackUrl = new URL('/auth/callback', `${req.protocol}://${req.get('host')}`);
+      callbackUrl.searchParams.set('callbackUrl', req.originalUrl);
+
+      const loginUrl = new URL(CENTRAL_LOGIN_URL);
+      loginUrl.searchParams.set('callbackUrl', callbackUrl.toString());
+
+      res.redirect(loginUrl.toString());
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Token cleanup
+
+Expired transfer tokens should be cleaned up periodically. Run `cleanupExpiredTokens()` on a schedule — every hour is a good default.
+
+<Tabs>
+  <TabItem label="Cron job">
+    ```ts title="jobs/cleanup-login-sessions.ts"
+    import { cleanupExpiredTokens } from '../lib/transfer-token';
+
+    // Run via cron: 0 * * * * (every hour)
+    await cleanupExpiredTokens();
+    ```
+  </TabItem>
+  <TabItem label="BullMQ">
+    ```ts title="jobs/cleanup-login-sessions.ts"
+    import { Queue, Worker } from 'bullmq';
+    import { cleanupExpiredTokens } from '../lib/transfer-token';
+
+    const queue = new Queue('cleanup-login-sessions', { connection: redis });
+    await queue.upsertJobScheduler('hourly', { pattern: '0 * * * *' });
+
+    new Worker('cleanup-login-sessions', async () => {
+      await cleanupExpiredTokens();
+    }, { connection: redis });
+    ```
+  </TabItem>
+  <TabItem label="Next.js Cron (Vercel)">
+    ```ts title="app/api/cron/cleanup/route.ts"
+    import { cleanupExpiredTokens } from '@/lib/transfer-token';
+    import { NextResponse } from 'next/server';
+
+    export async function GET(request: Request) {
+      // Verify cron secret to prevent unauthorized access
+      const authHeader = request.headers.get('authorization');
+      if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      }
+
+      await cleanupExpiredTokens();
+      return NextResponse.json({ success: true });
+    }
+    ```
+
+    ```json title="vercel.json"
+    {
+      "crons": [
+        {
+          "path": "/api/cron/cleanup",
+          "schedule": "0 * * * *"
+        }
+      ]
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Security considerations
+
+### Two-part token design
+
+The redirect URL carries two values: `id` (lookup) and `token` (validation). The database stores the `id` as a random primary key and the `token` as an HMAC hash. This means:
+
+- **`id` alone is useless** — it can look up a row, but without the matching `token`, validation fails
+- **`token` alone is useless** — there is no way to find the corresponding row without the `id`
+- **Database breach** — an attacker sees `id` and `tokenHash`, but cannot reverse the HMAC to recover the plaintext `token`. Both values are needed, and the token is not stored
+- **SQL injection** — even if an attacker can enumerate rows by `id`, they cannot forge the `token` that passes timing-safe HMAC verification
+
+### One-time use
+
+The `validateTransferToken` function deletes the token from the database in the same query that reads it. This means:
+
+- A token cannot be replayed after successful use
+- Even if an attacker intercepts the redirect URL, they have a narrow window (and the legitimate request will likely arrive first)
+
+### Short expiry window
+
+Transfer tokens expire after 5 minutes. This limits the window for interception. In practice, the redirect completes in under a second, so 5 minutes is generous. For higher-security applications, reduce this to 60 seconds:
+
+```ts
+const TOKEN_EXPIRY_MS = 60 * 1000; // 1 minute
+```
+
+### HTTPS required
+
+The transfer token travels in the redirect URL. Without HTTPS, it can be intercepted via network sniffing. **Always use HTTPS in production.** The redirect URL contains the token as a query parameter, which is encrypted in transit over TLS.
+
+<Aside type="caution">
+  Query parameters may appear in server access logs, proxy logs, and browser history. For maximum security, consider using a POST redirect with the token in the request body instead of a GET redirect with the token in the URL. However, the one-time use and short expiry make the query parameter approach acceptable for most applications.
+</Aside>
+
+### Open redirect prevention
+
+The `callbackUrl` is validated against a tenant domain allowlist on the central app **before** any redirect occurs (see the `validateTenantCallbackUrl` function above). This is the most critical security check in the flow — without it, an attacker can intercept the transfer token by crafting a login link that redirects to their domain.
+
+On the tenant side, the final redirect after login uses `safeRedirect` to ensure the post-login destination is a relative path. See the [Open Redirect Prevention](/ideal-auth/security/open-redirect/) guide for details.
+
+### Rate limiting
+
+Rate limit the callback endpoint to prevent brute-force token guessing. Even though tokens are 64 hex characters (256 bits of entropy), rate limiting adds defense in depth:
+
+```ts
+import { createRateLimiter } from 'ideal-auth';
+
+const callbackLimiter = createRateLimiter({
+  maxAttempts: 10,
+  windowMs: 60 * 1000, // 10 attempts per minute per IP
+});
+
+// In your callback handler, before validating the token:
+const ip = request.headers.get('x-forwarded-for') ?? '127.0.0.1';
+const { allowed } = await callbackLimiter.attempt(`callback:${ip}`);
+if (!allowed) {
+  return new Response('Too many requests', { status: 429 });
+}
+```
+
+### Separate secrets
+
+Use a dedicated `TRANSFER_TOKEN_SECRET` separate from `IDEAL_AUTH_SECRET`. This limits the impact of a compromise:
+
+| Secret | Purpose | Compromised impact |
+|--------|---------|-------------------|
+| `IDEAL_AUTH_SECRET` | Encrypts session cookies | Attacker can forge sessions |
+| `TRANSFER_TOKEN_SECRET` | HMACs transfer tokens | Attacker can forge transfer tokens (but they're one-time use and expire in 5 min) |
+
+### CSRF on the callback endpoint
+
+The callback endpoint receives a GET request with a token. This is safe because:
+
+1. The token is validated server-side (not just the presence of a cookie)
+2. The token is one-time use — a CSRF attack would need to know the exact token
+3. No state changes occur without a valid, unexpired, previously-unused token
+
+### Token entropy
+
+`generateToken(32)` produces 64 hex characters (256 bits of entropy). The probability of guessing a valid token is `1 / 2^256`, making brute force infeasible even without rate limiting.
+
+---
+
+## Shared database vs. API endpoint
+
+The examples above assume the central login app and tenant apps share a database (or the transfer token module is shared as a library). If your tenants run as separate services, expose the validation as an API endpoint on the central app instead:
+
+```ts title="Central app: app/api/auth/validate-token/route.ts"
+import { validateTransferToken } from '@/lib/transfer-token';
+import { NextResponse } from 'next/server';
+
+export async function POST(request: Request) {
+  // Authenticate the request from the tenant (shared API key, mTLS, etc.)
+  const apiKey = request.headers.get('x-api-key');
+  if (apiKey !== process.env.TENANT_API_KEY) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
+  const { id, token } = await request.json();
+  const data = await validateTransferToken(id, token);
+
+  if (!data) {
+    return NextResponse.json({ error: 'Invalid token' }, { status: 401 });
+  }
+
+  return NextResponse.json({ user: data });
+}
+```
+
+```ts title="Tenant app: lib/transfer-token.ts"
+// Replace the direct database call with an API call
+export async function validateTransferToken(id: string, token: string) {
+  const response = await fetch(
+    `${process.env.CENTRAL_APP_URL}/api/auth/validate-token`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.TENANT_API_KEY!,
+      },
+      body: JSON.stringify({ id, token }),
+    },
+  );
+
+  if (!response.ok) return null;
+
+  const { user } = await response.json();
+  return user as { userId: string };
+}
+```
+
+<Aside>
+  When using an API endpoint, protect it with a shared API key, mutual TLS, or IP allowlisting. Without authentication, anyone who discovers the endpoint could validate tokens they intercept.
+</Aside>
+
+---
+
+## Federated logout
+
+To log users out across all tenant domains, implement a federated logout flow:
+
+<Steps>
+
+1. **Tenant initiates logout.** The tenant calls `auth().logout()` to clear the local session cookie, then redirects to the central app's logout endpoint.
+
+    ```ts
+    export async function logoutAction() {
+      const session = auth();
+      await session.logout();
+
+      const logoutUrl = new URL(`${process.env.CENTRAL_LOGIN_URL}/logout`);
+      logoutUrl.searchParams.set('callbackUrl', window.location.origin);
+      redirect(logoutUrl.toString());
+    }
+    ```
+
+2. **Central app clears its session.** The central app clears its own session and, if using an OAuth provider, initiates the provider's logout flow.
+
+3. **Redirect back to tenant.** After all sessions are cleared, redirect the user back to the tenant's origin.
+
+</Steps>
+
+<Aside type="tip">
+  Stateless sessions (like ideal-auth's encrypted cookies) cannot be revoked across domains without additional infrastructure. Each domain must clear its own session cookie. If you need instant revocation across all tenants, add a `sessions` table and check it on every request — see the [Session Invalidation](/ideal-auth/security/session-invalidation/) guide.
+</Aside>
+
+---
+
+## Complete flow summary
+
+| Step | Location | What happens |
+|------|----------|-------------|
+| 1 | Tenant | User visits protected route, no session → redirect to central login |
+| 2 | Central | Validate `callbackUrl` against tenant domain allowlist |
+| 3 | Central | Login page shown with `callbackUrl` preserved |
+| 4 | Central | User authenticates (email/password or OAuth) |
+| 5 | Central | `createTransferToken(userId)` → random `id` + `token` generated, HMAC stored in DB |
+| 6 | Central | Redirect to `callbackUrl?id={id}&token={token}` |
+| 7 | Tenant | Callback receives `id` + `token`, calls `validateTransferToken(id, token)` |
+| 8 | Central DB | Lookup by `id` → timing-safe HMAC verify → timestamp check → row deleted |
+| 9 | Tenant | `attemptUser` returns user → `login()` creates session cookie on tenant domain |
+| 10 | Tenant | Redirect to original protected route |
+
+---
+
+## Security checklist
+
+- [ ] `TRANSFER_TOKEN_SECRET` is 32+ characters and stored as an environment variable
+- [ ] `TRANSFER_TOKEN_SECRET` is the same on the central app and all tenant apps
+- [ ] `TRANSFER_TOKEN_SECRET` is different from `IDEAL_AUTH_SECRET`
+- [ ] All redirects between domains use HTTPS
+- [ ] `callbackUrl` is validated against an allowlist of tenant domains
+- [ ] Transfer tokens expire within 5 minutes (or less)
+- [ ] Transfer tokens are one-time use (deleted after validation)
+- [ ] Callback endpoint is rate limited
+- [ ] Expired tokens are cleaned up on a schedule
+- [ ] If using an API endpoint for validation, it is authenticated (API key, mTLS, or IP allowlist)
