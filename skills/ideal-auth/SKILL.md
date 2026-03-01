@@ -1,5 +1,6 @@
 ---
-trigger: auth, login, logout, session, register, signup, sign up, sign in, sign out, password, 2FA, two-factor, totp, mfa, ideal-auth, cookie bridge, middleware, route protection, rate limit, rate limiting, password reset, forgot password, email verification, remember me, recovery code, csrf, encrypt, decrypt, hash, bcrypt, token, secret, session cookie
+name: ideal-auth
+description: Auth primitives for the JS ecosystem. Covers login, logout, session, register, signup, sign in, sign out, password, 2FA, two-factor, TOTP, MFA, ideal-auth, cookie bridge, middleware, route protection, rate limit, rate limiting, password reset, forgot password, email verification, remember me, recovery code, CSRF, encrypt, decrypt, hash, bcrypt, token, secret, session cookie, multi-tenant, cross-domain, tenant, transfer token, federated logout, OAuth redirect, central login, login session, attemptUser.
 ---
 
 You are an expert on `ideal-auth`, the auth primitives library for the JS ecosystem. You have complete knowledge of its API, patterns, security model, and framework integrations. Use this knowledge to help users implement authentication correctly.
@@ -1671,6 +1672,138 @@ redirect(safeRedirect(redirectTo, '/dashboard'));
 - Same secret must be used for creation and verification
 - Check if token has expired (default: 1 hour)
 - Secret rotation invalidates all outstanding tokens
+
+---
+
+## Multi-Tenant Cross-Domain Authentication
+
+When tenants run on different domains (e.g., `acme.app.com`, `widgets.app.com`), cookies set on the central login domain cannot be read by tenant domains. Use a short-lived, one-time-use database token to transfer authentication across domains.
+
+### When to use this pattern
+
+- Tenants are on **separate domains** (not subdomains of a shared parent)
+- Authentication happens on a **central login page** (identity domain)
+- OAuth providers redirect to the central app, not individual tenants
+- Cookies **cannot be shared** across tenant domains
+
+If all tenants share a parent domain (e.g., `*.app.com`), set `domain: '.app.com'` on the session cookie instead — no cross-domain flow needed.
+
+### Database schema
+
+```sql
+CREATE TABLE login_sessions (
+  id         TEXT PRIMARY KEY,          -- random lookup key
+  token_hash TEXT NOT NULL,             -- HMAC-SHA256 of the validation token
+  user_id    TEXT NOT NULL,             -- user who authenticated
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+```
+
+Two-part design: `id` for fast DB lookup, `token_hash` for cryptographic verification. Plaintext token is never stored — DB breach does not expose usable tokens. `userId` is stored plaintext (not a secret — no encryption overhead needed).
+
+### Transfer token module
+
+```ts
+import { generateToken, signData, timingSafeEqual } from 'ideal-auth';
+
+const TOKEN_EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
+const secret = process.env.TRANSFER_TOKEN_SECRET!; // separate from IDEAL_AUTH_SECRET
+
+// After successful authentication on central app
+async function createTransferToken(userId: string) {
+  const id = generateToken(20);    // 40 hex chars — lookup key
+  const token = generateToken(32); // 64 hex chars — validation secret
+  const tokenHash = signData(token, secret);
+  await db.insert(loginSessions).values({ id, tokenHash, userId });
+  return { id, token }; // both included in redirect URL
+}
+
+// On tenant callback endpoint
+async function validateTransferToken(id: string, token: string) {
+  const deleted = await db.delete(loginSessions).where(eq(loginSessions.id, id))
+    .returning({ tokenHash: loginSessions.tokenHash, userId: loginSessions.userId, createdAt: loginSessions.createdAt });
+  if (deleted.length === 0) return null;
+  const row = deleted[0];
+  if (row.createdAt.getTime() < Date.now() - TOKEN_EXPIRY_MS) return null; // expired
+  const candidateHash = signData(token, secret);
+  if (!timingSafeEqual(candidateHash, row.tokenHash)) return null; // invalid token
+  return { userId: row.userId };
+}
+```
+
+### Tenant domain allowlist (central app)
+
+```ts
+// Central app MUST validate callbackUrl before redirecting
+const ALLOWED_TENANT_DOMAINS = process.env.ALLOWED_TENANT_DOMAINS!.split(',');
+
+function validateTenantCallbackUrl(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url);
+    if (process.env.NODE_ENV === 'production' && parsed.protocol !== 'https:') return null;
+    if (!ALLOWED_TENANT_DOMAINS.includes(parsed.host)) return null;
+    return url;
+  } catch { return null; }
+}
+```
+
+### Tenant auth setup with `attemptUser`
+
+```ts
+const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  attemptUser: async (credentials) => {
+    const data = await validateTransferToken(credentials.id, credentials.token);
+    if (!data) return null;
+    let user = await db.user.findUnique({ where: { id: data.userId } });
+    if (!user) user = await db.user.create({ data: { id: data.userId } });
+    return user;
+  },
+});
+```
+
+### Tenant callback endpoint
+
+```ts
+// GET /api/auth/callback?id=xxx&token=yyy&callbackUrl=/dashboard
+const id = request.searchParams.get('id');
+const token = request.searchParams.get('token');
+if (!id || !token) redirect('/login-failed');
+const session = auth();
+const success = await session.attempt({ id, token });
+if (success) redirect(safeRedirect(callbackUrl, '/dashboard'));
+```
+
+### Central login redirect flow
+
+```
+Tenant (no session) → redirect to central login with callbackUrl
+Central login → validate callbackUrl against tenant allowlist → authenticate
+  → createTransferToken(userId) → redirect to tenant callback with id + token
+Tenant callback → validateTransferToken(id, token) → attemptUser → session created
+```
+
+### Security rules for multi-tenant auth
+
+- **Validate callbackUrl first**: Central app must check against tenant domain allowlist before any redirect — this is the most critical check
+- **Two-part token**: Separate `id` (lookup) and `token` (validation) — neither alone is useful
+- **Timing-safe verification**: Use `timingSafeEqual` to compare HMAC hashes, preventing timing attacks
+- **Separate secret**: `TRANSFER_TOKEN_SECRET` must be different from `IDEAL_AUTH_SECRET`
+- **Same secret on all apps**: Central and all tenants share `TRANSFER_TOKEN_SECRET`
+- **One-time use**: Delete token from DB immediately after validation
+- **5-minute expiry**: Reject tokens older than 5 minutes
+- **HTTPS required**: Token travels in redirect URL — must be encrypted in transit
+- **Rate limit callback**: 10 attempts/minute per IP on the callback endpoint
+- **Clean up expired tokens**: Run a cron job hourly to delete old rows
+- **No payload encryption needed**: `userId` is not a secret — the real protection is the HMAC'd token, one-time use, and short expiry
+- **API endpoint auth**: If tenants validate via API (not shared DB), protect with API key or mTLS
+
+### Federated logout
+
+Each tenant must clear its own session cookie. Redirect chain: tenant `logout()` → central logout endpoint → OAuth provider logout (if applicable) → redirect back to tenant.
 
 ---
 
