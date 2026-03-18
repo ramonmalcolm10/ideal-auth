@@ -20,7 +20,12 @@ export async function unseal(
     if (!data || !data.uid || !data.iat || !data.exp) return null;
     if (data.exp < Math.floor(Date.now() / 1000)) return null;
 
-    return data;
+    return {
+      uid: data.uid,
+      iat: data.iat,
+      exp: data.exp,
+      ...(data.data !== undefined && { data: data.data }),
+    };
   } catch {
     return null;
   }

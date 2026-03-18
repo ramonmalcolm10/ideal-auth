@@ -163,7 +163,7 @@ When `remember: false`, the cookie has no `maxAge` regardless of these settings.
 When `login()` or `attempt()` is called:
 
 1. A session payload is created with `{ uid, iat, exp }` where `exp = iat + maxAge`
-2. The payload is encrypted using AES-256-GCM via iron-session
+2. The payload is encrypted using AES-256-CBC via iron-session
 3. The encrypted payload is set as a cookie:
    - `remember: true` -- cookie `maxAge` is set to `rememberMaxAge`
    - `remember: false` -- no cookie `maxAge` (session cookie)

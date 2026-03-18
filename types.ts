@@ -27,6 +27,7 @@ export interface SessionPayload {
   uid: string;
   iat: number;
   exp: number;
+  data?: Record<string, unknown>;
 }
 
 export interface LoginOptions {
@@ -42,7 +43,28 @@ export interface AuthConfig<TUser extends AnyUser = AnyUser> {
     rememberMaxAge?: number;
     cookie?: Partial<ConfigurableCookieOptions>;
   };
-  resolveUser: (id: string) => Promise<TUser | null>;
+  resolveUser?: (id: string) => Promise<TUser | null>;
+
+  /**
+   * Fields from the user object to store in the session cookie.
+   * When provided, `resolveUser` is not needed — `user()` returns
+   * the stored fields directly from the cookie.
+   *
+   * The `id` field is always stored. List only additional fields.
+   * Keep the total small — session cookies have a ~4KB size limit.
+   *
+   * Cannot be used together with `resolveUser`.
+   *
+   * **Staleness:** Data is snapshotted at login time. If a user's role
+   * or permissions change server-side, the cookie retains the old values
+   * until the user re-logs in. For authorization-critical fields (role,
+   * permissions, subscription tier), prefer `resolveUser` to get fresh
+   * data on every request.
+   *
+   * **ID type:** `user()` always returns `id` as a `string` on subsequent
+   * requests (read from cookie), even if the original `TUser.id` was a number.
+   */
+  sessionFields?: (keyof TUser & string)[];
 
   // Laravel-style: provide hash + resolveUserByCredentials and attempt()
   // automatically strips "password", looks up the user, and verifies the hash.

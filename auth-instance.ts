@@ -17,7 +17,8 @@ interface AuthInstanceDeps<TUser extends AnyUser> {
   maxAge: number;
   rememberMaxAge: number;
   cookieOptions: ConfigurableCookieOptions;
-  resolveUser: (id: string) => Promise<TUser | null>;
+  resolveUser?: (id: string) => Promise<TUser | null>;
+  sessionFields?: (keyof TUser & string)[];
   hash?: HashInstance;
   resolveUserByCredentials?: (
     credentials: Record<string, any>,
@@ -46,6 +47,18 @@ export function createAuthInstance<TUser extends AnyUser>(
     return cachedPayload;
   }
 
+  function pickSessionData(user: TUser): Record<string, unknown> | undefined {
+    if (!deps.sessionFields) return undefined;
+
+    const data: Record<string, unknown> = {};
+    for (const field of deps.sessionFields) {
+      if (field !== 'id' && field in user) {
+        data[field] = user[field];
+      }
+    }
+    return Object.keys(data).length > 0 ? data : undefined;
+  }
+
   async function writeSession(
     user: TUser,
     options?: LoginOptions,
@@ -56,6 +69,7 @@ export function createAuthInstance<TUser extends AnyUser>(
       uid: String(user.id),
       iat: now,
       exp: now + maxAge,
+      data: pickSessionData(user),
     };
 
     const sealed = await seal(payload, deps.secret);
@@ -65,7 +79,10 @@ export function createAuthInstance<TUser extends AnyUser>(
     await deps.cookie.set(deps.cookieName, sealed, opts);
 
     cachedPayload = payload;
-    cachedUser = user;
+    // When using sessionFields, only cache the picked fields (matching what's in the cookie)
+    cachedUser = payload.data
+      ? ({ id: user.id, ...payload.data } as TUser)
+      : user;
   }
 
   return {
@@ -74,6 +91,9 @@ export function createAuthInstance<TUser extends AnyUser>(
     },
 
     async loginById(id: string, options?: LoginOptions): Promise<void> {
+      if (!deps.resolveUser) {
+        throw new Error('loginById requires resolveUser — use login(user) instead when using sessionFields');
+      }
       const user = await deps.resolveUser(id);
       if (!user) throw new Error('Login failed');
       await writeSession(user, options);
@@ -128,7 +148,19 @@ export function createAuthInstance<TUser extends AnyUser>(
         return null;
       }
 
-      cachedUser = await deps.resolveUser(session.uid);
+      // Cookie-backed: reconstruct user from session data
+      if (deps.sessionFields && session.data) {
+        cachedUser = { id: session.uid, ...session.data } as TUser;
+        return cachedUser;
+      }
+
+      // Database-backed: resolve user via callback
+      if (deps.resolveUser) {
+        cachedUser = await deps.resolveUser(session.uid);
+        return cachedUser;
+      }
+
+      cachedUser = null;
       return cachedUser;
     },
 

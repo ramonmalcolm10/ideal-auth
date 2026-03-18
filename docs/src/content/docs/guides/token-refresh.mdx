@@ -1,0 +1,264 @@
+---
+title: Token Refresh
+description: Refresh OAuth access tokens stored in session cookies using ideal-auth.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+When using `sessionFields` to store OAuth access tokens in the session cookie, those tokens will eventually expire. This guide covers how to proactively refresh them before they expire, keeping the user's session alive without re-authentication.
+
+<Aside type="tip">
+  This guide applies to any app that stores access tokens in the session cookie via `sessionFields` — whether single-domain or multi-tenant.
+</Aside>
+
+---
+
+## Setup
+
+Store the access token, refresh token, and expiry timestamp in the session cookie:
+
+```ts title="lib/auth.ts"
+import { createAuth } from 'ideal-auth';
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;       // Unix seconds when the access token expires
+};
+
+export const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  sessionFields: ['email', 'name', 'accessToken', 'refreshToken', 'expiresAt'],
+});
+```
+
+When logging in (after OAuth callback or cross-domain transfer), include all three values:
+
+```ts
+await auth().login({
+  id: profile.sub,
+  email: profile.email,
+  name: profile.name,
+  accessToken: tokens.access_token,
+  refreshToken: tokens.refresh_token,
+  expiresAt: Math.floor(Date.now() / 1000) + tokens.expires_in,
+});
+```
+
+---
+
+## Refresh helper
+
+Create a helper that exchanges a refresh token for new tokens. This is provider-specific — the example below shows a standard OAuth2 token endpoint:
+
+```ts title="lib/refresh-token.ts"
+export async function refreshAccessToken(refreshToken: string) {
+  const response = await fetch(process.env.OAUTH_TOKEN_URL!, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: process.env.OAUTH_CLIENT_ID!,
+      client_secret: process.env.OAUTH_CLIENT_SECRET!,
+    }),
+  });
+
+  if (!response.ok) {
+    return null;
+  }
+
+  const data = await response.json();
+
+  return {
+    accessToken: data.access_token as string,
+    refreshToken: (data.refresh_token as string) ?? refreshToken, // some providers rotate refresh tokens
+    expiresIn: data.expires_in as number,
+  };
+}
+```
+
+---
+
+## Proactive refresh
+
+Check the token expiry **before** making API calls. If the token is expired or about to expire, refresh it and update the session cookie. The key is that `auth().login()` replaces the session cookie — calling it again with updated tokens is the refresh mechanism.
+
+```ts title="lib/ensure-fresh-token.ts"
+import { auth } from './auth';
+import { refreshAccessToken } from './refresh-token';
+
+const REFRESH_BUFFER_SECONDS = 60; // refresh 60 seconds before expiry
+
+/**
+ * Ensure the access token is fresh. If expired or about to expire,
+ * refresh it and update the session cookie.
+ *
+ * Returns the current user with a valid access token, or null
+ * if the session is invalid or the refresh failed.
+ */
+export async function ensureFreshToken() {
+  const session = auth();
+  const user = await session.user();
+
+  if (!user) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+
+  // Token is still fresh — return as-is
+  if (user.expiresAt > now + REFRESH_BUFFER_SECONDS) {
+    return user;
+  }
+
+  // Token expired or about to expire — refresh it
+  const tokens = await refreshAccessToken(user.refreshToken);
+
+  if (!tokens) {
+    // Refresh failed — session is no longer valid
+    await session.logout();
+    return null;
+  }
+
+  // Update the session cookie with new tokens
+  const updatedUser = {
+    ...user,
+    accessToken: tokens.accessToken,
+    refreshToken: tokens.refreshToken,
+    expiresAt: now + tokens.expiresIn,
+  };
+
+  await session.login(updatedUser);
+
+  return updatedUser;
+}
+```
+
+<Aside type="caution">
+  The refresh buffer (60 seconds) prevents a race condition where the token expires between the check and the API call. Adjust this based on your OAuth provider's token lifetime — for short-lived tokens (5 minutes), a 30-second buffer is appropriate.
+</Aside>
+
+---
+
+## Usage
+
+Call `ensureFreshToken()` before any API call that requires the access token:
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/actions/fetch-data.ts"
+    'use server';
+
+    import { ensureFreshToken } from '@/lib/ensure-fresh-token';
+    import { redirect } from 'next/navigation';
+
+    export async function fetchDashboardData() {
+      const user = await ensureFreshToken();
+
+      if (!user) {
+        redirect('/login');
+      }
+
+      const res = await fetch('https://api.example.com/dashboard', {
+        headers: { Authorization: `Bearer ${user.accessToken}` },
+      });
+
+      return res.json();
+    }
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/middleware/fresh-token.ts"
+    import type { Request, Response, NextFunction } from 'express';
+    import { ensureFreshToken } from '../lib/ensure-fresh-token';
+
+    export async function requireFreshToken(
+      req: Request,
+      res: Response,
+      next: NextFunction,
+    ) {
+      const user = await ensureFreshToken();
+
+      if (!user) {
+        return res.status(401).json({ error: 'Session expired.' });
+      }
+
+      req.user = user;
+      next();
+    }
+    ```
+  </TabItem>
+  <TabItem label="SvelteKit">
+    ```ts title="src/hooks.server.ts"
+    import { redirect, type Handle } from '@sveltejs/kit';
+    import { ensureFreshToken } from '$lib/server/ensure-fresh-token';
+
+    export const handle: Handle = async ({ event, resolve }) => {
+      const user = await ensureFreshToken();
+
+      event.locals.user = user;
+
+      if (!user && event.url.pathname.startsWith('/dashboard')) {
+        redirect(303, '/login');
+      }
+
+      return resolve(event);
+    };
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## When the refresh token expires
+
+Refresh tokens also have a lifetime (often 30-90 days). When the refresh fails:
+
+1. `refreshAccessToken()` returns `null`
+2. `ensureFreshToken()` calls `logout()` to clear the invalid session
+3. The user is redirected to login
+
+This is the correct behavior — a failed refresh means the user's grant has been revoked or expired, and they need to re-authenticate.
+
+---
+
+## Refresh token rotation
+
+Some OAuth providers rotate refresh tokens on every use (the old refresh token is invalidated when a new one is issued). The `refreshAccessToken` helper handles this by preferring the new refresh token from the response, falling back to the existing one if the provider doesn't return a new one:
+
+```ts
+refreshToken: (data.refresh_token as string) ?? refreshToken,
+```
+
+<Aside type="caution">
+  With refresh token rotation, a race condition can occur if two concurrent requests both try to refresh at the same time. The first refresh succeeds, but the second uses the now-invalidated old refresh token and fails. To prevent this, use a lock or mutex around the refresh logic in high-concurrency environments:
+
+  ```ts
+  // Simple in-memory lock (single-process only)
+  let refreshPromise: Promise<any> | null = null;
+
+  async function ensureFreshToken() {
+    // ...token check...
+
+    if (!refreshPromise) {
+      refreshPromise = refreshAccessToken(user.refreshToken)
+        .finally(() => { refreshPromise = null; });
+    }
+
+    const tokens = await refreshPromise;
+    // ...update session...
+  }
+  ```
+</Aside>
+
+---
+
+## Security considerations
+
+- **Refresh tokens are secrets.** They are stored encrypted in the session cookie (iron-session AES-256-CBC + HMAC). The `httpOnly` flag prevents JavaScript access.
+- **Cookie size.** Access tokens (especially JWTs) can be large. If the total session cookie exceeds ~4KB after encryption, the browser will silently drop it. Test with your actual tokens.
+- **Logout clears tokens.** Calling `auth().logout()` deletes the session cookie, which removes the access and refresh tokens from the client. If you also need to revoke the tokens server-side, call your OAuth provider's revocation endpoint before logging out.
+- **Don't refresh on 401.** By the time you get a 401, the user's request already failed. Proactive refresh (checking `expiresAt` before the API call) provides a better user experience.

@@ -477,7 +477,7 @@ const limiter = createRateLimiter({
 
 ## How It Works
 
-Sessions are **stateless, encrypted cookies** powered by iron-session (AES-256-GCM + HMAC integrity).
+Sessions are **stateless, encrypted cookies** powered by iron-session (AES-256-CBC + HMAC integrity).
 
 1. **`login(user)`** — Creates a `SessionPayload { uid, iat, exp }`, seals it with iron-session, writes the encrypted string to the cookie via the bridge.
 2. **`check()` / `user()` / `id()`** — Reads the cookie via the bridge, unseals the payload, checks expiry. `user()` additionally calls `resolveUser(id)` to fetch the full user.
@@ -519,7 +519,7 @@ cookie: {
 
 | Package | Purpose |
 | --- | --- |
-| `iron-session` | Session sealing/unsealing (AES-256-GCM + HMAC) |
+| `iron-session` | Session sealing/unsealing (AES-256-CBC + HMAC) |
 | `bcryptjs` | Password hashing |
 
 Zero framework imports. Works in Node, Bun, Deno, and edge runtimes.
