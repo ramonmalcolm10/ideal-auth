@@ -439,52 +439,99 @@ The tenant app redirects unauthenticated users to the central login and handles 
 
 The tenant uses `attemptUser` to verify the transfer token and create a local session. This is the escape hatch that gives you full control over the authentication logic — no password verification needed since the central app already authenticated the user.
 
-```ts title="lib/auth.ts"
-import { createAuth } from 'ideal-auth';
-import { validateTransferToken } from './transfer-token';
-import { db } from './db';
+Choose between database-backed and cookie-backed sessions depending on whether the tenant has a database:
 
-type User = {
-  id: string;
-  email: string;
-  name: string;
-};
+<Tabs>
+  <TabItem label="With database (resolveUser)">
+    ```ts title="lib/auth.ts"
+    import { createAuth } from 'ideal-auth';
+    import { validateTransferToken } from './transfer-token';
+    import { db } from './db';
 
-const auth = createAuth<User>({
-  secret: process.env.IDEAL_AUTH_SECRET!,
-  cookie: createCookieBridge(), // your framework's cookie bridge
+    type User = {
+      id: string;
+      email: string;
+      name: string;
+    };
 
-  resolveUser: async (id) => {
-    return db.user.findUnique({ where: { id } });
-  },
+    const auth = createAuth<User>({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      cookie: createCookieBridge(),
 
-  // Use attemptUser for cross-domain token exchange
-  attemptUser: async (credentials) => {
-    const { id, token } = credentials;
+      // Database-backed: user() fetches fresh data on every request
+      resolveUser: async (id) => {
+        return db.user.findUnique({ where: { id } });
+      },
 
-    // Validate the transfer token (two-part: id for lookup, token for verification)
-    const data = await validateTransferToken(id, token);
-    if (!data) return null;
+      attemptUser: async (credentials) => {
+        const { id, token } = credentials;
+        const data = await validateTransferToken(id, token);
+        if (!data) return null;
 
-    // Find or create the user in the tenant's database
-    let user = await db.user.findUnique({
-      where: { id: data.userId },
+        let user = await db.user.findUnique({ where: { id: data.userId } });
+        if (!user) {
+          user = await db.user.create({ data: { id: data.userId } });
+        }
+        return user;
+      },
     });
 
-    if (!user) {
-      // For new users, fetch profile from your central user API or
-      // include additional fields in the login_sessions table
-      user = await db.user.create({
-        data: { id: data.userId },
-      });
-    }
+    export { auth };
+    ```
+  </TabItem>
+  <TabItem label="Without database (sessionFields)">
+    If the tenant has no database and needs the access token to call APIs, the central app must store the access token (encrypted) in the `login_sessions` table alongside the `userId`. See [Storing access tokens](#storing-access-tokens-for-database-free-tenants) below for the schema and transfer token changes.
 
-    return user;
-  },
-});
+    ```ts title="lib/auth.ts"
+    import { createAuth } from 'ideal-auth';
+    import { validateTransferToken } from './transfer-token';
 
-export { auth };
-```
+    type User = {
+      id: string;
+      email: string;
+      name: string;
+      accessToken: string;
+    };
+
+    const auth = createAuth<User>({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      cookie: createCookieBridge(),
+
+      // Cookie-backed: user() reads from cookie — zero external calls after login
+      sessionFields: ['email', 'name', 'accessToken'],
+
+      attemptUser: async (credentials) => {
+        const { id, token } = credentials;
+
+        // validateTransferToken returns { userId, accessToken }
+        // when the login_sessions table includes an encrypted access_token column
+        const data = await validateTransferToken(id, token);
+        if (!data) return null;
+
+        // Fetch profile from identity provider using the access token
+        const res = await fetch('https://identity.example.com/api/userinfo', {
+          headers: { Authorization: `Bearer ${data.accessToken}` },
+        });
+        if (!res.ok) return null;
+        const profile = await res.json();
+
+        return {
+          id: profile.sub,
+          email: profile.email,
+          name: profile.name,
+          accessToken: data.accessToken,
+        };
+      },
+    });
+
+    export { auth };
+    ```
+
+    <Aside type="tip">
+      With `sessionFields`, the user info is stored directly in the encrypted session cookie at login time. Every subsequent `auth().user()` call reads from the cookie — no API calls, no database. The access token is also available for making authenticated requests to other services.
+    </Aside>
+  </TabItem>
+</Tabs>
 
 ### Callback endpoint
 
@@ -898,34 +945,79 @@ export async function validateTransferToken(id: string, token: string) {
 
 ---
 
+## Storing access tokens for database-free tenants
+
+If the tenant has no database and needs an access token (e.g., to call a user info API or other protected services), the central app must store the access token in the `login_sessions` table and return it during validation.
+
+### Updated schema
+
+Add an `access_token` column. Unlike `user_id`, the access token **is a secret** and must be encrypted at rest.
+
+```sql
+CREATE TABLE login_sessions (
+  id            TEXT PRIMARY KEY,
+  token_hash    TEXT NOT NULL,
+  user_id       TEXT NOT NULL,
+  access_token  TEXT NOT NULL,      -- AES-256-GCM encrypted
+  created_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+```
+
+### Updated transfer token functions
+
+```ts title="lib/transfer-token.ts"
+import { generateToken, signData, timingSafeEqual, encrypt, decrypt } from 'ideal-auth';
+
+const secret = process.env.TRANSFER_TOKEN_SECRET!;
+const encryptionKey = process.env.ENCRYPTION_KEY!; // separate key — generate with: bunx ideal-auth encryption-key
+
+export async function createTransferToken(userId: string, accessToken: string) {
+  const id = generateToken(20);
+  const token = generateToken(32);
+  const tokenHash = signData(token, secret);
+  const encryptedAccessToken = await encrypt(accessToken, encryptionKey);
+
+  await db.insert(loginSessions).values({
+    id,
+    tokenHash,
+    userId,
+    accessToken: encryptedAccessToken,
+  });
+
+  return { id, token };
+}
+
+export async function validateTransferToken(id: string, token: string) {
+  const deleted = await db.delete(loginSessions)
+    .where(eq(loginSessions.id, id))
+    .returning();
+
+  if (deleted.length === 0) return null;
+  const row = deleted[0];
+
+  if (row.createdAt.getTime() < Date.now() - TOKEN_EXPIRY_MS) return null;
+
+  const candidateHash = signData(token, secret);
+  if (!timingSafeEqual(candidateHash, row.tokenHash)) return null;
+
+  return {
+    userId: row.userId,
+    accessToken: await decrypt(row.accessToken, encryptionKey),
+  };
+}
+```
+
+<Aside type="caution">
+  Use a separate `ENCRYPTION_KEY` for encrypting access tokens. Generate one with `bunx ideal-auth encryption-key`. Do not reuse `TRANSFER_TOKEN_SECRET` (HMAC) or `IDEAL_AUTH_SECRET` (sessions).
+</Aside>
+
+---
+
 ## Federated logout
 
-To log users out across all tenant domains, implement a federated logout flow:
+Logging out in a multi-tenant setup requires a redirect chain that visits each domain to clear its session cookie, and optionally revokes the session at the identity provider.
 
-<Steps>
-
-1. **Tenant initiates logout.** The tenant calls `auth().logout()` to clear the local session cookie, then redirects to the central app's logout endpoint.
-
-    ```ts
-    export async function logoutAction() {
-      const session = auth();
-      await session.logout();
-
-      const logoutUrl = new URL(`${process.env.CENTRAL_LOGIN_URL}/logout`);
-      logoutUrl.searchParams.set('callbackUrl', window.location.origin);
-      redirect(logoutUrl.toString());
-    }
-    ```
-
-2. **Central app clears its session.** The central app clears its own session and, if using an OAuth provider, initiates the provider's logout flow.
-
-3. **Redirect back to tenant.** After all sessions are cleared, redirect the user back to the tenant's origin.
-
-</Steps>
-
-<Aside type="tip">
-  Stateless sessions (like ideal-auth's encrypted cookies) cannot be revoked across domains without additional infrastructure. Each domain must clear its own session cookie. If you need instant revocation across all tenants, add a `sessions` table and check it on every request — see the [Session Invalidation](/ideal-auth/security/session-invalidation/) guide.
-</Aside>
+See the [Federated Logout](/ideal-auth/guides/federated-logout/) guide for the complete implementation, including OIDC provider logout, token revocation, and framework-specific examples.
 
 ---
 

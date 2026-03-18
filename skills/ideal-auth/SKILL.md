@@ -1,6 +1,6 @@
 ---
 name: ideal-auth
-description: Auth primitives for the JS ecosystem. Covers login, logout, session, register, signup, sign in, sign out, password, 2FA, two-factor, TOTP, MFA, ideal-auth, cookie bridge, middleware, route protection, rate limit, rate limiting, password reset, forgot password, email verification, remember me, recovery code, CSRF, encrypt, decrypt, hash, bcrypt, token, secret, session cookie, multi-tenant, cross-domain, tenant, transfer token, federated logout, OAuth redirect, central login, login session, attemptUser.
+description: Auth primitives for the JS ecosystem. Covers login, logout, session, register, signup, sign in, sign out, password, 2FA, two-factor, TOTP, MFA, ideal-auth, cookie bridge, middleware, route protection, rate limit, rate limiting, password reset, forgot password, email verification, remember me, recovery code, CSRF, encrypt, decrypt, hash, bcrypt, token, secret, session cookie, multi-tenant, cross-domain, tenant, transfer token, federated logout, OAuth redirect, central login, login session, attemptUser, sessionFields, cookie-backed session, resolveUser, token refresh, refresh token, access token, OIDC.
 ---
 
 You are an expert on `ideal-auth`, the auth primitives library for the JS ecosystem. You have complete knowledge of its API, patterns, security model, and framework integrations. Use this knowledge to help users implement authentication correctly.
@@ -74,7 +74,10 @@ Returns a factory function. Call `auth()` per request to get an `AuthInstance` s
 type AuthConfig<TUser extends AnyUser> = {
   secret: string;                    // 32+ chars, required — throws if shorter
   cookie: CookieBridge;              // required
-  resolveUser: (id: string) => Promise<TUser | null>;  // required
+
+  // Session mode — provide exactly ONE of these two:
+  resolveUser?: (id: string) => Promise<TUser | null>;  // DB-backed: user() calls this every request
+  sessionFields?: (keyof TUser & string)[];              // Cookie-backed: user() reads from cookie, zero external calls
 
   // Session options
   session?: {
@@ -95,16 +98,54 @@ type AuthConfig<TUser extends AnyUser> = {
 };
 ```
 
+#### Session Modes
+
+**Database-backed (`resolveUser`):** Cookie stores only user ID. `user()` calls `resolveUser(id)` every request. Best for real-time data freshness.
+
+```typescript
+const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  hash,
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+```
+
+**Cookie-backed (`sessionFields`):** Cookie stores user ID + declared fields. `user()` reads from cookie — zero external calls. Best for performance, stateless apps, or apps without a database.
+
+```typescript
+const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  sessionFields: ['email', 'name', 'role'],
+  hash,
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+// user() returns { id, email, name, role } from cookie
+```
+
+Key rules:
+- Provide exactly one of `resolveUser` or `sessionFields` — both or neither throws
+- `id` is always stored — don't include it in `sessionFields`
+- Cookie limit is ~4KB — store basic fields only
+- `sessionFields` data is a snapshot from login time — stale if user updates profile mid-session
+- To refresh, call `auth().login(updatedUser)` after the update
+- `loginById()` requires `resolveUser` — throws with `sessionFields`
+- Both modes work with `attempt()`, `attemptUser`, `hash + resolveUserByCredentials`
+
 #### AuthInstance Methods
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `login(user, options?)` | `Promise<void>` | Set session cookie for the given user |
-| `loginById(id, options?)` | `Promise<void>` | Resolve user by ID, then set session cookie |
+| `loginById(id, options?)` | `Promise<void>` | Resolve user by ID, then set session cookie (requires `resolveUser`) |
 | `attempt(credentials, options?)` | `Promise<boolean>` | Find user, verify password, login if valid |
 | `logout()` | `Promise<void>` | Delete session cookie |
 | `check()` | `Promise<boolean>` | Is the session valid? (fast, cached) |
-| `user()` | `Promise<TUser \| null>` | Get the authenticated user |
+| `user()` | `Promise<TUser \| null>` | Get the authenticated user (from DB with `resolveUser`, or from cookie with `sessionFields`) |
 | `id()` | `Promise<string \| null>` | Get the authenticated user's ID |
 
 #### LoginOptions
@@ -1675,6 +1716,53 @@ redirect(safeRedirect(redirectTo, '/dashboard'));
 
 ---
 
+## Token Refresh (OAuth Access Tokens)
+
+When using `sessionFields` to store OAuth access tokens in the session cookie, refresh them proactively before they expire. Do NOT wait for a 401 — by then the user's request already failed.
+
+### Setup
+
+```ts
+sessionFields: ['email', 'name', 'accessToken', 'refreshToken', 'expiresAt'],
+```
+
+Store `expiresAt` (Unix seconds) at login time: `Math.floor(Date.now() / 1000) + tokens.expires_in`.
+
+### Proactive refresh pattern
+
+```ts
+const REFRESH_BUFFER_SECONDS = 60;
+
+async function ensureFreshToken() {
+  const session = auth();
+  const user = await session.user();
+  if (!user) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  if (user.expiresAt > now + REFRESH_BUFFER_SECONDS) return user; // still fresh
+
+  // Refresh the token
+  const tokens = await refreshAccessToken(user.refreshToken);
+  if (!tokens) { await session.logout(); return null; } // refresh failed
+
+  // Update session cookie with new tokens
+  const updated = { ...user, accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, expiresAt: now + tokens.expiresIn };
+  await session.login(updated);
+  return updated;
+}
+```
+
+Key point: `auth().login()` replaces the session cookie — calling it with updated tokens IS the refresh mechanism.
+
+### Rules
+- Check `expiresAt` **before** making API calls, not after a 401
+- Use a 60-second buffer before expiry to prevent race conditions
+- When refresh fails, `logout()` and redirect to login
+- For refresh token rotation, prefer the new refresh token from the response
+- In high-concurrency environments, use a lock/mutex to prevent multiple simultaneous refreshes
+
+---
+
 ## Multi-Tenant Cross-Domain Authentication
 
 When tenants run on different domains (e.g., `acme.app.com`, `widgets.app.com`), cookies set on the central login domain cannot be read by tenant domains. Use a short-lived, one-time-use database token to transfer authentication across domains.
@@ -1750,6 +1838,7 @@ function validateTenantCallbackUrl(url: string | null): string | null {
 
 ### Tenant auth setup with `attemptUser`
 
+**With database (resolveUser):**
 ```ts
 const auth = createAuth<User>({
   secret: process.env.IDEAL_AUTH_SECRET!,
@@ -1763,6 +1852,27 @@ const auth = createAuth<User>({
     return user;
   },
 });
+```
+
+**Without database (sessionFields) — user info stored in cookie:**
+```ts
+const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  sessionFields: ['email', 'name', 'accessToken'],
+  attemptUser: async (credentials) => {
+    const data = await validateTransferToken(credentials.id, credentials.token);
+    if (!data) return null;
+    // Fetch profile from identity provider using the access token
+    const res = await fetch('https://identity.example.com/api/userinfo', {
+      headers: { Authorization: `Bearer ${data.accessToken}` },
+    });
+    if (!res.ok) return null;
+    const profile = await res.json();
+    return { id: profile.sub, email: profile.email, name: profile.name, accessToken: data.accessToken };
+  },
+});
+// user() returns { id, email, name, accessToken } from cookie — zero API calls after login
 ```
 
 ### Tenant callback endpoint
@@ -1801,9 +1911,62 @@ Tenant callback → validateTransferToken(id, token) → attemptUser → session
 - **No payload encryption needed**: `userId` is not a secret — the real protection is the HMAC'd token, one-time use, and short expiry
 - **API endpoint auth**: If tenants validate via API (not shared DB), protect with API key or mTLS
 
-### Federated logout
+---
 
-Each tenant must clear its own session cookie. Redirect chain: tenant `logout()` → central logout endpoint → OAuth provider logout (if applicable) → redirect back to tenant.
+## Federated Logout
+
+When authenticating through a central identity provider (OAuth, OIDC, or custom login service), logging out requires a redirect chain that clears sessions on every domain.
+
+### Flow
+
+```
+Tenant: auth().logout() → clear local cookie → redirect to central /logout
+Central: auth().logout() → clear central cookie → redirect to OIDC provider logout (if applicable)
+Provider: clear provider session → redirect to post_logout_redirect_uri
+Final: redirect back to tenant origin
+```
+
+### Tenant logout action
+
+```ts
+export async function logoutAction() {
+  const session = auth();
+  const user = await session.user();
+  const idToken = user?.idToken; // needed for OIDC provider logout
+
+  await session.logout();
+
+  const logoutUrl = new URL(`${process.env.CENTRAL_LOGIN_URL}/logout`);
+  logoutUrl.searchParams.set('callbackUrl', process.env.NEXT_PUBLIC_APP_URL!);
+  if (idToken) logoutUrl.searchParams.set('id_token_hint', idToken);
+  redirect(logoutUrl.toString());
+}
+```
+
+### Central logout endpoint
+
+```ts
+// Clear central session, then redirect to OIDC provider (or back to tenant if no provider)
+const session = auth();
+await session.logout();
+
+// With OIDC provider:
+const params = new URLSearchParams({ post_logout_redirect_uri: `${AUTH_URL}/logout/callback` });
+if (idTokenHint) params.set('id_token_hint', idTokenHint);
+redirect(`${OIDC_ISSUER_URL}/connect/logout?${params}`);
+
+// Without OIDC provider:
+redirect(callbackUrl);
+```
+
+### Key rules
+- `auth().logout()` only clears the **current domain's** cookie — cannot clear cookies on other domains
+- Each domain in the chain must be visited to clear its session
+- Validate `callbackUrl` on central logout endpoint (same allowlist as login)
+- Use `id_token_hint` for OIDC provider logout — without it, some providers show a confirmation page
+- For token revocation, call the provider's revocation endpoint before `logout()`
+- If you need instant revocation across all domains, add a server-side `sessions` table
+- Store `idToken` in `sessionFields` if needed for OIDC logout
 
 ---
 

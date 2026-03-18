@@ -44,7 +44,11 @@ Sessions are encrypted using [iron-session](https://github.com/vvo/iron-session)
 - **HMAC-SHA256** for integrity verification
 - A sealed session cannot be read or tampered with without the secret
 
-The session payload contains only `{ uid, iat, exp }` — the user ID, issued-at timestamp, and expiry timestamp (both in seconds). No sensitive data is stored in the cookie.
+The session payload contains `{ uid, iat, exp }` — the user ID, issued-at timestamp, and expiry timestamp (both in seconds). When using `sessionFields`, the payload also includes a `data` field containing the declared user fields (e.g., email, name, role). All fields — including `data` — are protected by iron-session's encryption and HMAC integrity. The cookie cannot be read or tampered with without the secret.
+
+:::caution
+With `sessionFields`, data is snapshotted at login time. If a user's role or permissions change server-side after login, the cookie retains the old values until the session expires or the user re-logs in. For authorization-critical fields (role, permissions, subscription tier), use `resolveUser` instead to fetch fresh data on every request.
+:::
 
 ### Password hashing
 

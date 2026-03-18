@@ -14,6 +14,18 @@ export function createAuth<TUser extends AnyUser = AnyUser>(
     throw new Error('secret must be at least 32 characters');
   }
 
+  if (config.resolveUser && config.sessionFields) {
+    throw new Error('Provide either resolveUser or sessionFields, not both');
+  }
+
+  if (!config.resolveUser && !config.sessionFields) {
+    throw new Error('Provide either resolveUser or sessionFields');
+  }
+
+  if (config.sessionFields && config.sessionFields.filter((f) => f !== 'id').length === 0) {
+    throw new Error('sessionFields must contain at least one field besides id');
+  }
+
   return () =>
     createAuthInstance<TUser>({
       secret: config.secret,
@@ -23,6 +35,7 @@ export function createAuth<TUser extends AnyUser = AnyUser>(
       rememberMaxAge: config.session?.rememberMaxAge ?? SESSION_DEFAULTS.rememberMaxAge,
       cookieOptions: config.session?.cookie ?? {},
       resolveUser: config.resolveUser,
+      sessionFields: config.sessionFields,
       hash: config.hash,
       resolveUserByCredentials: config.resolveUserByCredentials,
       credentialKey: config.credentialKey ?? 'password',

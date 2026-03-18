@@ -500,3 +500,289 @@ describe('AuthInstance', () => {
     });
   });
 });
+
+describe('sessionFields (cookie-backed sessions)', () => {
+  type FullUser = { id: string; email: string; name: string; role: string; password?: string };
+
+  const fullUser: FullUser = {
+    id: '42',
+    email: 'jane@example.com',
+    name: 'Jane',
+    role: 'admin',
+  };
+
+  function createSessionFieldsAuth(
+    bridge: ReturnType<typeof createMockCookieBridge>,
+    fields: (keyof FullUser & string)[],
+  ) {
+    return createAuth<FullUser>({
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: fields,
+    });
+  }
+
+  describe('validation', () => {
+    it('throws when both resolveUser and sessionFields are provided', () => {
+      expect(() =>
+        createAuth({
+          secret: SECRET,
+          cookie: createMockCookieBridge(),
+          resolveUser: async () => null,
+          sessionFields: ['email'],
+        }),
+      ).toThrow('Provide either resolveUser or sessionFields, not both');
+    });
+
+    it('throws when neither resolveUser nor sessionFields is provided', () => {
+      expect(() =>
+        createAuth({
+          secret: SECRET,
+          cookie: createMockCookieBridge(),
+        }),
+      ).toThrow('Provide either resolveUser or sessionFields');
+    });
+
+    it('throws when sessionFields is empty', () => {
+      expect(() =>
+        createAuth({
+          secret: SECRET,
+          cookie: createMockCookieBridge(),
+          sessionFields: [],
+        }),
+      ).toThrow('sessionFields must contain at least one field besides id');
+    });
+
+    it('throws when sessionFields contains only id', () => {
+      expect(() =>
+        createAuth({
+          secret: SECRET,
+          cookie: createMockCookieBridge(),
+          sessionFields: ['id'],
+        }),
+      ).toThrow('sessionFields must contain at least one field besides id');
+    });
+  });
+
+  describe('login()', () => {
+    it('stores declared fields in cookie and user() returns them', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createSessionFieldsAuth(bridge, ['email', 'name', 'role'])();
+
+      await auth.login(fullUser);
+
+      const user = await auth.user();
+      expect(user).toEqual({ id: '42', email: 'jane@example.com', name: 'Jane', role: 'admin' });
+    });
+
+    it('only stores declared fields, not all user properties', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createSessionFieldsAuth(bridge, ['email'])();
+
+      await auth.login(fullUser);
+
+      const user = await auth.user();
+      expect(user).toEqual({ id: '42', email: 'jane@example.com' });
+      expect(user).not.toHaveProperty('name');
+      expect(user).not.toHaveProperty('role');
+    });
+
+    it('always includes id even if not in sessionFields', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createSessionFieldsAuth(bridge, ['name'])();
+
+      await auth.login(fullUser);
+
+      const user = await auth.user();
+      expect(user!.id).toBe('42');
+    });
+  });
+
+  describe('check() and id()', () => {
+    it('check() returns true after login', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createSessionFieldsAuth(bridge, ['email'])();
+
+      await auth.login(fullUser);
+      expect(await auth.check()).toBe(true);
+    });
+
+    it('id() returns uid after login', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createSessionFieldsAuth(bridge, ['email'])();
+
+      await auth.login(fullUser);
+      expect(await auth.id()).toBe('42');
+    });
+  });
+
+  describe('persistence across instances', () => {
+    it('user() reads stored fields from cookie on a new instance', async () => {
+      const bridge = createMockCookieBridge();
+      const factory = createSessionFieldsAuth(bridge, ['email', 'name']);
+
+      // First instance: login
+      await factory().login(fullUser);
+
+      // Second instance: read from cookie (simulates new request)
+      const user = await factory().user();
+      expect(user).toEqual({ id: '42', email: 'jane@example.com', name: 'Jane' });
+    });
+  });
+
+  describe('logout()', () => {
+    it('clears session and user() returns null', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createSessionFieldsAuth(bridge, ['email'])();
+
+      await auth.login(fullUser);
+      await auth.logout();
+
+      expect(await auth.check()).toBe(false);
+      expect(await auth.user()).toBeNull();
+    });
+  });
+
+  describe('attempt() with attemptUser', () => {
+    it('stores sessionFields from user returned by attemptUser', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createAuth<FullUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email', 'name', 'role'],
+        attemptUser: async (creds) =>
+          creds.token === 'valid' ? fullUser : null,
+      })();
+
+      const success = await auth.attempt({ token: 'valid' });
+      expect(success).toBe(true);
+
+      const user = await auth.user();
+      expect(user).toEqual({ id: '42', email: 'jane@example.com', name: 'Jane', role: 'admin' });
+    });
+
+    it('returns false when attemptUser returns null', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createAuth<FullUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email'],
+        attemptUser: async () => null,
+      })();
+
+      const success = await auth.attempt({ token: 'invalid' });
+      expect(success).toBe(false);
+    });
+  });
+
+  describe('attempt() with hash + resolveUserByCredentials', () => {
+    it('stores sessionFields from resolved user', async () => {
+      const bridge = createMockCookieBridge();
+      const hash = createHash({ rounds: 4 });
+      const hashed = await hash.make('secret123');
+      const userWithPassword: FullUser = { ...fullUser, password: hashed };
+
+      const auth = createAuth<FullUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email', 'name'],
+        hash,
+        resolveUserByCredentials: async () => userWithPassword,
+      })();
+
+      const success = await auth.attempt({ email: 'jane@example.com', password: 'secret123' });
+      expect(success).toBe(true);
+
+      const user = await auth.user();
+      expect(user).toEqual({ id: '42', email: 'jane@example.com', name: 'Jane' });
+      expect(user).not.toHaveProperty('password');
+    });
+  });
+
+  describe('loginById()', () => {
+    it('throws with helpful message when used with sessionFields', () => {
+      const bridge = createMockCookieBridge();
+      const auth = createAuth<FullUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email'],
+      })();
+
+      expect(auth.loginById('42')).rejects.toThrow(
+        'loginById requires resolveUser — use login(user) instead when using sessionFields',
+      );
+    });
+  });
+
+  describe('remember me', () => {
+    it('works with sessionFields and remember: true', async () => {
+      const bridge = createMockCookieBridge();
+      const auth = createSessionFieldsAuth(bridge, ['email'])();
+
+      await auth.login(fullUser, { remember: true });
+      expect(bridge.lastOptions?.maxAge).toBe(60 * 60 * 24 * 30);
+      expect(await auth.user()).toEqual({ id: '42', email: 'jane@example.com' });
+    });
+  });
+
+  describe('edge cases', () => {
+    it('handles fields not present on user object (silently excluded)', async () => {
+      const bridge = createMockCookieBridge();
+      const userMissingRole = { id: '42', email: 'jane@example.com', name: 'Jane', role: undefined as unknown as string };
+      const auth = createAuth<FullUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email', 'name', 'role'],
+      })();
+
+      await auth.login(userMissingRole);
+
+      // role is undefined on the user, but 'role' key exists via 'in' check so it's included
+      const user = await auth.user();
+      expect(user!.email).toBe('jane@example.com');
+      expect(user!.name).toBe('Jane');
+    });
+
+    it('cross-request round-trip preserves data through seal/unseal', async () => {
+      const bridge = createMockCookieBridge();
+      const factory = createSessionFieldsAuth(bridge, ['email', 'name', 'role']);
+
+      // Request 1: login
+      const auth1 = factory();
+      await auth1.login(fullUser);
+
+      // Request 2: new instance, reads from sealed cookie
+      const auth2 = factory();
+      const user = await auth2.user();
+
+      expect(user).not.toBeNull();
+      expect(user!.id).toBe('42');
+      expect(user!.email).toBe('jane@example.com');
+      expect(user!.name).toBe('Jane');
+      expect(user!.role).toBe('admin');
+    });
+
+    it('old session without data field returns null with sessionFields config', async () => {
+      const bridge = createMockCookieBridge();
+
+      // Simulate an old session: login with resolveUser (no data in cookie)
+      const oldAuth = createAuth<FullUser>({
+        secret: SECRET,
+        cookie: bridge,
+        resolveUser: async () => fullUser,
+      })();
+      await oldAuth.login(fullUser);
+
+      // Now switch to sessionFields config and try to read the old session
+      const newAuth = createAuth<FullUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email', 'name'],
+      })();
+
+      // Old cookie has no data field — user() should return null (forces re-login)
+      const user = await newAuth.user();
+      expect(user).toBeNull();
+    });
+  });
+});

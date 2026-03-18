@@ -1,0 +1,327 @@
+---
+title: Federated Logout
+description: Log users out across multiple domains and OAuth providers using ideal-auth.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+When your application authenticates through a central identity provider (OAuth, OIDC, or a custom login service), logging out requires more than just clearing the local session cookie. You need to clear sessions on every domain that has one and, optionally, revoke the session at the identity provider itself.
+
+<Aside type="tip">
+  This guide applies to any app that authenticates through an external provider — not just multi-tenant architectures. If your app uses Google, GitHub, or any OIDC provider and you want "log out everywhere" behavior, this is the pattern.
+</Aside>
+
+---
+
+## The problem
+
+`auth().logout()` clears the session cookie on the **current domain only**. It cannot:
+
+- Clear cookies on other domains (browsers don't allow cross-domain cookie deletion)
+- Revoke the session at an OAuth/OIDC provider
+- Notify other applications that the user logged out
+
+Without federated logout, a user who logs out of `tenant-a.com` is still logged into `tenant-b.com` and the identity provider. If they visit `tenant-b.com`, they appear authenticated. If `tenant-b.com` redirects them to the identity provider for re-auth, the provider still has a valid session and silently redirects them back — the user can never actually log out.
+
+---
+
+## Logout flow
+
+The solution is a redirect chain that visits each domain and clears its session:
+
+```
+User clicks "Sign out" on tenant-a.com
+        │
+        ▼
+  1. auth().logout()        ← clears tenant-a.com session cookie
+  2. Redirect to central    ← /logout?callbackUrl=https://tenant-a.com
+        │
+        ▼
+  Central app
+  3. auth().logout()        ← clears central app session cookie
+  4. Redirect to provider   ← OIDC end_session_endpoint (if applicable)
+        │
+        ▼
+  Identity provider
+  5. Clears provider session
+  6. Redirect to post_logout_redirect_uri
+        │
+        ▼
+  7. Redirect back to tenant-a.com (or landing page)
+```
+
+Not every step is required. If you don't use an external OIDC provider, skip steps 4-6. If you only have one domain, `auth().logout()` is sufficient.
+
+---
+
+## Implementation
+
+### Step 1: Tenant logout action
+
+Clear the local session cookie, then redirect to the central app's logout endpoint.
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/actions/logout.ts"
+    'use server';
+
+    import { redirect } from 'next/navigation';
+    import { auth } from '@/lib/auth';
+
+    export async function logoutAction() {
+      const session = auth();
+
+      // If using sessionFields with accessToken, grab it before logout
+      const user = await session.user();
+      const idToken = user?.idToken;
+
+      await session.logout();
+
+      // Redirect to central logout with callback to return here after
+      const logoutUrl = new URL(`${process.env.CENTRAL_LOGIN_URL}/logout`);
+      logoutUrl.searchParams.set('callbackUrl', process.env.NEXT_PUBLIC_APP_URL!);
+
+      // Pass the id_token_hint if available (needed for OIDC provider logout)
+      if (idToken) {
+        logoutUrl.searchParams.set('id_token_hint', idToken);
+      }
+
+      redirect(logoutUrl.toString());
+    }
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/routes/logout.ts"
+    import { Router } from 'express';
+    import { auth } from '../lib/auth';
+
+    const router = Router();
+
+    router.post('/logout', async (req, res) => {
+      const session = auth(req, res);
+      const user = await session.user();
+      const idToken = user?.idToken;
+
+      await session.logout();
+
+      const logoutUrl = new URL(`${process.env.CENTRAL_LOGIN_URL}/logout`);
+      logoutUrl.searchParams.set('callbackUrl', `${req.protocol}://${req.get('host')}`);
+
+      if (idToken) {
+        logoutUrl.searchParams.set('id_token_hint', idToken);
+      }
+
+      res.redirect(logoutUrl.toString());
+    });
+
+    export default router;
+    ```
+  </TabItem>
+  <TabItem label="SvelteKit">
+    ```ts title="src/routes/logout/+page.server.ts"
+    import { redirect } from '@sveltejs/kit';
+    import { auth } from '$lib/server/auth';
+    import { CENTRAL_LOGIN_URL } from '$env/static/private';
+    import type { Actions } from './$types';
+
+    export const actions: Actions = {
+      default: async ({ cookies, url }) => {
+        const session = auth(cookies);
+        const user = await session.user();
+        const idToken = user?.idToken;
+
+        await session.logout();
+
+        const logoutUrl = new URL(`${CENTRAL_LOGIN_URL}/logout`);
+        logoutUrl.searchParams.set('callbackUrl', url.origin);
+
+        if (idToken) {
+          logoutUrl.searchParams.set('id_token_hint', idToken);
+        }
+
+        redirect(303, logoutUrl.toString());
+      },
+    };
+    ```
+  </TabItem>
+</Tabs>
+
+### Step 2: Central app logout endpoint
+
+The central app clears its own session and optionally initiates OIDC provider logout.
+
+<Tabs>
+  <TabItem label="With OIDC provider">
+    ```ts title="Central app: app/api/logout/route.ts"
+    import { auth } from '@/lib/auth';
+    import { cookies } from 'next/headers';
+    import { NextResponse } from 'next/server';
+    import type { NextRequest } from 'next/server';
+
+    export async function GET(request: NextRequest) {
+      const callbackUrl = request.nextUrl.searchParams.get('callbackUrl');
+      const idTokenHint = request.nextUrl.searchParams.get('id_token_hint');
+
+      // Clear the central app's session
+      const session = auth();
+      await session.logout();
+
+      // Store the final callback URL for after the provider redirects back
+      const cookieStore = await cookies();
+      if (callbackUrl) {
+        cookieStore.set('logout_callback', callbackUrl, {
+          httpOnly: true,
+          maxAge: 300, // 5 minutes
+          path: '/',
+        });
+      }
+
+      // Redirect to the OIDC provider's logout endpoint
+      const params = new URLSearchParams({
+        post_logout_redirect_uri: `${process.env.AUTH_URL}/api/logout/callback`,
+      });
+
+      if (idTokenHint) {
+        params.set('id_token_hint', idTokenHint);
+      }
+
+      const providerLogoutUrl = `${process.env.OIDC_ISSUER_URL}/connect/logout?${params}`;
+      return NextResponse.redirect(providerLogoutUrl);
+    }
+    ```
+
+    ```ts title="Central app: app/api/logout/callback/route.ts"
+    import { cookies } from 'next/headers';
+    import { NextResponse } from 'next/server';
+    import type { NextRequest } from 'next/server';
+
+    export async function GET(request: NextRequest) {
+      const cookieStore = await cookies();
+      const callbackUrl = cookieStore.get('logout_callback')?.value
+        ?? process.env.NEXT_PUBLIC_APP_URL!;
+
+      cookieStore.delete('logout_callback');
+
+      return NextResponse.redirect(callbackUrl);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Without OIDC provider">
+    ```ts title="Central app: app/api/logout/route.ts"
+    import { auth } from '@/lib/auth';
+    import { NextResponse } from 'next/server';
+    import type { NextRequest } from 'next/server';
+
+    export async function GET(request: NextRequest) {
+      const callbackUrl = request.nextUrl.searchParams.get('callbackUrl')
+        ?? process.env.NEXT_PUBLIC_APP_URL!;
+
+      // Clear the central app's session
+      const session = auth();
+      await session.logout();
+
+      // Redirect back to the caller
+      return NextResponse.redirect(callbackUrl);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Step 3: Logout button
+
+```tsx title="components/logout-button.tsx"
+'use client';
+
+import { logoutAction } from '@/app/actions/logout';
+
+export function LogoutButton() {
+  return (
+    <form action={logoutAction}>
+      <button type="submit">Sign out</button>
+    </form>
+  );
+}
+```
+
+---
+
+## Storing `idToken` for OIDC logout
+
+Many OIDC providers require an `id_token_hint` parameter when calling the logout endpoint. If you use `sessionFields`, include the ID token:
+
+```ts
+sessionFields: ['email', 'name', 'accessToken', 'refreshToken', 'idToken', 'expiresAt'],
+```
+
+If you use `resolveUser`, store the ID token in your database and retrieve it during logout.
+
+<Aside type="caution">
+  ID tokens can be large JWTs (1KB+). Combined with access and refresh tokens, you may approach the ~4KB cookie limit. Test with your actual tokens. If the cookie is too large, store the ID token in a separate encrypted cookie or a server-side store.
+</Aside>
+
+---
+
+## Revoking tokens server-side
+
+Clearing cookies only prevents the **browser** from sending the tokens. The tokens themselves remain valid until they expire. For high-security applications, revoke them at the provider before logging out:
+
+```ts
+// Before calling auth().logout()
+async function revokeTokens(accessToken: string, refreshToken: string) {
+  // Revoke the access token
+  await fetch(process.env.OAUTH_REVOCATION_URL!, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      token: accessToken,
+      token_type_hint: 'access_token',
+      client_id: process.env.OAUTH_CLIENT_ID!,
+      client_secret: process.env.OAUTH_CLIENT_SECRET!,
+    }),
+  });
+
+  // Revoke the refresh token
+  await fetch(process.env.OAUTH_REVOCATION_URL!, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      token: refreshToken,
+      token_type_hint: 'refresh_token',
+      client_id: process.env.OAUTH_CLIENT_ID!,
+      client_secret: process.env.OAUTH_CLIENT_SECRET!,
+    }),
+  });
+}
+```
+
+<Aside>
+  Not all providers support token revocation. Check your provider's documentation. If revocation is not supported, the tokens will remain valid until their natural expiry — this is why short-lived access tokens (5-15 minutes) are recommended.
+</Aside>
+
+---
+
+## Stateless session limitations
+
+ideal-auth uses stateless encrypted cookies. This means:
+
+- **No server-side session store.** There is no central list of active sessions to invalidate.
+- **Each domain must clear its own cookie.** The redirect chain ensures every domain is visited.
+- **Orphaned sessions.** If a tenant domain is skipped in the logout chain (e.g., the user closes the browser mid-redirect), that session remains valid until it expires.
+
+If you need **instant, guaranteed revocation** across all domains, add a server-side session store:
+
+1. Add a `sessions` table with `session_id` and `revoked_at` columns
+2. Store a `session_id` in the cookie (via `sessionFields`)
+3. On every request, check if the session has been revoked
+4. On logout, mark the session as revoked in the database
+
+See the [Session Invalidation](/ideal-auth/security/session-invalidation/) guide for details.
+
+---
+
+## Security considerations
+
+- **Validate `callbackUrl` on the central logout endpoint.** Apply the same tenant domain allowlist used for login redirects. Without this, an attacker can craft a logout URL that redirects to a malicious site after logout.
+- **Use `id_token_hint` for OIDC logout.** Without it, some providers will show a confirmation page instead of logging out silently.
+- **Logout cookies should be short-lived.** The `logout_callback` cookie used to preserve the return URL should expire quickly (5 minutes) and be `httpOnly`.
+- **POST for tenant logout, GET for redirects.** The initial logout action should be a POST (CSRF-safe via form submission). The redirect chain uses GET because each hop is a browser redirect.

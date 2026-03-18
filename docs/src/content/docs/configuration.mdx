@@ -54,7 +54,8 @@ const auth = createAuth({
 | `secret` | `string` | — | **Required.** Encryption secret, at least 32 characters. Typically `process.env.IDEAL_AUTH_SECRET`. |
 | `cookie` | `CookieBridge` | — | **Required.** Object with `get`, `set`, and `delete` methods for your framework's cookie API. See [Getting Started](/ideal-auth/getting-started/). |
 | `session` | `object` | See below | Session configuration (cookie name, TTL, cookie options). |
-| `resolveUser` | `(id: string) => Promise<TUser \| null>` | — | **Required.** Looks up a user by ID. Called when rehydrating a session from an encrypted cookie. |
+| `resolveUser` | `(id: string) => Promise<TUser \| null>` | — | Looks up a user by ID. Called when rehydrating a session from an encrypted cookie. **Required** unless `sessionFields` is provided. |
+| `sessionFields` | `(keyof TUser & string)[]` | — | Fields from the user object to store in the session cookie. When provided, `user()` returns the stored fields directly — no database call. **Required** unless `resolveUser` is provided. Cannot be used together with `resolveUser`. |
 | `resolveUserByCredentials` | `(credentials: Record<string, any>) => Promise<TUser \| null>` | `undefined` | Looks up a user by credentials (with the password field stripped). Used by `attempt()` in the Laravel-style flow. |
 | `hash` | `HashInstance` | `undefined` | A `createHash()` instance. Required if using `resolveUserByCredentials` with `attempt()`. |
 | `credentialKey` | `string` | `'password'` | The key in the credentials object that holds the plaintext password. `attempt()` strips this key before passing credentials to `resolveUserByCredentials`. |
@@ -110,6 +111,63 @@ const auth = createAuth({
 });
 ```
 
+### Session modes
+
+`createAuth` supports two mutually exclusive modes for how `user()` resolves the authenticated user. Provide exactly one of `resolveUser` or `sessionFields`.
+
+**Database-backed (`resolveUser`):** The session cookie stores only the user ID. Every `user()` call invokes `resolveUser(id)` to fetch the full user from your database. Best when you need real-time data (e.g., role changes take effect immediately).
+
+```ts
+const auth = createAuth({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  hash,
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+
+// user() hits the database on every call
+const user = await auth().user();
+```
+
+**Cookie-backed (`sessionFields`):** The session cookie stores the user ID plus the declared fields. `user()` reads directly from the cookie — zero external calls. Best for performance, stateless architectures, or apps without a database.
+
+```ts
+const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: cookieBridge,
+  sessionFields: ['email', 'name', 'role'],
+  hash,
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+
+// user() reads from the cookie — no database call
+const user = await auth().user(); // { id, email, name, role }
+```
+
+:::note
+The `id` field is always stored in the session cookie regardless of mode. You do not need to include it in `sessionFields`. If you include it, it will be silently ignored.
+:::
+
+:::caution
+`loginById()` is not supported with `sessionFields` and will throw an error. It requires `resolveUser` to look up the full user object so the declared fields can be populated. Use `login(user)` instead — pass the full user object directly.
+:::
+
+:::caution
+With `sessionFields`, the cookie data is a snapshot from login time. If the user updates their profile, the cookie still has the old values until they re-login. To refresh, call `auth().login(updatedUser)` after the update.
+:::
+
+| | `resolveUser` | `sessionFields` |
+|---|---|---|
+| `user()` reads from | Database | Cookie |
+| DB calls after login | Every request | Zero |
+| Data freshness | Always current | Snapshot at login |
+| `loginById()` | Supported | Not supported (throws) |
+| Cookie size | Minimal (~100 bytes) | Depends on stored fields (~4KB limit) |
+| Best for | Real-time role/permission changes | Performance, stateless, no-DB tenants |
+
 ---
 
 ## Session config
@@ -144,13 +202,20 @@ The encrypted session cookie contains a `SessionPayload`:
 
 ```ts
 interface SessionPayload {
-  uid: string;  // User ID (always stored as string)
-  iat: number;  // Issued-at timestamp (Unix seconds)
-  exp: number;  // Expiration timestamp (Unix seconds)
+  uid: string;                       // User ID (always stored as string)
+  iat: number;                       // Issued-at timestamp (Unix seconds)
+  exp: number;                       // Expiration timestamp (Unix seconds)
+  data?: Record<string, unknown>;    // Additional fields (when using sessionFields)
 }
 ```
 
-The payload is encrypted using iron-session (AES-256-GCM + HMAC-SHA-256). It cannot be read or tampered with on the client.
+The `data` field is populated when `sessionFields` is configured. It contains only the fields you declared — nothing else from the user object leaks into the cookie.
+
+The payload is encrypted using iron-session (AES-256-CBC + HMAC-SHA-256). It cannot be read or tampered with on the client.
+
+:::caution
+Session cookies have a **~4KB size limit** (including encryption overhead). Basic fields like `id`, `email`, `name`, and `role` fit easily. Avoid storing large values like JWTs with many claims. If you need to store an access token, test that the total cookie size stays under 4KB.
+:::
 
 ---
 
@@ -352,71 +417,159 @@ import {
 
 ---
 
-## Full configuration example
+## Full configuration examples
 
-```ts title="lib/auth.ts"
-import {
-  createAuth,
-  createHash,
-  createTokenVerifier,
-  createTOTP,
-  createRateLimiter,
-} from 'ideal-auth';
-import { cookies } from 'next/headers';
-import { db } from './db';
+<Tabs>
+  <TabItem label="Database-backed">
+    ```ts title="lib/auth.ts"
+    import {
+      createAuth,
+      createHash,
+      createTokenVerifier,
+      createTOTP,
+      createRateLimiter,
+    } from 'ideal-auth';
+    import { cookies } from 'next/headers';
+    import { db } from './db';
 
-// Cookie bridge (Next.js App Router)
-const cookieBridge = {
-  async get(name: string) {
-    return (await cookies()).get(name)?.value;
-  },
-  async set(name: string, value: string, options: any) {
-    (await cookies()).set(name, value, options);
-  },
-  async delete(name: string) {
-    (await cookies()).delete(name);
-  },
-};
+    // Cookie bridge (Next.js App Router)
+    const cookieBridge = {
+      async get(name: string) {
+        return (await cookies()).get(name)?.value;
+      },
+      async set(name: string, value: string, options: any) {
+        (await cookies()).set(name, value, options);
+      },
+      async delete(name: string) {
+        (await cookies()).delete(name);
+      },
+    };
 
-// Password hashing
-export const hash = createHash({ rounds: 12 });
+    // Password hashing
+    export const hash = createHash({ rounds: 12 });
 
-// Session auth
-export const auth = createAuth({
-  secret: process.env.IDEAL_AUTH_SECRET!,
-  cookie: cookieBridge,
-  session: {
-    cookieName: 'ideal_session',
-    maxAge: 60 * 60 * 24 * 7,       // 7 days
-    rememberMaxAge: 60 * 60 * 24 * 30, // 30 days
-    cookie: {
-      secure: true,
-      sameSite: 'lax',
-      path: '/',
-    },
-  },
-  resolveUser: (id) => db.user.findUnique({ where: { id } }),
-  resolveUserByCredentials: (creds) =>
-    db.user.findUnique({ where: { email: creds.email } }),
-  hash,
-});
+    // Session auth — user() fetches from database on every request
+    export const auth = createAuth({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      cookie: cookieBridge,
+      resolveUser: (id) => db.user.findUnique({ where: { id } }),
+      resolveUserByCredentials: (creds) =>
+        db.user.findUnique({ where: { email: creds.email } }),
+      hash,
+    });
 
-// Token verifier (password reset, email verification)
-export const tokenVerifier = createTokenVerifier({
-  secret: process.env.IDEAL_AUTH_SECRET!,
-  expiryMs: 1000 * 60 * 60, // 1 hour
-});
+    // Token verifier (password reset, email verification)
+    export const tokenVerifier = createTokenVerifier({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      expiryMs: 1000 * 60 * 60, // 1 hour
+    });
 
-// TOTP for 2FA
-export const totp = createTOTP({
-  digits: 6,
-  period: 30,
-  window: 1,
-});
+    // TOTP for 2FA
+    export const totp = createTOTP();
 
-// Rate limiter for login
-export const loginLimiter = createRateLimiter({
-  maxAttempts: 5,
-  windowMs: 15 * 60 * 1000, // 15 minutes
-});
-```
+    // Rate limiter for login
+    export const loginLimiter = createRateLimiter({
+      maxAttempts: 5,
+      windowMs: 15 * 60 * 1000, // 15 minutes
+    });
+    ```
+  </TabItem>
+  <TabItem label="Cookie-backed">
+    ```ts title="lib/auth.ts"
+    import {
+      createAuth,
+      createHash,
+      createRateLimiter,
+    } from 'ideal-auth';
+    import { cookies } from 'next/headers';
+    import { db } from './db';
+
+    type User = {
+      id: string;
+      email: string;
+      name: string;
+      role: string;
+      password: string;
+    };
+
+    const cookieBridge = {
+      async get(name: string) {
+        return (await cookies()).get(name)?.value;
+      },
+      async set(name: string, value: string, options: any) {
+        (await cookies()).set(name, value, options);
+      },
+      async delete(name: string) {
+        (await cookies()).delete(name);
+      },
+    };
+
+    export const hash = createHash({ rounds: 12 });
+
+    // Session auth — user() reads from cookie, zero database calls after login
+    export const auth = createAuth<User>({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      cookie: cookieBridge,
+      sessionFields: ['email', 'name', 'role'],
+      resolveUserByCredentials: (creds) =>
+        db.user.findUnique({ where: { email: creds.email } }),
+      hash,
+    });
+
+    export const loginLimiter = createRateLimiter({
+      maxAttempts: 5,
+      windowMs: 15 * 60 * 1000,
+    });
+    ```
+  </TabItem>
+  <TabItem label="Cookie-backed (no database)">
+    ```ts title="lib/auth.ts"
+    import { createAuth } from 'ideal-auth';
+
+    type User = {
+      id: string;
+      email: string;
+      name: string;
+      accessToken: string;
+    };
+
+    const cookieBridge = {
+      async get(name: string) {
+        return (await cookies()).get(name)?.value;
+      },
+      async set(name: string, value: string, options: any) {
+        (await cookies()).set(name, value, options);
+      },
+      async delete(name: string) {
+        (await cookies()).delete(name);
+      },
+    };
+
+    // No database — user info comes from OIDC and is stored in the cookie
+    export const auth = createAuth<User>({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      cookie: cookieBridge,
+      sessionFields: ['email', 'name', 'accessToken'],
+      attemptUser: async (credentials) => {
+        // Validate the cross-domain transfer token
+        const data = await validateTransferToken(credentials.id, credentials.token);
+        if (!data) return null;
+
+        // Fetch user profile from identity provider
+        const res = await fetch('https://identity.example.com/api/userinfo', {
+          headers: { Authorization: `Bearer ${data.accessToken}` },
+        });
+        if (!res.ok) return null;
+        const profile = await res.json();
+
+        return {
+          id: profile.sub,
+          email: profile.email,
+          name: profile.name,
+          accessToken: data.accessToken,
+        };
+      },
+    });
+    ```
+  </TabItem>
+</Tabs>

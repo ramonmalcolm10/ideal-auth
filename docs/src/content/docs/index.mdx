@@ -30,7 +30,7 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
     No database adapters or ORM lock-in. You provide `resolveUser` and `resolveUserByCredentials` — use any database, any schema.
   </Card>
   <Card title="Encrypted sessions" icon="approve-check">
-    Session payloads are encrypted with AES-256-GCM and authenticated with HMAC via iron-session. No plaintext tokens, no JWTs.
+    Session payloads are encrypted with AES-256-CBC and authenticated with HMAC via iron-session. No plaintext tokens, no JWTs.
   </Card>
   <Card title="TOTP 2FA with recovery codes" icon="setting">
     RFC 6238 compliant one-time passwords with configurable digits, period, and window. Generate hashed recovery codes out of the box.
