@@ -1,6 +1,6 @@
 ---
 name: ideal-auth
-description: Auth primitives for the JS ecosystem. Covers login, logout, session, register, signup, sign in, sign out, password, 2FA, two-factor, TOTP, MFA, ideal-auth, cookie bridge, middleware, route protection, rate limit, rate limiting, password reset, forgot password, email verification, remember me, recovery code, CSRF, encrypt, decrypt, hash, bcrypt, token, secret, session cookie, multi-tenant, cross-domain, tenant, transfer token, federated logout, OAuth redirect, central login, login session, attemptUser, sessionFields, cookie-backed session, resolveUser, token refresh, refresh token, access token, OIDC.
+description: Auth primitives for the JS ecosystem. Covers login, logout, session, register, signup, sign in, sign out, password, 2FA, two-factor, TOTP, MFA, ideal-auth, cookie bridge, middleware, route protection, rate limit, rate limiting, password reset, forgot password, email verification, remember me, recovery code, CSRF, encrypt, decrypt, hash, bcrypt, token, secret, session cookie, multi-tenant, cross-domain, tenant, transfer token, federated logout, OAuth redirect, central login, login session, attemptUser, sessionFields, cookie-backed session, resolveUser, token refresh, refresh token, access token, OIDC, passkey, passkeys, WebAuthn, passwordless, biometric, fingerprint.
 ---
 
 You are an expert on `ideal-auth`, the auth primitives library for the JS ecosystem. You have complete knowledge of its API, patterns, security model, and framework integrations. Use this knowledge to help users implement authentication correctly.
@@ -1619,6 +1619,53 @@ await auth().login(user);
 // Persistent (30 days)
 await auth().login(user, { remember: true });
 ```
+
+---
+
+## Passkeys (WebAuthn)
+
+Passkeys use public-key cryptography for passwordless authentication. ideal-auth handles the session after verification — the WebAuthn protocol is handled by `@simplewebauthn/server` and `@simplewebauthn/browser`.
+
+No `hash` or `bcryptjs` needed — there are no passwords.
+
+### Flow
+
+```
+Registration: browser creates key pair → store public key in DB
+Authentication: server sends challenge → browser signs it → server verifies → auth().login(user)
+```
+
+### After WebAuthn verification, create session with ideal-auth
+
+```ts
+import { verifyAuthenticationResponse } from '@simplewebauthn/server';
+import { auth } from './auth';
+
+const verification = await verifyAuthenticationResponse({
+  response: body,
+  expectedChallenge,
+  expectedOrigin: origin,
+  expectedRPID: rpID,
+  credential: { id: passkey.id, publicKey: Buffer.from(passkey.publicKey, 'base64url'), counter: passkey.counter },
+});
+
+if (verification.verified) {
+  // Update signature counter (replay protection)
+  await db.passkey.update({ where: { id: passkey.id }, data: { counter: Number(verification.authenticationInfo.newCounter) } });
+
+  const user = await db.user.findUnique({ where: { id: passkey.userId } });
+  await auth().login(user); // session created — done
+}
+```
+
+### Key points
+- Install: `bun add @simplewebauthn/server @simplewebauthn/browser`
+- Store challenges in httpOnly cookies (5-min expiry), not client-side
+- Always update the signature counter after authentication
+- Set `rpID` to root domain (e.g., `example.com`) — works across subdomains
+- `userVerification: 'preferred'` for most apps, `'required'` for high-security
+- Passkeys with user verification can replace 2FA (biometric/PIN is the second factor)
+- Rate limit the options and verify endpoints
 
 ---
 

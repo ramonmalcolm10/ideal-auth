@@ -50,13 +50,13 @@ The `secret` must be at least **32 characters**. `createAuth` throws immediately
 | `session.maxAge` | `number` (seconds) | No | `604800` (7 days) |
 | `session.rememberMaxAge` | `number` (seconds) | No | `2592000` (30 days) |
 | `session.cookie` | `Partial<ConfigurableCookieOptions>` | No | `secure` in production, `sameSite: 'lax'`, `path: '/'` |
-| `resolveUser` | `(id: string) => Promise<TUser \| null>` | Yes (unless `sessionFields` is provided) | — |
+| `resolveUser` | `(id: string) => Promise<TUser \| null \| undefined>` | Yes (unless `sessionFields` is provided) | — |
 | `sessionFields` | `(keyof TUser & string)[]` | Yes (unless `resolveUser` is provided) | — |
-| `resolveUserByCredentials` | `(credentials: Record<string, unknown>) => Promise<TUser \| null>` | No | — |
+| `resolveUserByCredentials` | `(credentials: Record<string, unknown>) => Promise<TUser \| null \| undefined>` | No | — |
 | `hash` | [`HashInstance`](/ideal-auth/api/create-hash/) | No | — |
 | `credentialKey` | `string` | No | `'password'` |
 | `passwordField` | `string` | No | `'password'` |
-| `attemptUser` | `(credentials: Record<string, unknown>) => Promise<TUser \| null>` | No | — |
+| `attemptUser` | `(credentials: Record<string, unknown>) => Promise<TUser \| null \| undefined>` | No | — |
 
 ### secret
 

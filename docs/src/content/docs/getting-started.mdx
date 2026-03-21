@@ -4,6 +4,7 @@ description: Install ideal-auth and set up your first auth flow in minutes.
 ---
 
 import { Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+import SecretGenerator from '../../components/SecretGenerator.astro';
 
 ## Installation
 
@@ -36,10 +37,15 @@ import { Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
 1. ### Generate a secret
 
-   ideal-auth requires a secret of at least 32 characters for encrypting sessions and signing tokens. Generate one with the built-in CLI:
+   ideal-auth requires a secret of at least 32 characters for encrypting sessions and signing tokens. Generate one here or via the CLI:
+
+   <SecretGenerator />
+
+   Or use the CLI:
 
    ```bash
-   bunx ideal-auth secret
+   bunx ideal-auth secret          # session secret
+   bunx ideal-auth encryption-key  # for encrypt()/decrypt() — optional
    ```
 
    Add the output to your environment variables:

@@ -17,15 +17,15 @@ interface AuthInstanceDeps<TUser extends AnyUser> {
   maxAge: number;
   rememberMaxAge: number;
   cookieOptions: ConfigurableCookieOptions;
-  resolveUser?: (id: string) => Promise<TUser | null>;
+  resolveUser?: (id: string) => Promise<TUser | null | undefined>;
   sessionFields?: (keyof TUser & string)[];
   hash?: HashInstance;
   resolveUserByCredentials?: (
     credentials: Record<string, any>,
-  ) => Promise<TUser | null>;
+  ) => Promise<TUser | null | undefined>;
   credentialKey: string;
   passwordField: string;
-  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null>;
+  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
 }
 
 export function createAuthInstance<TUser extends AnyUser>(
@@ -156,7 +156,7 @@ export function createAuthInstance<TUser extends AnyUser>(
 
       // Database-backed: resolve user via callback
       if (deps.resolveUser) {
-        cachedUser = await deps.resolveUser(session.uid);
+        cachedUser = (await deps.resolveUser(session.uid)) ?? null;
         return cachedUser;
       }
 
