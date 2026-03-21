@@ -34,7 +34,7 @@ export interface LoginOptions {
   remember?: boolean;
 }
 
-export interface AuthConfig<TUser extends AnyUser = AnyUser> {
+interface AuthConfigBase<TUser extends AnyUser> {
   secret: string;
   cookie: CookieBridge;
   session?: {
@@ -43,42 +43,52 @@ export interface AuthConfig<TUser extends AnyUser = AnyUser> {
     rememberMaxAge?: number;
     cookie?: Partial<ConfigurableCookieOptions>;
   };
-  resolveUser?: (id: string) => Promise<TUser | null>;
-
-  /**
-   * Fields from the user object to store in the session cookie.
-   * When provided, `resolveUser` is not needed — `user()` returns
-   * the stored fields directly from the cookie.
-   *
-   * The `id` field is always stored. List only additional fields.
-   * Keep the total small — session cookies have a ~4KB size limit.
-   *
-   * Cannot be used together with `resolveUser`.
-   *
-   * **Staleness:** Data is snapshotted at login time. If a user's role
-   * or permissions change server-side, the cookie retains the old values
-   * until the user re-logs in. For authorization-critical fields (role,
-   * permissions, subscription tier), prefer `resolveUser` to get fresh
-   * data on every request.
-   *
-   * **ID type:** `user()` always returns `id` as a `string` on subsequent
-   * requests (read from cookie), even if the original `TUser.id` was a number.
-   */
-  sessionFields?: (keyof TUser & string)[];
 
   // Laravel-style: provide hash + resolveUserByCredentials and attempt()
   // automatically strips "password", looks up the user, and verifies the hash.
   hash?: HashInstance;
   resolveUserByCredentials?: (
     credentials: Record<string, any>,
-  ) => Promise<TUser | null>;
+  ) => Promise<TUser | null | undefined>;
   credentialKey?: string; // key in credentials holding the plaintext password (default: 'password')
   passwordField?: string; // field on user holding the hash (default: 'password')
 
   // Escape hatch: full control over lookup + verification.
   // If provided, takes precedence over the Laravel-style config above.
-  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null>;
+  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
 }
+
+/** Database-backed: `user()` calls `resolveUser(id)` on every request. */
+interface AuthConfigWithResolveUser<TUser extends AnyUser> extends AuthConfigBase<TUser> {
+  resolveUser: (id: string) => Promise<TUser | null | undefined>;
+  /** Cannot use `sessionFields` together with `resolveUser`. */
+  sessionFields?: never;
+}
+
+/**
+ * Cookie-backed: `user()` reads declared fields from the session cookie.
+ *
+ * The `id` field is always stored. List only additional fields.
+ * Keep the total small — session cookies have a ~4KB size limit.
+ *
+ * **Staleness:** Data is snapshotted at login time. If a user's role
+ * or permissions change server-side, the cookie retains the old values
+ * until the user re-logs in. For authorization-critical fields (role,
+ * permissions, subscription tier), prefer `resolveUser` to get fresh
+ * data on every request.
+ *
+ * **ID type:** `user()` always returns `id` as a `string` on subsequent
+ * requests (read from cookie), even if the original `TUser.id` was a number.
+ */
+interface AuthConfigWithSessionFields<TUser extends AnyUser> extends AuthConfigBase<TUser> {
+  /** Cannot use `resolveUser` together with `sessionFields`. */
+  resolveUser?: never;
+  sessionFields: (keyof TUser & string)[];
+}
+
+export type AuthConfig<TUser extends AnyUser = AnyUser> =
+  | AuthConfigWithResolveUser<TUser>
+  | AuthConfigWithSessionFields<TUser>;
 
 export interface HashConfig {
   rounds?: number;

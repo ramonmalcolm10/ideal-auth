@@ -96,12 +96,13 @@ Returns a function `auth()` that creates an `AuthInstance` on each call.
 | --- | --- | --- | --- |
 | `secret` | `string` | Yes | — |
 | `cookie` | `CookieBridge` | Yes | — |
-| `resolveUser` | `(id: string) => Promise<User \| null>` | Yes | — |
+| `resolveUser` | `(id: string) => Promise<User \| null \| undefined>` | Yes (unless `sessionFields` is provided) | — |
+| `sessionFields` | `(keyof User & string)[]` | Yes (unless `resolveUser` is provided) | — |
 | `hash` | `HashInstance` | No | — |
-| `resolveUserByCredentials` | `(creds: Record<string, any>) => Promise<User \| null>` | No | — |
+| `resolveUserByCredentials` | `(creds: Record<string, any>) => Promise<User \| null \| undefined>` | No | — |
 | `credentialKey` | `string` | No | `'password'` |
 | `passwordField` | `string` | No | `'password'` |
-| `attemptUser` | `(creds: Record<string, any>) => Promise<User \| null>` | No | — |
+| `attemptUser` | `(creds: Record<string, any>) => Promise<User \| null \| undefined>` | No | — |
 | `session.cookieName` | `string` | No | `'ideal_session'` |
 | `session.maxAge` | `number` (seconds) | No | `604800` (7 days) |
 | `session.rememberMaxAge` | `number` (seconds) | No | `2592000` (30 days) |
