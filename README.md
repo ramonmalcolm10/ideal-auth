@@ -12,17 +12,19 @@ Provide a cookie bridge (3 functions) once during setup, and `auth().login(user)
 bun add ideal-auth
 ```
 
-## Generate Secret
+## Generate Secrets
 
 ```bash
+# Session secret (required — used by createAuth)
 bunx ideal-auth secret
+# IDEAL_AUTH_SECRET=aLThikMgJKMBB5WZLE-lCaOQUdgPWU8BHRv99bkYaVY
+
+# Encryption key (optional — used by encrypt/decrypt for data at rest)
+bunx ideal-auth encryption-key
+# ENCRYPTION_KEY=9546dd9fa461ce15f0aacd6e1b461b52
 ```
 
-```
-IDEAL_AUTH_SECRET=aLThikMgJKMBB5WZLE-lCaOQUdgPWU8BHRv99bkYaVY
-```
-
-Copy the output into your `.env` file. The secret must be at least 32 characters.
+Copy the output into your `.env` file. `IDEAL_AUTH_SECRET` must be at least 32 characters. `ENCRYPTION_KEY` is only needed if you use `encrypt()`/`decrypt()` (e.g., encrypting TOTP secrets or access tokens at rest).
 
 ## Quick Start
 

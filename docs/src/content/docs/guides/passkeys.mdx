@@ -1,0 +1,755 @@
+---
+title: Passkeys (WebAuthn)
+description: Passwordless authentication with passkeys using ideal-auth and SimpleWebAuthn.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Passkeys use public-key cryptography to authenticate users without passwords. The browser creates a key pair during registration — the private key stays on the device (or synced via iCloud/Google), and the public key is stored in your database. During login, the server sends a challenge, the browser signs it with the private key, and the server verifies the signature with the stored public key.
+
+ideal-auth handles the session after authentication. The WebAuthn protocol (challenge generation, credential storage, verification) is handled by [@simplewebauthn/server](https://simplewebauthn.dev/) and [@simplewebauthn/browser](https://simplewebauthn.dev/).
+
+<Aside type="tip">
+  No `hash` or `bcryptjs` is needed for passkey authentication — there are no passwords to hash. Use `login(user)` directly after WebAuthn verification.
+</Aside>
+
+---
+
+## Installation
+
+```bash
+bun add ideal-auth @simplewebauthn/server @simplewebauthn/browser
+```
+
+---
+
+## Database schema
+
+Store passkey credentials alongside your users. Each user can have multiple passkeys (e.g., phone + laptop + security key).
+
+<Tabs>
+  <TabItem label="SQL">
+    ```sql
+    CREATE TABLE passkeys (
+      id             TEXT PRIMARY KEY,          -- credential ID (base64url)
+      user_id        TEXT NOT NULL REFERENCES users(id),
+      public_key     BYTEA NOT NULL,            -- public key bytes
+      counter        BIGINT NOT NULL DEFAULT 0, -- signature counter (replay protection)
+      device_type    TEXT,                       -- 'singleDevice' or 'multiDevice'
+      backed_up      BOOLEAN NOT NULL DEFAULT FALSE,
+      transports     TEXT[],                     -- e.g., ['usb', 'ble', 'nfc', 'internal']
+      created_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX idx_passkeys_user_id ON passkeys (user_id);
+    ```
+  </TabItem>
+  <TabItem label="Drizzle">
+    ```ts title="db/schema.ts"
+    import { pgTable, text, bigint, boolean, timestamp } from 'drizzle-orm/pg-core';
+
+    export const passkeys = pgTable('passkeys', {
+      id: text('id').primaryKey(),
+      userId: text('user_id').notNull().references(() => users.id),
+      publicKey: text('public_key').notNull(),       // base64url-encoded
+      counter: bigint('counter', { mode: 'number' }).notNull().default(0),
+      deviceType: text('device_type'),
+      backedUp: boolean('backed_up').notNull().default(false),
+      transports: text('transports'),                 // JSON string array
+      createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    });
+    ```
+  </TabItem>
+  <TabItem label="Prisma">
+    ```prisma title="prisma/schema.prisma"
+    model Passkey {
+      id         String   @id
+      userId     String   @map("user_id")
+      publicKey  Bytes    @map("public_key")
+      counter    BigInt   @default(0)
+      deviceType String?  @map("device_type")
+      backedUp   Boolean  @default(false) @map("backed_up")
+      transports String[]
+      createdAt  DateTime @default(now()) @map("created_at")
+
+      user User @relation(fields: [userId], references: [id])
+
+      @@map("passkeys")
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Auth setup
+
+Passkey authentication doesn't need `hash` or `resolveUserByCredentials`. Use `resolveUser` or `sessionFields` depending on whether you have a database.
+
+<Tabs>
+  <TabItem label="With database (resolveUser)">
+    ```ts title="lib/auth.ts"
+    import { createAuth } from 'ideal-auth';
+
+    type User = { id: string; email: string; name: string };
+
+    export const auth = createAuth<User>({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      cookie: createCookieBridge(),
+      resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+    });
+    ```
+  </TabItem>
+  <TabItem label="Without database (sessionFields)">
+    ```ts title="lib/auth.ts"
+    import { createAuth } from 'ideal-auth';
+
+    type User = { id: string; email: string; name: string };
+
+    export const auth = createAuth<User>({
+      secret: process.env.IDEAL_AUTH_SECRET!,
+      cookie: createCookieBridge(),
+      sessionFields: ['email', 'name'],
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Relying party config
+
+Create a shared configuration for the WebAuthn relying party (your application):
+
+```ts title="lib/webauthn.ts"
+import type {
+  GenerateRegistrationOptionsOpts,
+  GenerateAuthenticationOptionsOpts,
+} from '@simplewebauthn/server';
+
+export const rpName = 'My App';
+export const rpID = process.env.WEBAUTHN_RP_ID!;           // e.g., 'example.com'
+export const origin = process.env.WEBAUTHN_ORIGIN!;         // e.g., 'https://example.com'
+```
+
+```bash title=".env"
+WEBAUTHN_RP_ID="example.com"
+WEBAUTHN_ORIGIN="https://example.com"
+```
+
+<Aside type="caution">
+  `rpID` must match the domain where the user registers their passkey. In development, use `localhost`. Passkeys registered on one domain cannot be used on another.
+</Aside>
+
+---
+
+## Registration
+
+Registration is a two-step process: generate options (server), create credential (browser), verify and store (server).
+
+### Step 1: Generate registration options
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/api/auth/passkey/register/options/route.ts"
+    import { generateRegistrationOptions } from '@simplewebauthn/server';
+    import { auth } from '@/lib/auth';
+    import { rpName, rpID } from '@/lib/webauthn';
+    import { db } from '@/lib/db';
+    import { NextResponse } from 'next/server';
+
+    export async function POST() {
+      const session = auth();
+      const user = await session.user();
+
+      if (!user) {
+        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+      }
+
+      // Get existing passkeys for this user (to exclude during registration)
+      const existingPasskeys = await db.passkey.findMany({
+        where: { userId: user.id },
+      });
+
+      const options = await generateRegistrationOptions({
+        rpName,
+        rpID,
+        userName: user.email,
+        userDisplayName: user.name,
+        excludeCredentials: existingPasskeys.map((pk) => ({
+          id: pk.id,
+          transports: pk.transports,
+        })),
+        authenticatorSelection: {
+          residentKey: 'preferred',
+          userVerification: 'preferred',
+        },
+      });
+
+      // Store the challenge for verification (short-lived)
+      // Use a cookie, session store, or cache — must be available in the verify step
+      const cookieStore = await (await import('next/headers')).cookies();
+      cookieStore.set('webauthn_challenge', options.challenge, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 300, // 5 minutes
+        path: '/',
+      });
+
+      return NextResponse.json(options);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/routes/passkey.ts"
+    import { generateRegistrationOptions } from '@simplewebauthn/server';
+    import { auth } from '../lib/auth';
+    import { rpName, rpID } from '../lib/webauthn';
+    import { db } from '../lib/db';
+    import { Router } from 'express';
+
+    const router = Router();
+
+    router.post('/passkey/register/options', async (req, res) => {
+      const session = auth(req, res);
+      const user = await session.user();
+
+      if (!user) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const existingPasskeys = await db.passkey.findMany({
+        where: { userId: user.id },
+      });
+
+      const options = await generateRegistrationOptions({
+        rpName,
+        rpID,
+        userName: user.email,
+        userDisplayName: user.name,
+        excludeCredentials: existingPasskeys.map((pk) => ({
+          id: pk.id,
+          transports: pk.transports,
+        })),
+        authenticatorSelection: {
+          residentKey: 'preferred',
+          userVerification: 'preferred',
+        },
+      });
+
+      // Store challenge in session or cookie
+      req.session.webauthnChallenge = options.challenge;
+
+      res.json(options);
+    });
+
+    export default router;
+    ```
+  </TabItem>
+</Tabs>
+
+### Step 2: Create credential (browser)
+
+```ts title="lib/passkey-client.ts"
+import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
+
+export async function registerPasskey() {
+  // 1. Get options from server
+  const optionsRes = await fetch('/api/auth/passkey/register/options', {
+    method: 'POST',
+  });
+  const options = await optionsRes.json();
+
+  // 2. Browser creates the credential (triggers biometric/PIN prompt)
+  const credential = await startRegistration({ optionsJSON: options });
+
+  // 3. Send credential to server for verification
+  const verifyRes = await fetch('/api/auth/passkey/register/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(credential),
+  });
+
+  return verifyRes.json();
+}
+```
+
+### Step 3: Verify and store credential
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/api/auth/passkey/register/verify/route.ts"
+    import { verifyRegistrationResponse } from '@simplewebauthn/server';
+    import { auth } from '@/lib/auth';
+    import { rpID, origin } from '@/lib/webauthn';
+    import { db } from '@/lib/db';
+    import { cookies } from 'next/headers';
+    import { NextResponse } from 'next/server';
+
+    export async function POST(request: Request) {
+      const session = auth();
+      const user = await session.user();
+
+      if (!user) {
+        return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+      }
+
+      const body = await request.json();
+      const cookieStore = await cookies();
+      const expectedChallenge = cookieStore.get('webauthn_challenge')?.value;
+
+      if (!expectedChallenge) {
+        return NextResponse.json({ error: 'Challenge expired' }, { status: 400 });
+      }
+
+      const verification = await verifyRegistrationResponse({
+        response: body,
+        expectedChallenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+      });
+
+      if (!verification.verified || !verification.registrationInfo) {
+        return NextResponse.json({ error: 'Verification failed' }, { status: 400 });
+      }
+
+      const { credential, credentialDeviceType, credentialBackedUp } =
+        verification.registrationInfo;
+
+      // Store the passkey
+      await db.passkey.create({
+        data: {
+          id: credential.id,
+          userId: user.id,
+          publicKey: Buffer.from(credential.publicKey).toString('base64url'),
+          counter: Number(credential.counter),
+          deviceType: credentialDeviceType,
+          backedUp: credentialBackedUp,
+          transports: body.response.transports ?? [],
+        },
+      });
+
+      // Clean up challenge
+      cookieStore.delete('webauthn_challenge');
+
+      return NextResponse.json({ success: true });
+    }
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/routes/passkey.ts (continued)"
+    import { verifyRegistrationResponse } from '@simplewebauthn/server';
+    import { rpID, origin } from '../lib/webauthn';
+
+    router.post('/passkey/register/verify', async (req, res) => {
+      const session = auth(req, res);
+      const user = await session.user();
+
+      if (!user) {
+        return res.status(401).json({ error: 'Not authenticated' });
+      }
+
+      const expectedChallenge = req.session.webauthnChallenge;
+      if (!expectedChallenge) {
+        return res.status(400).json({ error: 'Challenge expired' });
+      }
+
+      const verification = await verifyRegistrationResponse({
+        response: req.body,
+        expectedChallenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+      });
+
+      if (!verification.verified || !verification.registrationInfo) {
+        return res.status(400).json({ error: 'Verification failed' });
+      }
+
+      const { credential, credentialDeviceType, credentialBackedUp } =
+        verification.registrationInfo;
+
+      await db.passkey.create({
+        data: {
+          id: credential.id,
+          userId: user.id,
+          publicKey: Buffer.from(credential.publicKey).toString('base64url'),
+          counter: Number(credential.counter),
+          deviceType: credentialDeviceType,
+          backedUp: credentialBackedUp,
+          transports: req.body.response.transports ?? [],
+        },
+      });
+
+      delete req.session.webauthnChallenge;
+
+      res.json({ success: true });
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Authentication
+
+Authentication is also two steps: generate options (server), get assertion (browser), verify and login (server).
+
+### Step 1: Generate authentication options
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/api/auth/passkey/login/options/route.ts"
+    import { generateAuthenticationOptions } from '@simplewebauthn/server';
+    import { rpID } from '@/lib/webauthn';
+    import { cookies } from 'next/headers';
+    import { NextResponse } from 'next/server';
+
+    export async function POST() {
+      const options = await generateAuthenticationOptions({
+        rpID,
+        userVerification: 'preferred',
+      });
+
+      const cookieStore = await cookies();
+      cookieStore.set('webauthn_challenge', options.challenge, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        maxAge: 300,
+        path: '/',
+      });
+
+      return NextResponse.json(options);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/routes/passkey.ts (continued)"
+    import { generateAuthenticationOptions } from '@simplewebauthn/server';
+
+    router.post('/passkey/login/options', async (req, res) => {
+      const options = await generateAuthenticationOptions({
+        rpID,
+        userVerification: 'preferred',
+      });
+
+      req.session.webauthnChallenge = options.challenge;
+
+      res.json(options);
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+### Step 2: Get assertion (browser)
+
+```ts title="lib/passkey-client.ts (continued)"
+export async function loginWithPasskey() {
+  // 1. Get options from server
+  const optionsRes = await fetch('/api/auth/passkey/login/options', {
+    method: 'POST',
+  });
+  const options = await optionsRes.json();
+
+  // 2. Browser signs the challenge (triggers biometric/PIN prompt)
+  const credential = await startAuthentication({ optionsJSON: options });
+
+  // 3. Send assertion to server for verification
+  const verifyRes = await fetch('/api/auth/passkey/login/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(credential),
+  });
+
+  return verifyRes.json();
+}
+```
+
+### Step 3: Verify assertion and create session
+
+This is where ideal-auth comes in — after WebAuthn verification, call `auth().login(user)` to create the session.
+
+<Tabs>
+  <TabItem label="Next.js">
+    ```ts title="app/api/auth/passkey/login/verify/route.ts"
+    import { verifyAuthenticationResponse } from '@simplewebauthn/server';
+    import { auth } from '@/lib/auth';
+    import { rpID, origin } from '@/lib/webauthn';
+    import { db } from '@/lib/db';
+    import { cookies } from 'next/headers';
+    import { NextResponse } from 'next/server';
+
+    export async function POST(request: Request) {
+      const body = await request.json();
+      const cookieStore = await cookies();
+      const expectedChallenge = cookieStore.get('webauthn_challenge')?.value;
+
+      if (!expectedChallenge) {
+        return NextResponse.json({ error: 'Challenge expired' }, { status: 400 });
+      }
+
+      // Look up the passkey
+      const passkey = await db.passkey.findUnique({
+        where: { id: body.id },
+      });
+
+      if (!passkey) {
+        return NextResponse.json({ error: 'Passkey not found' }, { status: 400 });
+      }
+
+      const verification = await verifyAuthenticationResponse({
+        response: body,
+        expectedChallenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+        credential: {
+          id: passkey.id,
+          publicKey: Buffer.from(passkey.publicKey, 'base64url'),
+          counter: passkey.counter,
+          transports: passkey.transports,
+        },
+      });
+
+      if (!verification.verified) {
+        return NextResponse.json({ error: 'Verification failed' }, { status: 400 });
+      }
+
+      // Update the signature counter (replay protection)
+      await db.passkey.update({
+        where: { id: passkey.id },
+        data: { counter: Number(verification.authenticationInfo.newCounter) },
+      });
+
+      // Look up the user and create a session — this is where ideal-auth comes in
+      const user = await db.user.findUnique({
+        where: { id: passkey.userId },
+      });
+
+      if (!user) {
+        return NextResponse.json({ error: 'User not found' }, { status: 400 });
+      }
+
+      const session = auth();
+      await session.login(user);
+
+      // Clean up challenge
+      cookieStore.delete('webauthn_challenge');
+
+      return NextResponse.json({ success: true });
+    }
+    ```
+  </TabItem>
+  <TabItem label="Express">
+    ```ts title="src/routes/passkey.ts (continued)"
+    import { verifyAuthenticationResponse } from '@simplewebauthn/server';
+
+    router.post('/passkey/login/verify', async (req, res) => {
+      const expectedChallenge = req.session.webauthnChallenge;
+      if (!expectedChallenge) {
+        return res.status(400).json({ error: 'Challenge expired' });
+      }
+
+      const passkey = await db.passkey.findUnique({
+        where: { id: req.body.id },
+      });
+
+      if (!passkey) {
+        return res.status(400).json({ error: 'Passkey not found' });
+      }
+
+      const verification = await verifyAuthenticationResponse({
+        response: req.body,
+        expectedChallenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+        credential: {
+          id: passkey.id,
+          publicKey: Buffer.from(passkey.publicKey, 'base64url'),
+          counter: passkey.counter,
+          transports: passkey.transports,
+        },
+      });
+
+      if (!verification.verified) {
+        return res.status(400).json({ error: 'Verification failed' });
+      }
+
+      await db.passkey.update({
+        where: { id: passkey.id },
+        data: { counter: Number(verification.authenticationInfo.newCounter) },
+      });
+
+      const user = await db.user.findUnique({
+        where: { id: passkey.userId },
+      });
+
+      if (!user) {
+        return res.status(400).json({ error: 'User not found' });
+      }
+
+      // Create session with ideal-auth
+      const session = auth(req, res);
+      await session.login(user);
+
+      delete req.session.webauthnChallenge;
+
+      res.json({ success: true });
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Login form
+
+Offer passkey login alongside traditional email/password:
+
+```tsx title="app/login/page.tsx"
+'use client';
+
+import { useState } from 'react';
+import { loginWithPasskey } from '@/lib/passkey-client';
+import { useRouter } from 'next/navigation';
+
+export default function LoginPage() {
+  const router = useRouter();
+  const [error, setError] = useState('');
+
+  async function handlePasskeyLogin() {
+    setError('');
+    try {
+      const result = await loginWithPasskey();
+      if (result.success) {
+        router.push('/dashboard');
+      } else {
+        setError(result.error ?? 'Passkey login failed.');
+      }
+    } catch {
+      setError('Passkey authentication was cancelled or not available.');
+    }
+  }
+
+  return (
+    <div>
+      <h1>Sign in</h1>
+
+      {error && <p className="error">{error}</p>}
+
+      {/* Passkey login */}
+      <button type="button" onClick={handlePasskeyLogin}>
+        Sign in with passkey
+      </button>
+
+      <hr />
+
+      {/* Traditional login form */}
+      <form action={loginAction}>
+        <input name="email" type="email" required />
+        <input name="password" type="password" required />
+        <button type="submit">Sign in with email</button>
+      </form>
+    </div>
+  );
+}
+```
+
+---
+
+## Passkey management
+
+Let authenticated users register new passkeys and remove existing ones:
+
+```tsx title="app/settings/passkeys/page.tsx"
+'use client';
+
+import { useState, useEffect } from 'react';
+import { registerPasskey } from '@/lib/passkey-client';
+
+export default function PasskeySettings() {
+  const [passkeys, setPasskeys] = useState([]);
+  const [message, setMessage] = useState('');
+
+  useEffect(() => {
+    fetch('/api/auth/passkey/list')
+      .then((r) => r.json())
+      .then((data) => setPasskeys(data.passkeys));
+  }, []);
+
+  async function handleRegister() {
+    try {
+      const result = await registerPasskey();
+      if (result.success) {
+        setMessage('Passkey registered successfully.');
+        // Refresh the list
+        const data = await fetch('/api/auth/passkey/list').then((r) => r.json());
+        setPasskeys(data.passkeys);
+      }
+    } catch {
+      setMessage('Registration was cancelled.');
+    }
+  }
+
+  async function handleRemove(id: string) {
+    await fetch(`/api/auth/passkey/${id}`, { method: 'DELETE' });
+    setPasskeys(passkeys.filter((pk: any) => pk.id !== id));
+  }
+
+  return (
+    <div>
+      <h2>Passkeys</h2>
+      {message && <p>{message}</p>}
+
+      <ul>
+        {passkeys.map((pk: any) => (
+          <li key={pk.id}>
+            {pk.deviceType === 'multiDevice' ? 'Synced passkey' : 'Device-bound passkey'}
+            {' — '}
+            {new Date(pk.createdAt).toLocaleDateString()}
+            <button onClick={() => handleRemove(pk.id)}>Remove</button>
+          </li>
+        ))}
+      </ul>
+
+      <button onClick={handleRegister}>Register new passkey</button>
+    </div>
+  );
+}
+```
+
+---
+
+## Passkeys + 2FA
+
+Passkeys can replace passwords entirely, but you may want to support both during a transition period. Common patterns:
+
+**Passkey-only accounts:** Users who register with a passkey never set a password. The `password` field in your database is nullable.
+
+**Passkey + password:** Users have both options. The login page offers passkey first, with a fallback to email/password.
+
+**Passkey replaces 2FA:** Passkeys with `userVerification: 'required'` include a biometric or PIN check, which is functionally equivalent to 2FA. You can skip TOTP for users who authenticate via passkey.
+
+```ts
+// After passkey login, check if user verification was performed
+if (verification.authenticationInfo.userVerified) {
+  // Passkey included biometric/PIN — no additional 2FA needed
+  await session.login(user);
+} else {
+  // Passkey was device-only — require TOTP as additional factor
+  // Redirect to 2FA verification page
+}
+```
+
+---
+
+## Security considerations
+
+- **Challenge expiry:** Challenges should expire within 5 minutes. Store them in a short-lived httpOnly cookie or server-side session — never in the URL or client-side storage.
+- **Signature counter:** Always update the counter after successful authentication. If a passkey's counter goes backwards, it may indicate a cloned credential — reject the authentication.
+- **rpID scope:** Set `rpID` to your root domain (e.g., `example.com`), not a subdomain. This allows passkeys to work across subdomains (`app.example.com`, `admin.example.com`).
+- **User verification:** Use `userVerification: 'preferred'` for most apps. Use `'required'` for high-security flows (e.g., banking). `'discouraged'` skips biometric/PIN — only use for low-security scenarios.
+- **Transports:** Store the credential's `transports` array and pass it back during authentication. This helps the browser find the right authenticator (USB, BLE, NFC, or internal).
+- **Rate limiting:** Rate limit the authentication options and verify endpoints to prevent abuse. Use `createRateLimiter` from ideal-auth.
+
+<Aside type="caution">
+  Passkeys registered in development on `localhost` will not work in production on your real domain (and vice versa). The `rpID` is bound to the domain at registration time.
+</Aside>
