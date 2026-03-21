@@ -25,17 +25,20 @@
     "skills"
   ],
   "dependencies": {
-    "iron-session": "^8.0.4",
-    "bcryptjs": "^3.0.3"
+    "iron-session": "^8.0.4"
   },
   "devDependencies": {
     "@types/bcryptjs": "^3.0.0",
     "@types/node": "^20"
   },
   "peerDependencies": {
+    "bcryptjs": "^3.0.3",
     "typescript": "^5.0.0"
   },
   "peerDependenciesMeta": {
+    "bcryptjs": {
+      "optional": true
+    },
     "typescript": {
       "optional": true
     }

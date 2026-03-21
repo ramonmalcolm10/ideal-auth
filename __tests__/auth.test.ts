@@ -501,6 +501,65 @@ describe('AuthInstance', () => {
   });
 });
 
+describe('no hash/bcryptjs required', () => {
+  const bridge = () => createMockCookieBridge();
+
+  it('login(user) works without hash', async () => {
+    const auth = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: bridge(),
+      resolveUser: async (id) => (id === '1' ? testUser : null),
+    })();
+
+    await auth.login(testUser);
+    expect(await auth.check()).toBe(true);
+    expect(await auth.user()).toEqual(testUser);
+  });
+
+  it('attemptUser works without hash', async () => {
+    const b = bridge();
+    const auth = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: b,
+      resolveUser: async (id) => (id === '1' ? testUser : null),
+      attemptUser: async (creds) =>
+        creds.token === 'valid' ? testUser : null,
+    })();
+
+    const success = await auth.attempt({ token: 'valid' });
+    expect(success).toBe(true);
+    expect(await auth.user()).toEqual(testUser);
+  });
+
+  it('sessionFields with attemptUser works without hash', async () => {
+    const b = bridge();
+    const auth = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: b,
+      sessionFields: ['email'],
+      attemptUser: async (creds) =>
+        creds.token === 'valid' ? testUser : null,
+    })();
+
+    const success = await auth.attempt({ token: 'valid' });
+    expect(success).toBe(true);
+    expect(await auth.user()).toEqual({ id: '1', email: 'test@example.com' });
+  });
+
+  it('sessionFields with login(user) works without hash', async () => {
+    const b = bridge();
+    const auth = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: b,
+      sessionFields: ['email'],
+    })();
+
+    await auth.login(testUser);
+    expect(await auth.check()).toBe(true);
+    expect(await auth.user()).toEqual({ id: '1', email: 'test@example.com' });
+  });
+});
+
 describe('sessionFields (cookie-backed sessions)', () => {
   type FullUser = { id: string; email: string; name: string; role: string; password?: string };
 
