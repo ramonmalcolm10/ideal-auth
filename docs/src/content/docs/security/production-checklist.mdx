@@ -94,7 +94,7 @@ Review every item on this list before deploying an application that uses ideal-a
 
 ## Tokens
 
-- [ ] **Token verifier secret is 32+ characters.** Same requirement as the session secret. You can use the same secret or a different one.
+- [ ] **Token verifier secret is 32+ characters.** Same requirement as `IDEAL_AUTH_SECRET`. You can use the same secret or a different one.
 
   ```ts
   const resetTokens = createTokenVerifier({

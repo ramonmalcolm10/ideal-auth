@@ -1742,7 +1742,7 @@ redirect(safeRedirect(redirectTo, '/dashboard'));
 
 | Setting | Default | Notes |
 |---------|---------|-------|
-| Session secret | 32+ chars | Validated at startup |
+| `IDEAL_AUTH_SECRET` | 32+ chars | Validated at startup |
 | Cookie name | `ideal_session` | Customizable |
 | Session maxAge | 604,800s (7 days) | Standard session |
 | Remember maxAge | 2,592,000s (30 days) | Remember me |

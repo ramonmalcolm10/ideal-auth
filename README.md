@@ -15,7 +15,7 @@ bun add ideal-auth
 ## Generate Secrets
 
 ```bash
-# Session secret (required — used by createAuth)
+# IDEAL_AUTH_SECRET (required — used by createAuth)
 bunx ideal-auth secret
 # IDEAL_AUTH_SECRET=aLThikMgJKMBB5WZLE-lCaOQUdgPWU8BHRv99bkYaVY
 
