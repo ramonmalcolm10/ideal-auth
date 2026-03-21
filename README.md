@@ -171,7 +171,11 @@ const auth = createAuth({
 
 ### `createHash(config?)`
 
-Returns a `HashInstance` using bcrypt.
+Returns a `HashInstance` using bcrypt. Requires `bcryptjs` (optional peer dependency):
+
+```bash
+bun add bcryptjs
+```
 
 | Option | Type | Default |
 | --- | --- | --- |
@@ -184,6 +188,27 @@ const hash = createHash({ rounds: 12 });
 
 const hashed = await hash.make('password');
 const valid  = await hash.verify('password', hashed); // true
+```
+
+### Custom hash (bring your own)
+
+Skip `bcryptjs` entirely by providing your own `HashInstance`:
+
+```typescript
+import { prehash } from 'ideal-auth';
+import type { HashInstance } from 'ideal-auth';
+
+// Bun native bcrypt (use prehash to prevent silent truncation at 72 bytes)
+const hash: HashInstance = {
+  make: (password) => Bun.password.hash(prehash(password), { algorithm: 'bcrypt', cost: 12 }),
+  verify: (password, hash) => Bun.password.verify(prehash(password), hash),
+};
+
+// Bun argon2id (OWASP recommended — no prehash needed, no input length limit)
+const hash: HashInstance = {
+  make: (password) => Bun.password.hash(password, { algorithm: 'argon2id' }),
+  verify: (password, hash) => Bun.password.verify(password, hash),
+};
 ```
 
 ---
@@ -517,10 +542,10 @@ cookie: {
 
 ## Dependencies
 
-| Package | Purpose |
-| --- | --- |
-| `iron-session` | Session sealing/unsealing (AES-256-CBC + HMAC) |
-| `bcryptjs` | Password hashing |
+| Package | Purpose | Required |
+| --- | --- | --- |
+| `iron-session` | Session sealing/unsealing (AES-256-CBC + HMAC) | Yes |
+| `bcryptjs` | Password hashing (used by `createHash()`) | Optional — not needed if you provide your own `HashInstance` |
 
 Zero framework imports. Works in Node, Bun, Deno, and edge runtimes.
 

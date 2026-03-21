@@ -219,9 +219,38 @@ Session cookies have a **~4KB size limit** (including encryption overhead). Basi
 
 ---
 
-## `createHash`
+## Password hashing
 
-Configures bcrypt password hashing. Automatically applies SHA-256 prehash for passwords exceeding 72 bytes (bcrypt's input limit).
+Password hashing is **only needed when you verify credentials yourself** — specifically when using `attempt()` with the Laravel-style `hash` + `resolveUserByCredentials` flow. You do **not** need a `HashInstance` or `bcryptjs` if you:
+
+- Use `attemptUser` (the escape hatch) — you handle verification in the callback
+- Use `login(user)` directly — user is already authenticated (e.g., via OAuth, cross-domain transfer token, or an external API)
+- Use `sessionFields` without any credential verification
+
+ideal-auth accepts any object that implements the `HashInstance` interface:
+
+```ts
+interface HashInstance {
+  make(password: string): Promise<string>;
+  verify(password: string, hash: string): Promise<boolean>;
+}
+```
+
+You can use the built-in `createHash()` (bcryptjs) or bring your own implementation.
+
+### `createHash` (bcryptjs)
+
+Configures bcrypt password hashing via `bcryptjs`. Automatically applies SHA-256 prehash for passwords exceeding 72 bytes (bcrypt's input limit).
+
+:::note
+`bcryptjs` is an optional peer dependency. Install it if you use `createHash()`:
+
+```bash
+bun add bcryptjs
+```
+
+If `bcryptjs` is not installed and you call `createHash()`, it will throw a clear error with installation instructions.
+:::
 
 ```ts
 import { createHash } from 'ideal-auth';
@@ -232,14 +261,77 @@ const hashed = await hash.make('my-password');
 const valid = await hash.verify('my-password', hashed);
 ```
 
-### Config options
-
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `rounds` | `number` | `12` | bcrypt cost factor (salt rounds). Higher values are slower but more secure. Each increment roughly doubles the computation time. |
 
 :::tip
 The default of 12 rounds is a good balance for most applications. Increase to 14 for high-security applications. Avoid going below 10.
+:::
+
+### Custom hash (bring your own)
+
+If your runtime provides built-in password hashing (e.g., Bun) or you prefer a different algorithm (e.g., argon2), pass your own `HashInstance` instead of using `createHash()`. No `bcryptjs` dependency needed.
+
+<Tabs>
+  <TabItem label="Bun (bcrypt)">
+    ```ts
+    import { prehash } from 'ideal-auth';
+    import type { HashInstance } from 'ideal-auth';
+
+    const hash: HashInstance = {
+      make: (password) => Bun.password.hash(prehash(password), {
+        algorithm: 'bcrypt',
+        cost: 12,
+      }),
+      verify: (password, hash) => Bun.password.verify(prehash(password), hash),
+    };
+    ```
+
+    `prehash` applies SHA-256 for passwords exceeding bcrypt's 72-byte input limit, preventing silent truncation. It returns the password unchanged if it's within the limit.
+  </TabItem>
+  <TabItem label="Bun (argon2id)">
+    ```ts
+    import type { HashInstance } from 'ideal-auth';
+
+    const hash: HashInstance = {
+      make: (password) => Bun.password.hash(password, {
+        algorithm: 'argon2id',
+        memoryCost: 65536, // 64 MB
+        timeCost: 2,
+      }),
+      verify: (password, hash) => Bun.password.verify(password, hash),
+    };
+    ```
+  </TabItem>
+  <TabItem label="Node (argon2)">
+    ```ts
+    import argon2 from 'argon2';
+    import type { HashInstance } from 'ideal-auth';
+
+    const hash: HashInstance = {
+      make: (password) => argon2.hash(password),
+      verify: (password, hash) => argon2.verify(hash, password),
+    };
+    ```
+  </TabItem>
+</Tabs>
+
+Then pass it to `createAuth`:
+
+```ts
+const auth = createAuth({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  hash, // your custom HashInstance
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
+```
+
+:::caution
+When using a custom hash, you are responsible for security hardening (cost factors, algorithm choice, input validation). For custom bcrypt implementations, use `prehash()` from ideal-auth to prevent silent truncation at 72 bytes. Argon2 has no input length limit — prehash is not needed.
 :::
 
 ---

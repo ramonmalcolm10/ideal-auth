@@ -194,25 +194,65 @@ const auth = createAuth({
 
 ---
 
-### `createHash(config?): HashInstance`
+### Password Hashing
 
-bcrypt password hashing with automatic SHA-256 prehash for passwords > 72 bytes.
+Password hashing is **only needed for the Laravel-style `attempt()` flow** (`hash` + `resolveUserByCredentials`). If you use `attemptUser`, `login(user)` directly, or `sessionFields` without credential verification, no `HashInstance` or `bcryptjs` is required.
+
+ideal-auth accepts any `HashInstance`:
 
 ```typescript
-type HashConfig = { rounds?: number };  // default: 12
-
 type HashInstance = {
   make(password: string): Promise<string>;
   verify(password: string, hash: string): Promise<boolean>;
 };
 ```
 
+**`createHash()` (bcryptjs)** — built-in convenience. Requires `bcryptjs` as an optional peer dependency (`bun add bcryptjs`). Throws a clear error if not installed.
+
 ```typescript
 import { createHash } from 'ideal-auth';
 
-const hash = createHash({ rounds: 12 });
+const hash = createHash({ rounds: 12 }); // default: 12
 const hashed = await hash.make('password');
 const valid = await hash.verify('password', hashed); // true
+```
+
+**Custom hash (bring your own)** — use your runtime's native hashing or a different algorithm. No `bcryptjs` needed.
+
+```typescript
+import { prehash } from 'ideal-auth';
+
+// Bun native bcrypt (faster than bcryptjs — use prehash for 72-byte limit)
+const hash: HashInstance = {
+  make: (password) => Bun.password.hash(prehash(password), { algorithm: 'bcrypt', cost: 12 }),
+  verify: (password, hash) => Bun.password.verify(prehash(password), hash),
+};
+
+// Bun argon2id (OWASP recommended — no prehash needed, no input length limit)
+const hash: HashInstance = {
+  make: (password) => Bun.password.hash(password, { algorithm: 'argon2id', memoryCost: 65536, timeCost: 2 }),
+  verify: (password, hash) => Bun.password.verify(password, hash),
+};
+
+// Node argon2 (requires: bun add argon2 — no prehash needed)
+import argon2 from 'argon2';
+const hash: HashInstance = {
+  make: (password) => argon2.hash(password),
+  verify: (password, hash) => argon2.verify(hash, password),
+};
+```
+
+Pass either to `createAuth`:
+
+```typescript
+const auth = createAuth({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: createCookieBridge(),
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  hash, // createHash() or your custom HashInstance
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+});
 ```
 
 ---

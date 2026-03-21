@@ -5,6 +5,7 @@ describe('public API exports', () => {
   const expectedExports = [
     'createAuth',
     'createHash',
+    'prehash',
     'generateToken',
     'signData',
     'verifySignature',

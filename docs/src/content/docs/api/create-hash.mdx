@@ -1,7 +1,9 @@
 ---
 title: createHash
-description: API reference for createHash — bcrypt password hashing.
+description: API reference for createHash — bcrypt password hashing and custom hash support.
 ---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 ## Signature
 
@@ -10,6 +12,20 @@ function createHash(config?: HashConfig): HashInstance
 ```
 
 Creates a password hashing instance powered by bcrypt. Uses `bcryptjs` (pure JavaScript, edge runtime compatible) under the hood.
+
+:::tip
+Password hashing is only needed when you verify credentials yourself — specifically the Laravel-style `attempt()` flow with `hash` + `resolveUserByCredentials`. If you use `attemptUser`, `login(user)` directly, or authenticate via OAuth/external API, you don't need `createHash()` or `bcryptjs` at all.
+:::
+
+:::note
+`bcryptjs` is an optional peer dependency. Install it only if you use `createHash()`:
+
+```bash
+bun add bcryptjs
+```
+
+If you prefer to use your runtime's built-in hashing (e.g., `Bun.password`) or a different algorithm (e.g., argon2), see [Custom HashInstance](#custom-hashinstance) below — no `bcryptjs` needed.
+:::
 
 ```typescript
 import { createHash } from 'ideal-auth';
@@ -156,6 +172,81 @@ async function registerUser(email: string, password: string) {
   return user;
 }
 ```
+
+---
+
+## Custom HashInstance
+
+You don't have to use `createHash()`. Any object that implements `HashInstance` works with `createAuth`. This lets you use your runtime's native hashing or a different algorithm without pulling in `bcryptjs`.
+
+<Tabs>
+  <TabItem label="Bun (bcrypt)">
+    ```typescript
+    import { prehash } from 'ideal-auth';
+    import type { HashInstance } from 'ideal-auth';
+
+    const hash: HashInstance = {
+      make: (password) => Bun.password.hash(prehash(password), {
+        algorithm: 'bcrypt',
+        cost: 12,
+      }),
+      verify: (password, hash) => Bun.password.verify(prehash(password), hash),
+    };
+    ```
+
+    Bun's native bcrypt is significantly faster than `bcryptjs` (native implementation vs. pure JavaScript). `prehash` applies SHA-256 for passwords exceeding bcrypt's 72-byte input limit, preventing silent truncation — the same protection that `createHash()` applies automatically.
+  </TabItem>
+  <TabItem label="Bun (argon2id)">
+    ```typescript
+    import type { HashInstance } from 'ideal-auth';
+
+    const hash: HashInstance = {
+      make: (password) => Bun.password.hash(password, {
+        algorithm: 'argon2id',
+        memoryCost: 65536, // 64 MB
+        timeCost: 2,
+      }),
+      verify: (password, hash) => Bun.password.verify(password, hash),
+    };
+    ```
+
+    Argon2id is the current [OWASP recommendation](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) for password hashing. It is resistant to both GPU and side-channel attacks.
+  </TabItem>
+  <TabItem label="Node (argon2)">
+    ```typescript
+    import argon2 from 'argon2';
+    import type { HashInstance } from 'ideal-auth';
+
+    const hash: HashInstance = {
+      make: (password) => argon2.hash(password),
+      verify: (password, hash) => argon2.verify(hash, password),
+    };
+    ```
+
+    Requires `bun add argon2` (native Node.js addon).
+  </TabItem>
+</Tabs>
+
+Pass your custom instance to `createAuth` the same way:
+
+```typescript
+const auth = createAuth({
+  secret: process.env.AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  resolveUserByCredentials: async (creds) =>
+    db.user.findUnique({ where: { email: creds.email } }),
+  hash, // your custom HashInstance
+});
+```
+
+:::caution
+When using a custom hash, you are responsible for:
+- **Cost factors** — choose appropriate memory/time costs for your algorithm
+- **Algorithm choice** — bcrypt and argon2id are both production-ready; avoid MD5, SHA-1, or plain SHA-256
+- **Input validation** — `createHash()` rejects empty passwords; your implementation should too
+- **Prehash for bcrypt** — use `prehash()` from ideal-auth to prevent silent truncation at 72 bytes. Argon2 has no input length limit and does not need prehash.
+:::
 
 ---
 

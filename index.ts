@@ -2,7 +2,7 @@
 export { createAuth } from './auth';
 
 // Hash
-export { createHash } from './hash';
+export { createHash, prehash } from './hash';
 
 // Crypto utilities
 export { generateToken } from './crypto/token';
