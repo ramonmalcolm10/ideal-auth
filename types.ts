@@ -94,7 +94,7 @@ export interface AuthConfigWithSessionFields<
 > extends AuthConfigBase<TUser> {
   /** Cannot use `resolveUser` together with `sessionFields`. */
   resolveUser?: never;
-  sessionFields: K[];
+  sessionFields: readonly K[];
 }
 
 export type AuthConfig<TUser extends AnyUser = AnyUser> =

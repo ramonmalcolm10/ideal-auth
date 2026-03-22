@@ -18,7 +18,7 @@ interface AuthInstanceDeps<TUser extends AnyUser> {
   rememberMaxAge: number;
   cookieOptions: ConfigurableCookieOptions;
   resolveUser?: (id: string) => Promise<TUser | null | undefined>;
-  sessionFields?: (keyof TUser & string)[];
+  sessionFields?: readonly (keyof TUser & string)[];
   hash?: HashInstance;
   resolveUserByCredentials?: (
     credentials: Record<string, any>,

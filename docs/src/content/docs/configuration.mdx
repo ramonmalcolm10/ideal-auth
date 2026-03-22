@@ -161,6 +161,8 @@ const user = await auth().user();
 
 **Cookie-backed (`sessionFields`):** The session cookie stores the user ID plus the declared fields. `user()` returns only `id` + the declared fields — everything else (including password) is excluded from the type.
 
+Define the fields once as a `const` array and derive the type from it:
+
 ```ts
 type DbUser = {
   id: string;
@@ -170,10 +172,13 @@ type DbUser = {
   password: string;
 };
 
-const auth = createAuth<DbUser>({
+// Define fields once — `as const` preserves the literal types
+const sessionFields = ['email', 'name', 'role'] as const;
+
+const auth = createAuth<DbUser, (typeof sessionFields)[number]>({
   secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
-  sessionFields: ['email', 'name', 'role'],
+  sessionFields,
   resolveUserByCredentials: async (creds) =>
     db.user.findFirst({ where: { email: creds.email } }),
   hash,
@@ -652,11 +657,13 @@ import {
 
     export const hash = createHash({ rounds: 12 });
 
+    const sessionFields = ['email', 'name', 'role'] as const;
+
     // Session auth — user() reads from cookie, zero database calls after login
-    export const auth = createAuth<User>({
+    export const auth = createAuth<User, (typeof sessionFields)[number]>({
       secret: process.env.IDEAL_AUTH_SECRET!,
       cookie: cookieBridge,
-      sessionFields: ['email', 'name', 'role'],
+      sessionFields,
       resolveUserByCredentials: (creds) =>
         db.user.findUnique({ where: { email: creds.email } }),
       hash,
@@ -691,11 +698,13 @@ import {
       },
     };
 
+    const sessionFields = ['email', 'name', 'accessToken'] as const;
+
     // No database — user info comes from OIDC and is stored in the cookie
-    export const auth = createAuth<User>({
+    export const auth = createAuth<User, (typeof sessionFields)[number]>({
       secret: process.env.IDEAL_AUTH_SECRET!,
       cookie: cookieBridge,
-      sessionFields: ['email', 'name', 'accessToken'],
+      sessionFields,
       attemptUser: async (credentials) => {
         // Validate the cross-domain transfer token
         const data = await validateTransferToken(credentials.id, credentials.token);

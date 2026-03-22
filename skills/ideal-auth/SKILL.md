@@ -126,13 +126,17 @@ const user = await auth().user(); // Type: SafeUser | null
 
 **Cookie-backed (`sessionFields`):** Cookie stores user ID + declared fields. `user()` returns `Pick<TUser, 'id' | K>` — password excluded from the type.
 
+Define fields once as `const` and derive the type with `(typeof sessionFields)[number]`:
+
 ```typescript
 type DbUser = { id: string; email: string; name: string; role: string; password: string };
 
-const auth = createAuth<DbUser>({
+const sessionFields = ['email', 'name', 'role'] as const;
+
+const auth = createAuth<DbUser, (typeof sessionFields)[number]>({
   secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: createCookieBridge(),
-  sessionFields: ['email', 'name', 'role'],
+  sessionFields,
   resolveUserByCredentials: async (creds) => db.user.findFirst({ where: { email: creds.email } }),
   hash,
 });
