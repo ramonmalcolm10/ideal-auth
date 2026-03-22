@@ -176,7 +176,7 @@ describe('custom HashInstance (bring your own hash)', () => {
     const users: User[] = [{ id: '1', email: 'a@b.com', name: 'Test', password: hashedPassword }];
 
     const bridge = createMockCookieBridge();
-    const auth = createAuth<User, 'email' | 'name'>({
+    const auth = createAuth<User>({
       secret: SECRET,
       cookie: bridge,
       sessionFields: ['email', 'name'],

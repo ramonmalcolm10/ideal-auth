@@ -71,33 +71,28 @@ Returns a factory function. Call `auth()` per request to get an `AuthInstance` s
 #### AuthConfig
 
 ```typescript
-// Session mode — provide exactly ONE of resolveUser or sessionFields
-// TypeScript will error if you provide both or neither
+// TUser = session user type — what user() returns. Do not include password.
+// Provide exactly ONE of resolveUser or sessionFields.
+// TypeScript will error if you provide both or neither.
 
-// resolveUser mode: TUser is the safe type returned by resolveUser and user()
-type AuthConfigWithResolveUser<TUser> = {
-  secret: string;
-  cookie: CookieBridge;
-  resolveUser: (id: string) => Promise<TUser | null | undefined>;
-  sessionFields?: never;
-  // resolveUserByCredentials can return any shape — only needs id + passwordField
-  resolveUserByCredentials?: (credentials: Record<string, any>) => Promise<AnyUser | null | undefined>;
-  hash?: HashInstance;
-  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
-  // ...session options
-};
-
-// sessionFields mode: user() returns Pick<TUser, 'id' | K>
-type AuthConfigWithSessionFields<TUser, K extends keyof TUser> = {
-  secret: string;
-  cookie: CookieBridge;
-  resolveUser?: never;
-  sessionFields: K[];
-  resolveUserByCredentials?: (credentials: Record<string, any>) => Promise<AnyUser | null | undefined>;
-  hash?: HashInstance;
-  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
-  // ...session options
-};
+type AuthConfig<TUser> =
+  | {
+      resolveUser: (id: string) => Promise<TUser | null | undefined>;
+      sessionFields?: never;
+      // resolveUserByCredentials can return any shape — only needs id + passwordField
+      resolveUserByCredentials?: (credentials: Record<string, any>) => Promise<AnyUser | null | undefined>;
+      hash?: HashInstance;
+      attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
+      // ...session, secret, cookie
+    }
+  | {
+      resolveUser?: never;
+      sessionFields: (keyof TUser & string)[];
+      resolveUserByCredentials?: (credentials: Record<string, any>) => Promise<AnyUser | null | undefined>;
+      hash?: HashInstance;
+      attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
+      // ...session, secret, cookie
+    };
 ```
 
 #### Session Modes
@@ -124,29 +119,24 @@ const auth = createAuth<SafeUser>({
 const user = await auth().user(); // Type: SafeUser | null
 ```
 
-**Cookie-backed (`sessionFields`):** Cookie stores user ID + declared fields. `user()` returns `Pick<TUser, 'id' | K>` — password excluded from the type.
-
-Define fields once as `const` and derive the type with `(typeof sessionFields)[number]`:
+**Cookie-backed (`sessionFields`):** Cookie stores user ID + declared fields. `user()` returns `TUser | null`. Since `TUser` should not include password, the type is already safe.
 
 ```typescript
-type DbUser = { id: string; email: string; name: string; role: string; password: string };
+type SessionUser = { id: string; email: string; name: string; role: string }; // no password
 
-const sessionFields = ['email', 'name', 'role'] as const;
-
-const auth = createAuth<DbUser, (typeof sessionFields)[number]>({
+const auth = createAuth<SessionUser>({
   secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: createCookieBridge(),
-  sessionFields,
+  sessionFields: ['email', 'name', 'role'],
   resolveUserByCredentials: async (creds) => db.user.findFirst({ where: { email: creds.email } }),
   hash,
 });
-const user = await auth().user(); // Type: Pick<DbUser, 'id' | 'email' | 'name' | 'role'> | null
+const user = await auth().user(); // Type: SessionUser | null
 ```
 
 Key rules:
+- `TUser` is the session user type — what `user()` returns. Do not include password.
 - Provide exactly one of `resolveUser` or `sessionFields` — TypeScript errors if both or neither
-- `resolveUser` mode: `TUser` is the safe type. Only select non-sensitive fields in your query
-- `sessionFields` mode: `user()` type is `Pick<TUser, 'id' | ...fields>` — password excluded automatically
 - `resolveUserByCredentials` returns `AnyUser` — doesn't need to match `TUser`, only needs `id` + password field
 - Password is stripped from the cached user after `attempt()` — even same-request `user()` won't expose it
 - Cookie limit is ~4KB — store basic fields only

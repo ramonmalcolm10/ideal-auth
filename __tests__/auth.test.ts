@@ -547,7 +547,7 @@ describe('no hash/bcryptjs required', () => {
 
   it('sessionFields with attemptUser works without hash', async () => {
     const b = bridge();
-    const auth = createAuth<TestUser, 'email'>({
+    const auth = createAuth<TestUser>({
       secret: SECRET,
       cookie: b,
       sessionFields: ['email'],
@@ -562,7 +562,7 @@ describe('no hash/bcryptjs required', () => {
 
   it('sessionFields with login(user) works without hash', async () => {
     const b = bridge();
-    const auth = createAuth<TestUser, 'email'>({
+    const auth = createAuth<TestUser>({
       secret: SECRET,
       cookie: b,
       sessionFields: ['email'],
@@ -584,11 +584,11 @@ describe('sessionFields (cookie-backed sessions)', () => {
     role: 'admin',
   };
 
-  function createSessionFieldsAuth<K extends keyof FullUser & string>(
+  function createSessionFieldsAuth(
     bridge: ReturnType<typeof createMockCookieBridge>,
-    fields: K[],
+    fields: (keyof FullUser & string)[],
   ) {
-    return createAuth<FullUser, K>({
+    return createAuth<FullUser>({
       secret: SECRET,
       cookie: bridge,
       sessionFields: fields,
@@ -721,7 +721,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
   describe('attempt() with attemptUser', () => {
     it('stores sessionFields from user returned by attemptUser', async () => {
       const bridge = createMockCookieBridge();
-      const auth = createAuth<FullUser, 'email' | 'name' | 'role'>({
+      const auth = createAuth<FullUser>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email', 'name', 'role'],
@@ -738,7 +738,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
 
     it('returns false when attemptUser returns null', async () => {
       const bridge = createMockCookieBridge();
-      const auth = createAuth<FullUser, 'email'>({
+      const auth = createAuth<FullUser>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email'],
@@ -757,7 +757,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
       const hashed = await hash.make('secret123');
       const userWithPassword: FullUser = { ...fullUser, password: hashed };
 
-      const auth = createAuth<FullUser, 'email' | 'name'>({
+      const auth = createAuth<FullUser>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email', 'name'],
@@ -777,7 +777,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
   describe('loginById()', () => {
     it('throws with helpful message when used with sessionFields', () => {
       const bridge = createMockCookieBridge();
-      const auth = createAuth<FullUser, 'email'>({
+      const auth = createAuth<FullUser>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email'],
@@ -804,7 +804,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
     it('handles fields not present on user object (silently excluded)', async () => {
       const bridge = createMockCookieBridge();
       const userMissingRole = { id: '42', email: 'jane@example.com', name: 'Jane', role: undefined as unknown as string };
-      const auth = createAuth<FullUser, 'email' | 'name' | 'role'>({
+      const auth = createAuth<FullUser>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email', 'name', 'role'],
@@ -849,7 +849,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
       await oldAuth.login(fullUser);
 
       // Now switch to sessionFields config and try to read the old session
-      const newAuth = createAuth<FullUser, 'email' | 'name'>({
+      const newAuth = createAuth<FullUser>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email', 'name'],

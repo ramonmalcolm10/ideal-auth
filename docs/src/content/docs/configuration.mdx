@@ -159,34 +159,29 @@ const user = await auth().user();
 // Type: SafeUser | null — no password, safe to pass to client
 ```
 
-**Cookie-backed (`sessionFields`):** The session cookie stores the user ID plus the declared fields. `user()` returns only `id` + the declared fields — everything else (including password) is excluded from the type.
-
-Define the fields once as a `const` array and derive the type from it:
+**Cookie-backed (`sessionFields`):** The session cookie stores the user ID plus the declared fields. `user()` returns `TUser | null`. Since `TUser` should not include sensitive fields like password, the return type is already safe.
 
 ```ts
-type DbUser = {
+// TUser is the session user — no password
+type SessionUser = {
   id: string;
   email: string;
   name: string;
   role: string;
-  password: string;
 };
 
-// Define fields once — `as const` preserves the literal types
-const sessionFields = ['email', 'name', 'role'] as const;
-
-const auth = createAuth<DbUser, (typeof sessionFields)[number]>({
+const auth = createAuth<SessionUser>({
   secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
-  sessionFields,
+  sessionFields: ['email', 'name', 'role'],
+  // Can return any shape — only needs id + password field for verification
   resolveUserByCredentials: async (creds) =>
     db.user.findFirst({ where: { email: creds.email } }),
   hash,
 });
 
 const user = await auth().user();
-// Type: Pick<DbUser, 'id' | 'email' | 'name' | 'role'> | null
-// No password on the type — safe to pass to client
+// Type: SessionUser | null — no password, safe to pass to client
 ```
 
 :::note
@@ -657,13 +652,11 @@ import {
 
     export const hash = createHash({ rounds: 12 });
 
-    const sessionFields = ['email', 'name', 'role'] as const;
-
     // Session auth — user() reads from cookie, zero database calls after login
-    export const auth = createAuth<User, (typeof sessionFields)[number]>({
+    export const auth = createAuth<User>({
       secret: process.env.IDEAL_AUTH_SECRET!,
       cookie: cookieBridge,
-      sessionFields,
+      sessionFields: ['email', 'name', 'role'],
       resolveUserByCredentials: (creds) =>
         db.user.findUnique({ where: { email: creds.email } }),
       hash,
@@ -698,13 +691,11 @@ import {
       },
     };
 
-    const sessionFields = ['email', 'name', 'accessToken'] as const;
-
     // No database — user info comes from OIDC and is stored in the cookie
-    export const auth = createAuth<User, (typeof sessionFields)[number]>({
+    export const auth = createAuth<User>({
       secret: process.env.IDEAL_AUTH_SECRET!,
       cookie: cookieBridge,
-      sessionFields,
+      sessionFields: ['email', 'name', 'accessToken'],
       attemptUser: async (credentials) => {
         // Validate the cross-domain transfer token
         const data = await validateTransferToken(credentials.id, credentials.token);
