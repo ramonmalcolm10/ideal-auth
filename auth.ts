@@ -10,20 +10,16 @@ const SESSION_DEFAULTS = {
 /**
  * Create an auth factory.
  *
- * @example
- * // resolveUser — user() returns SafeUser
- * createAuth<SafeUser>({ resolveUser: ... })
+ * `TUser` is the session user type — what `user()` returns.
+ * Do not include sensitive fields like password in this type.
  *
- * // sessionFields — user() returns Pick<DbUser, 'id' | 'email' | 'name'>
- * const sessionFields = ['email', 'name'] as const;
- * createAuth<DbUser, (typeof sessionFields)[number]>({ sessionFields, ... })
+ * @example
+ * type SessionUser = { id: string; email: string; name: string };
+ * createAuth<SessionUser>({ ... })
  */
-export function createAuth<
-  TUser extends AnyUser,
-  K extends keyof TUser & string = keyof TUser & string,
->(
+export function createAuth<TUser extends AnyUser>(
   config: AuthConfig<TUser>,
-): () => AuthInstance<TUser, Pick<TUser, 'id' | K>> {
+): () => AuthInstance<TUser> {
   if (!config.secret || config.secret.length < 32) {
     throw new Error('secret must be at least 32 characters');
   }

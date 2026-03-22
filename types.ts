@@ -94,7 +94,7 @@ export interface AuthConfigWithSessionFields<
 > extends AuthConfigBase<TUser> {
   /** Cannot use `resolveUser` together with `sessionFields`. */
   resolveUser?: never;
-  sessionFields: readonly K[];
+  sessionFields: K[];
 }
 
 export type AuthConfig<TUser extends AnyUser = AnyUser> =
@@ -105,13 +105,13 @@ export interface HashConfig {
   rounds?: number;
 }
 
-export interface AuthInstance<TUser extends AnyUser = AnyUser, TSessionUser = TUser> {
+export interface AuthInstance<TUser extends AnyUser = AnyUser> {
   login(user: TUser, options?: LoginOptions): Promise<void>;
   loginById(id: string, options?: LoginOptions): Promise<void>;
   attempt(credentials: Record<string, any>, options?: LoginOptions): Promise<boolean>;
   logout(): Promise<void>;
   check(): Promise<boolean>;
-  user(): Promise<TSessionUser | null>;
+  user(): Promise<TUser | null>;
   id(): Promise<string | null>;
 }
 
