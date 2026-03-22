@@ -22,7 +22,7 @@ interface AuthInstanceDeps<TUser extends AnyUser> {
   hash?: HashInstance;
   resolveUserByCredentials?: (
     credentials: Record<string, any>,
-  ) => Promise<TUser | null | undefined>;
+  ) => Promise<AnyUser | null | undefined>;
   credentialKey: string;
   passwordField: string;
   attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
@@ -79,10 +79,14 @@ export function createAuthInstance<TUser extends AnyUser>(
     await deps.cookie.set(deps.cookieName, sealed, opts);
 
     cachedPayload = payload;
-    // When using sessionFields, only cache the picked fields (matching what's in the cookie)
-    cachedUser = payload.data
-      ? ({ id: user.id, ...payload.data } as TUser)
-      : user;
+    if (payload.data) {
+      // sessionFields mode: cache only the picked fields
+      cachedUser = { id: user.id, ...payload.data } as TUser;
+    } else {
+      // resolveUser mode: strip the password field from cache
+      const { [deps.passwordField]: _, ...safeUser } = user as Record<string, any>;
+      cachedUser = safeUser as TUser;
+    }
   }
 
   return {
@@ -111,15 +115,15 @@ export function createAuthInstance<TUser extends AnyUser>(
       // Laravel-style: strip password, resolve user, verify hash
       if (deps.hash && deps.resolveUserByCredentials) {
         const { [deps.credentialKey]: password, ...lookup } = credentials;
-        const user = await deps.resolveUserByCredentials(lookup);
-        if (!user) return false;
+        const dbUser = await deps.resolveUserByCredentials(lookup);
+        if (!dbUser) return false;
 
-        const storedHash = (user as Record<string, any>)[deps.passwordField];
+        const storedHash = (dbUser as Record<string, any>)[deps.passwordField];
         if (!storedHash || !(await deps.hash.verify(password, storedHash))) {
           return false;
         }
 
-        await writeSession(user, options);
+        await writeSession(dbUser as TUser, options);
         return true;
       }
 

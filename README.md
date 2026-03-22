@@ -99,7 +99,7 @@ Returns a function `auth()` that creates an `AuthInstance` on each call.
 | `resolveUser` | `(id: string) => Promise<User \| null \| undefined>` | Yes (unless `sessionFields` is provided) | — |
 | `sessionFields` | `(keyof User & string)[]` | Yes (unless `resolveUser` is provided) | — |
 | `hash` | `HashInstance` | No | — |
-| `resolveUserByCredentials` | `(creds: Record<string, any>) => Promise<User \| null \| undefined>` | No | — |
+| `resolveUserByCredentials` | `(creds: Record<string, any>) => Promise<AnyUser \| null \| undefined>` | No | — |
 | `credentialKey` | `string` | No | `'password'` |
 | `passwordField` | `string` | No | `'password'` |
 | `attemptUser` | `(creds: Record<string, any>) => Promise<User \| null \| undefined>` | No | — |

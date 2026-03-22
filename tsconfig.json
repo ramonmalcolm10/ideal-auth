@@ -11,7 +11,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "isolatedModules": true,
-    "types": ["node"]
+    "types": ["node", "bun-types"]
   },
   "include": ["**/*.ts"],
   "exclude": ["__tests__", "node_modules", "dist", "docs"]

@@ -29,6 +29,8 @@ export type {
   CookieOptions,
   SessionPayload,
   AuthConfig,
+  AuthConfigWithResolveUser,
+  AuthConfigWithSessionFields,
   HashConfig,
   LoginOptions,
   AuthInstance,

@@ -335,6 +335,20 @@ describe('AuthInstance', () => {
       expect(await laravelAuth.check()).toBe(true);
     });
 
+    it('strips password from cached user after attempt', async () => {
+      await laravelAuth.attempt({
+        email: 'a@b.com',
+        password: 'correct-password',
+      });
+
+      // On the same request, user() should not expose the password
+      const user = await laravelAuth.user();
+      expect(user).not.toBeNull();
+      expect(user!.id).toBe('1');
+      expect(user!.email).toBe('a@b.com');
+      expect(user).not.toHaveProperty('password');
+    });
+
     it('fails with wrong password', async () => {
       const result = await laravelAuth.attempt({
         email: 'a@b.com',
@@ -533,7 +547,7 @@ describe('no hash/bcryptjs required', () => {
 
   it('sessionFields with attemptUser works without hash', async () => {
     const b = bridge();
-    const auth = createAuth<TestUser>({
+    const auth = createAuth<TestUser, 'email'>({
       secret: SECRET,
       cookie: b,
       sessionFields: ['email'],
@@ -548,7 +562,7 @@ describe('no hash/bcryptjs required', () => {
 
   it('sessionFields with login(user) works without hash', async () => {
     const b = bridge();
-    const auth = createAuth<TestUser>({
+    const auth = createAuth<TestUser, 'email'>({
       secret: SECRET,
       cookie: b,
       sessionFields: ['email'],
@@ -570,11 +584,11 @@ describe('sessionFields (cookie-backed sessions)', () => {
     role: 'admin',
   };
 
-  function createSessionFieldsAuth(
+  function createSessionFieldsAuth<K extends keyof FullUser & string>(
     bridge: ReturnType<typeof createMockCookieBridge>,
-    fields: (keyof FullUser & string)[],
+    fields: K[],
   ) {
-    return createAuth<FullUser>({
+    return createAuth<FullUser, K>({
       secret: SECRET,
       cookie: bridge,
       sessionFields: fields,
@@ -584,6 +598,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
   describe('validation', () => {
     it('throws when both resolveUser and sessionFields are provided', () => {
       expect(() =>
+        // @ts-expect-error — intentionally testing invalid config (both provided)
         createAuth({
           secret: SECRET,
           cookie: createMockCookieBridge(),
@@ -595,6 +610,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
 
     it('throws when neither resolveUser nor sessionFields is provided', () => {
       expect(() =>
+        // @ts-expect-error — intentionally testing invalid config (neither provided)
         createAuth({
           secret: SECRET,
           cookie: createMockCookieBridge(),
@@ -607,7 +623,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
         createAuth({
           secret: SECRET,
           cookie: createMockCookieBridge(),
-          sessionFields: [],
+          sessionFields: [] as any,
         }),
       ).toThrow('sessionFields must contain at least one field besides id');
     });
@@ -617,7 +633,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
         createAuth({
           secret: SECRET,
           cookie: createMockCookieBridge(),
-          sessionFields: ['id'],
+          sessionFields: ['id'] as any,
         }),
       ).toThrow('sessionFields must contain at least one field besides id');
     });
@@ -705,7 +721,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
   describe('attempt() with attemptUser', () => {
     it('stores sessionFields from user returned by attemptUser', async () => {
       const bridge = createMockCookieBridge();
-      const auth = createAuth<FullUser>({
+      const auth = createAuth<FullUser, 'email' | 'name' | 'role'>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email', 'name', 'role'],
@@ -722,7 +738,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
 
     it('returns false when attemptUser returns null', async () => {
       const bridge = createMockCookieBridge();
-      const auth = createAuth<FullUser>({
+      const auth = createAuth<FullUser, 'email'>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email'],
@@ -741,7 +757,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
       const hashed = await hash.make('secret123');
       const userWithPassword: FullUser = { ...fullUser, password: hashed };
 
-      const auth = createAuth<FullUser>({
+      const auth = createAuth<FullUser, 'email' | 'name'>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email', 'name'],
@@ -761,7 +777,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
   describe('loginById()', () => {
     it('throws with helpful message when used with sessionFields', () => {
       const bridge = createMockCookieBridge();
-      const auth = createAuth<FullUser>({
+      const auth = createAuth<FullUser, 'email'>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email'],
@@ -788,7 +804,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
     it('handles fields not present on user object (silently excluded)', async () => {
       const bridge = createMockCookieBridge();
       const userMissingRole = { id: '42', email: 'jane@example.com', name: 'Jane', role: undefined as unknown as string };
-      const auth = createAuth<FullUser>({
+      const auth = createAuth<FullUser, 'email' | 'name' | 'role'>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email', 'name', 'role'],
@@ -833,7 +849,7 @@ describe('sessionFields (cookie-backed sessions)', () => {
       await oldAuth.login(fullUser);
 
       // Now switch to sessionFields config and try to read the old session
-      const newAuth = createAuth<FullUser>({
+      const newAuth = createAuth<FullUser, 'email' | 'name'>({
         secret: SECRET,
         cookie: bridge,
         sessionFields: ['email', 'name'],

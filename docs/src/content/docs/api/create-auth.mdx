@@ -52,7 +52,7 @@ The `secret` must be at least **32 characters**. `createAuth` throws immediately
 | `session.cookie` | `Partial<ConfigurableCookieOptions>` | No | `secure` in production, `sameSite: 'lax'`, `path: '/'` |
 | `resolveUser` | `(id: string) => Promise<TUser \| null \| undefined>` | Yes (unless `sessionFields` is provided) | — |
 | `sessionFields` | `(keyof TUser & string)[]` | Yes (unless `resolveUser` is provided) | — |
-| `resolveUserByCredentials` | `(credentials: Record<string, unknown>) => Promise<TUser \| null \| undefined>` | No | — |
+| `resolveUserByCredentials` | `(credentials: Record<string, unknown>) => Promise<AnyUser \| null \| undefined>` | No | — |
 | `hash` | [`HashInstance`](/ideal-auth/api/create-hash/) | No | — |
 | `credentialKey` | `string` | No | `'password'` |
 | `passwordField` | `string` | No | `'password'` |
@@ -93,10 +93,13 @@ resolveUser: async (id) => {
 
 Used by `attempt()` in [Laravel-style mode](#laravel-style-mode) to look up a user by the non-password fields of the credentials object. The `credentialKey` field (default `'password'`) is stripped before the object is passed to this function.
 
+This callback can return any user shape — it does not need to match `TUser`. It only needs to include the `id` field and the password hash field (default `'password'`). The returned object is used internally for hash verification and then the password field is stripped from the cache.
+
 ```typescript
 resolveUserByCredentials: async (credentials) => {
   // credentials = { email: "user@example.com" }
   // (password was already stripped)
+  // Can return the full DB row — password is only used for verification
   return db.user.findUnique({ where: { email: credentials.email } });
 }
 ```
