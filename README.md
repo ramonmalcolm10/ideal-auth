@@ -552,18 +552,6 @@ cookie: {
 
 Zero framework imports. Works in Node, Bun, Deno, and edge runtimes.
 
-## Claude Code
-
-If you use [Claude Code](https://claude.com/claude-code), install the ideal-auth plugin so your AI assistant knows the full API, cookie bridge patterns, security best practices, and implementation guides:
-
-```bash
-claude plugin install github:ramonmalcolm10/ideal-auth
-```
-
-After installing, Claude Code will automatically help with auth setup, login/registration flows, middleware, 2FA, password reset, rate limiting, and more — using the correct patterns for your framework.
-
----
-
 ## Support
 
 If this saved you time, consider supporting the project:
