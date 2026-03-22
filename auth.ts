@@ -1,4 +1,4 @@
-import type { AnyUser, AuthInstance, AuthConfig, AuthConfigWithResolveUser, AuthConfigWithSessionFields } from './types';
+import type { AnyUser, AuthInstance, AuthConfig } from './types';
 import { createAuthInstance } from './auth-instance';
 
 const SESSION_DEFAULTS = {
@@ -7,19 +7,23 @@ const SESSION_DEFAULTS = {
   rememberMaxAge: 60 * 60 * 24 * 30, // 30 days
 };
 
-/** Database-backed: `user()` returns `TUser` (the safe type from `resolveUser`). */
-export function createAuth<TUser extends AnyUser>(
-  config: AuthConfigWithResolveUser<TUser>,
-): () => AuthInstance<TUser>;
-
-/** Cookie-backed: `user()` returns only `id` + the declared `sessionFields`. */
-export function createAuth<TUser extends AnyUser, K extends keyof TUser & string>(
-  config: AuthConfigWithSessionFields<TUser, K>,
-): () => AuthInstance<TUser, Pick<TUser, 'id' | K>>;
-
-export function createAuth<TUser extends AnyUser>(
+/**
+ * Create an auth factory.
+ *
+ * @example
+ * // resolveUser — user() returns SafeUser
+ * createAuth<SafeUser>({ resolveUser: ... })
+ *
+ * // sessionFields — user() returns Pick<DbUser, 'id' | 'email' | 'name'>
+ * const sessionFields = ['email', 'name'] as const;
+ * createAuth<DbUser, (typeof sessionFields)[number]>({ sessionFields, ... })
+ */
+export function createAuth<
+  TUser extends AnyUser,
+  K extends keyof TUser & string = keyof TUser & string,
+>(
   config: AuthConfig<TUser>,
-): () => AuthInstance<TUser, any> {
+): () => AuthInstance<TUser, Pick<TUser, 'id' | K>> {
   if (!config.secret || config.secret.length < 32) {
     throw new Error('secret must be at least 32 characters');
   }
