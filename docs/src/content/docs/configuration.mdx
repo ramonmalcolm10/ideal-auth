@@ -65,9 +65,9 @@ const auth = createAuth({
 | `secret` | `string` | — | **Required.** Encryption secret, at least 32 characters. Typically `process.env.IDEAL_AUTH_SECRET`. |
 | `cookie` | `CookieBridge` | — | **Required.** Object with `get`, `set`, and `delete` methods for your framework's cookie API. See [Getting Started](/ideal-auth/getting-started/). |
 | `session` | `object` | See below | Session configuration (cookie name, TTL, cookie options). |
-| `resolveUser` | `(id: string) => Promise<TUser \| null>` | — | Looks up a user by ID. Called when rehydrating a session from an encrypted cookie. **Required** unless `sessionFields` is provided. |
-| `sessionFields` | `(keyof TUser & string)[]` | — | Fields from the user object to store in the session cookie. When provided, `user()` returns the stored fields directly — no database call. **Required** unless `resolveUser` is provided. Cannot be used together with `resolveUser`. |
-| `resolveUserByCredentials` | `(credentials: Record<string, any>) => Promise<TUser \| null>` | `undefined` | Looks up a user by credentials (with the password field stripped). Used by `attempt()` in the Laravel-style flow. |
+| `resolveUser` | `(id: string) => Promise<TUser \| null \| undefined>` | — | Looks up a user by ID. Called when rehydrating a session from an encrypted cookie. **Required** unless `sessionFields` is provided. The return type defines what `user()` exposes — only select safe fields (no password). |
+| `sessionFields` | `(keyof TUser & string)[]` | — | Fields from the user object to store in the session cookie. When provided, `user()` returns only `id` + the declared fields. **Required** unless `resolveUser` is provided. Cannot be used together with `resolveUser`. |
+| `resolveUserByCredentials` | `(credentials) => Promise<AnyUser \| null \| undefined>` | `undefined` | Looks up a user by credentials (with the password field stripped). Used by `attempt()` in the Laravel-style flow. Can return any shape — only needs `id` + the `passwordField` for verification. Does not need to match `TUser`. |
 | `hash` | `HashInstance` | `undefined` | A `createHash()` instance. Required if using `resolveUserByCredentials` with `attempt()`. |
 | `credentialKey` | `string` | `'password'` | The key in the credentials object that holds the plaintext password. `attempt()` strips this key before passing credentials to `resolveUserByCredentials`. |
 | `passwordField` | `string` | `'password'` | The field on the user object that holds the stored bcrypt hash. Used by `attempt()` to verify the password. |
@@ -124,38 +124,64 @@ const auth = createAuth({
 
 ### Session modes
 
-`createAuth` supports two mutually exclusive modes for how `user()` resolves the authenticated user. Provide exactly one of `resolveUser` or `sessionFields`.
+`createAuth` supports two mutually exclusive modes for how `user()` resolves the authenticated user. Provide exactly one of `resolveUser` or `sessionFields`. TypeScript will show an error in your editor if you provide both or neither.
 
-**Database-backed (`resolveUser`):** The session cookie stores only the user ID. Every `user()` call invokes `resolveUser(id)` to fetch the full user from your database. Best when you need real-time data (e.g., role changes take effect immediately).
+**Database-backed (`resolveUser`):** The session cookie stores only the user ID. Every `user()` call invokes `resolveUser(id)` to fetch the user from your database. The return type of `resolveUser` defines what `user()` exposes — only select safe fields.
 
 ```ts
-const auth = createAuth({
+// TUser is the safe type — no password, no sensitive fields
+type SafeUser = {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+};
+
+const auth = createAuth<SafeUser>({
   secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
-  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+
+  // Returns SafeUser — this is what user() exposes
+  resolveUser: async (id) => db.user.findFirst({
+    where: { id },
+    columns: { id: true, email: true, name: true, role: true }, // no password
+  }),
+
+  // Can return any shape — only needs id + password field for verification
+  // Does NOT need to match SafeUser
+  resolveUserByCredentials: async (creds) => db.user.findFirst({
+    where: { email: creds.email },
+  }),
   hash,
-  resolveUserByCredentials: async (creds) =>
-    db.user.findUnique({ where: { email: creds.email } }),
 });
 
-// user() hits the database on every call
 const user = await auth().user();
+// Type: SafeUser | null — no password, safe to pass to client
 ```
 
-**Cookie-backed (`sessionFields`):** The session cookie stores the user ID plus the declared fields. `user()` reads directly from the cookie — zero external calls. Best for performance, stateless architectures, or apps without a database.
+**Cookie-backed (`sessionFields`):** The session cookie stores the user ID plus the declared fields. `user()` returns only `id` + the declared fields — everything else (including password) is excluded from the type.
 
 ```ts
-const auth = createAuth<User>({
+type DbUser = {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  password: string;
+};
+
+const auth = createAuth<DbUser>({
   secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   sessionFields: ['email', 'name', 'role'],
-  hash,
   resolveUserByCredentials: async (creds) =>
-    db.user.findUnique({ where: { email: creds.email } }),
+    db.user.findFirst({ where: { email: creds.email } }),
+  hash,
 });
 
-// user() reads from the cookie — no database call
-const user = await auth().user(); // { id, email, name, role }
+const user = await auth().user();
+// Type: Pick<DbUser, 'id' | 'email' | 'name' | 'role'> | null
+// No password on the type — safe to pass to client
 ```
 
 :::note
@@ -169,6 +195,23 @@ The `id` field is always stored in the session cookie regardless of mode. You do
 :::caution
 With `sessionFields`, the cookie data is a snapshot from login time. If the user updates their profile, the cookie still has the old values until they re-login. To refresh, call `auth().login(updatedUser)` after the update.
 :::
+
+### Password safety
+
+ideal-auth strips the password field from the cached user after `attempt()` succeeds. This means even on the same request, `user()` will not include the password. However, you should still follow these practices:
+
+- **`resolveUser` mode:** Type `TUser` as the safe type (without password). Only select non-sensitive columns in your `resolveUser` query. `resolveUserByCredentials` can return the full database row — it's only used internally for hash verification.
+- **`sessionFields` mode:** Only declare non-sensitive fields. The `password` field is never stored in the cookie and is excluded from the `user()` return type.
+- **Same-request `user()` after `attempt()`:** If `resolveUserByCredentials` returns fewer fields than `resolveUser` (e.g., only `id` + `email` + `password` for verification), calling `user()` on the same request after `attempt()` returns those fields minus the password. Fields like `name` or `role` will be missing until the next request, when `resolveUser` is called. To avoid this, either return the same fields from both callbacks, or don't call `user()` on the same request as `attempt()` (redirect after login instead).
+- **Never pass `user()` directly to the client without filtering.** Even with correct types, always be explicit about what you send:
+
+  ```ts
+  // Server Component (Next.js)
+  const user = await auth().user();
+
+  // Only pass what the client needs — never spread the full user
+  return <Dashboard user={{ name: user.name, email: user.email }} />;
+  ```
 
 | | `resolveUser` | `sessionFields` |
 |---|---|---|

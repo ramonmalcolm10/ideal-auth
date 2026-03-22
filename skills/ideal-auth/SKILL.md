@@ -71,70 +71,83 @@ Returns a factory function. Call `auth()` per request to get an `AuthInstance` s
 #### AuthConfig
 
 ```typescript
-type AuthConfig<TUser extends AnyUser> = {
-  secret: string;                    // 32+ chars, required — throws if shorter
-  cookie: CookieBridge;              // required
+// Session mode — provide exactly ONE of resolveUser or sessionFields
+// TypeScript will error if you provide both or neither
 
-  // Session mode — provide exactly ONE of these two:
-  resolveUser?: (id: string) => Promise<TUser | null>;  // DB-backed: user() calls this every request
-  sessionFields?: (keyof TUser & string)[];              // Cookie-backed: user() reads from cookie, zero external calls
-
-  // Session options
-  session?: {
-    cookieName?: string;             // default: 'ideal_session'
-    maxAge?: number;                 // default: 604800 (7 days, in seconds)
-    rememberMaxAge?: number;         // default: 2592000 (30 days, in seconds)
-    cookie?: Partial<ConfigurableCookieOptions>;
-  };
-
-  // Laravel-style attempt (recommended)
+// resolveUser mode: TUser is the safe type returned by resolveUser and user()
+type AuthConfigWithResolveUser<TUser> = {
+  secret: string;
+  cookie: CookieBridge;
+  resolveUser: (id: string) => Promise<TUser | null | undefined>;
+  sessionFields?: never;
+  // resolveUserByCredentials can return any shape — only needs id + passwordField
+  resolveUserByCredentials?: (credentials: Record<string, any>) => Promise<AnyUser | null | undefined>;
   hash?: HashInstance;
-  resolveUserByCredentials?: (credentials: Record<string, any>) => Promise<TUser | null>;
-  credentialKey?: string;            // default: 'password'
-  passwordField?: string;            // default: 'password'
+  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
+  // ...session options
+};
 
-  // Manual attempt (escape hatch — takes precedence if both provided)
-  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null>;
+// sessionFields mode: user() returns Pick<TUser, 'id' | K>
+type AuthConfigWithSessionFields<TUser, K extends keyof TUser> = {
+  secret: string;
+  cookie: CookieBridge;
+  resolveUser?: never;
+  sessionFields: K[];
+  resolveUserByCredentials?: (credentials: Record<string, any>) => Promise<AnyUser | null | undefined>;
+  hash?: HashInstance;
+  attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
+  // ...session options
 };
 ```
 
 #### Session Modes
 
-**Database-backed (`resolveUser`):** Cookie stores only user ID. `user()` calls `resolveUser(id)` every request. Best for real-time data freshness.
+**Database-backed (`resolveUser`):** Cookie stores only user ID. `user()` calls `resolveUser(id)` every request. Type `TUser` as the safe type — only select non-sensitive columns.
 
 ```typescript
-const auth = createAuth<User>({
+type SafeUser = { id: string; email: string; name: string; role: string };
+
+const auth = createAuth<SafeUser>({
   secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: createCookieBridge(),
-  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+  // Returns SafeUser — no password
+  resolveUser: async (id) => db.user.findFirst({
+    where: { id },
+    columns: { id: true, email: true, name: true, role: true },
+  }),
+  // Can return full DB row — only used internally for hash verification
+  resolveUserByCredentials: async (creds) => db.user.findFirst({
+    where: { email: creds.email },
+  }),
   hash,
-  resolveUserByCredentials: async (creds) =>
-    db.user.findUnique({ where: { email: creds.email } }),
 });
+const user = await auth().user(); // Type: SafeUser | null
 ```
 
-**Cookie-backed (`sessionFields`):** Cookie stores user ID + declared fields. `user()` reads from cookie — zero external calls. Best for performance, stateless apps, or apps without a database.
+**Cookie-backed (`sessionFields`):** Cookie stores user ID + declared fields. `user()` returns `Pick<TUser, 'id' | K>` — password excluded from the type.
 
 ```typescript
-const auth = createAuth<User>({
+type DbUser = { id: string; email: string; name: string; role: string; password: string };
+
+const auth = createAuth<DbUser>({
   secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: createCookieBridge(),
   sessionFields: ['email', 'name', 'role'],
+  resolveUserByCredentials: async (creds) => db.user.findFirst({ where: { email: creds.email } }),
   hash,
-  resolveUserByCredentials: async (creds) =>
-    db.user.findUnique({ where: { email: creds.email } }),
 });
-// user() returns { id, email, name, role } from cookie
+const user = await auth().user(); // Type: Pick<DbUser, 'id' | 'email' | 'name' | 'role'> | null
 ```
 
 Key rules:
-- Provide exactly one of `resolveUser` or `sessionFields` — both or neither throws
-- `id` is always stored — don't include it in `sessionFields`
+- Provide exactly one of `resolveUser` or `sessionFields` — TypeScript errors if both or neither
+- `resolveUser` mode: `TUser` is the safe type. Only select non-sensitive fields in your query
+- `sessionFields` mode: `user()` type is `Pick<TUser, 'id' | ...fields>` — password excluded automatically
+- `resolveUserByCredentials` returns `AnyUser` — doesn't need to match `TUser`, only needs `id` + password field
+- Password is stripped from the cached user after `attempt()` — even same-request `user()` won't expose it
 - Cookie limit is ~4KB — store basic fields only
-- `sessionFields` data is a snapshot from login time — stale if user updates profile mid-session
-- To refresh, call `auth().login(updatedUser)` after the update
 - `loginById()` requires `resolveUser` — throws with `sessionFields`
-- Both modes work with `attempt()`, `attemptUser`, `hash + resolveUserByCredentials`
+- Never pass `user()` directly to the client — always pick the specific fields you need
 
 #### AuthInstance Methods
 

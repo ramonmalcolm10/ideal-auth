@@ -46,10 +46,12 @@ interface AuthConfigBase<TUser extends AnyUser> {
 
   // Laravel-style: provide hash + resolveUserByCredentials and attempt()
   // automatically strips "password", looks up the user, and verifies the hash.
+  // resolveUserByCredentials can return any user shape — it only needs id + the passwordField.
+  // It does NOT need to match TUser since it's only used internally for verification.
   hash?: HashInstance;
   resolveUserByCredentials?: (
     credentials: Record<string, any>,
-  ) => Promise<TUser | null | undefined>;
+  ) => Promise<AnyUser | null | undefined>;
   credentialKey?: string; // key in credentials holding the plaintext password (default: 'password')
   passwordField?: string; // field on user holding the hash (default: 'password')
 
@@ -58,8 +60,14 @@ interface AuthConfigBase<TUser extends AnyUser> {
   attemptUser?: (credentials: Record<string, any>) => Promise<TUser | null | undefined>;
 }
 
-/** Database-backed: `user()` calls `resolveUser(id)` on every request. */
-interface AuthConfigWithResolveUser<TUser extends AnyUser> extends AuthConfigBase<TUser> {
+/**
+ * Database-backed: `user()` calls `resolveUser(id)` on every request.
+ *
+ * `TUser` is the safe user type returned by `resolveUser` — this is what `user()` exposes.
+ * It should NOT include sensitive fields like password.
+ * `resolveUserByCredentials` can return any shape (it only needs id + password field for verification).
+ */
+export interface AuthConfigWithResolveUser<TUser extends AnyUser> extends AuthConfigBase<TUser> {
   resolveUser: (id: string) => Promise<TUser | null | undefined>;
   /** Cannot use `sessionFields` together with `resolveUser`. */
   sessionFields?: never;
@@ -80,10 +88,13 @@ interface AuthConfigWithResolveUser<TUser extends AnyUser> extends AuthConfigBas
  * **ID type:** `user()` always returns `id` as a `string` on subsequent
  * requests (read from cookie), even if the original `TUser.id` was a number.
  */
-interface AuthConfigWithSessionFields<TUser extends AnyUser> extends AuthConfigBase<TUser> {
+export interface AuthConfigWithSessionFields<
+  TUser extends AnyUser,
+  K extends keyof TUser & string = keyof TUser & string,
+> extends AuthConfigBase<TUser> {
   /** Cannot use `resolveUser` together with `sessionFields`. */
   resolveUser?: never;
-  sessionFields: (keyof TUser & string)[];
+  sessionFields: K[];
 }
 
 export type AuthConfig<TUser extends AnyUser = AnyUser> =
@@ -94,13 +105,13 @@ export interface HashConfig {
   rounds?: number;
 }
 
-export interface AuthInstance<TUser extends AnyUser = AnyUser> {
+export interface AuthInstance<TUser extends AnyUser = AnyUser, TSessionUser = TUser> {
   login(user: TUser, options?: LoginOptions): Promise<void>;
   loginById(id: string, options?: LoginOptions): Promise<void>;
   attempt(credentials: Record<string, any>, options?: LoginOptions): Promise<boolean>;
   logout(): Promise<void>;
   check(): Promise<boolean>;
-  user(): Promise<TUser | null>;
+  user(): Promise<TSessionUser | null>;
   id(): Promise<string | null>;
 }
 
