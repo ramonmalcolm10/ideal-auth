@@ -118,10 +118,14 @@ const resendLimiter = createRateLimiter({
      }
 
      // Mark as verified
-     await db.user.update({
+     const updatedUser = await db.user.update({
        where: { id: userId },
        data: { emailVerifiedAt: new Date() },
      });
+
+     // Login (or refresh session) so emailVerifiedAt is up to date
+     const session = auth();
+     await session.login(updatedUser);
 
      return res.json({ message: 'Email verified successfully' });
    }
