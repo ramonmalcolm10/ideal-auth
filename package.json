@@ -51,5 +51,32 @@
     "type": "git",
     "url": "git+https://github.com/ramonmalcolm10/ideal-auth.git"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "keywords": [
+    "auth",
+    "authentication",
+    "session",
+    "cookie",
+    "login",
+    "password",
+    "bcrypt",
+    "argon2",
+    "hash",
+    "totp",
+    "2fa",
+    "two-factor",
+    "mfa",
+    "rate-limit",
+    "csrf",
+    "encryption",
+    "iron-session",
+    "nextjs",
+    "sveltekit",
+    "express",
+    "hono",
+    "nuxt",
+    "bun",
+    "passkey",
+    "webauthn"
+  ]
 }
