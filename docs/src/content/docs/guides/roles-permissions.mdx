@@ -58,7 +58,7 @@ function hasMinRole(user: { role: string }, minRole: Role): boolean {
 import { createAuth } from 'ideal-auth';
 
 const auth = createAuth({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   resolveUser: (id) => db.user.findUnique({ where: { id } }),
   // ...

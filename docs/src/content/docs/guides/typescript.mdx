@@ -29,7 +29,7 @@ interface User {
 }
 
 const auth = createAuth<User>({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   resolveUser: (id) => db.user.findUnique({ where: { id } }),
   resolveUserByCredentials: (creds) =>
@@ -109,7 +109,7 @@ interface User {
 const hash = createHash();
 
 const auth = createAuth<User>({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   hash,
   resolveUser: (id) => db.user.findUnique({ where: { id } }),
@@ -136,7 +136,7 @@ interface User {
 const hash = createHash();
 
 const auth = createAuth<User>({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   hash,
   resolveUser: async (id) => {
@@ -169,7 +169,7 @@ interface User {
 const hash = createHash();
 
 const auth = createAuth<User>({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   hash,
   resolveUser: async (id) => {
@@ -208,7 +208,7 @@ interface DBUser {
 type User = Omit<DBUser, 'password'>;
 
 const auth = createAuth<User>({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   hash,
   resolveUser: async (id) => {
@@ -243,7 +243,7 @@ interface User {
 }
 
 const auth = createAuth<User>({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   hash,
   resolveUser: async (id) => {
@@ -313,7 +313,7 @@ const cookieOverrides: Partial<ConfigurableCookieOptions> = {
 };
 
 const auth = createAuth<User>({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   session: {
     cookie: cookieOverrides,
@@ -331,7 +331,7 @@ function createAuthWithDefaults(
   cookieOptions?: Partial<ConfigurableCookieOptions>,
 ) {
   return createAuth<User>({
-    secret: process.env.SESSION_SECRET,
+    secret: process.env.IDEAL_AUTH_SECRET!,
     cookie: cookieBridge,
     session: {
       cookie: {

@@ -84,7 +84,7 @@ import { createAuth, createHash } from 'ideal-auth';
 
 const hash = createHash();
 const auth = createAuth({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   hash,
   resolveUser: (id) => db.user.findUnique({ where: { id } }),
@@ -140,7 +140,7 @@ Override the default durations in your `createAuth` config:
 
 ```ts
 const auth = createAuth({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   session: {
     maxAge: 60 * 60 * 24 * 3,      // 3 days (default, when remember is omitted)
@@ -193,7 +193,7 @@ import { createAuth, createHash } from 'ideal-auth';
 const hash = createHash();
 
 const auth = createAuth({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   hash,
   session: {

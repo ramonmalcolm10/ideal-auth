@@ -157,7 +157,7 @@ import { createAuth, createHash, createTokenVerifier } from 'ideal-auth';
 
 const hash = createHash();
 const auth = createAuth({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   cookie: cookieBridge,
   hash,
   resolveUser: (id) => db.user.findUnique({ where: { id } }),
@@ -167,7 +167,7 @@ const auth = createAuth({
 
 // Token verifier for the 2FA pending state (short-lived)
 const pendingVerifier = createTokenVerifier({
-  secret: process.env.SESSION_SECRET,
+  secret: process.env.IDEAL_AUTH_SECRET!,
   expiryMs: 5 * 60 * 1000, // 5 minutes
 });
 
