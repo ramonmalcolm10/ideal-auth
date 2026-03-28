@@ -548,7 +548,7 @@ const hash = createHash();
 
 export function createAppAuth(cookie: CookieBridge) {
   return createAuth({
-    secret: process.env.SESSION_SECRET!,
+    secret: process.env.IDEAL_AUTH_SECRET!,
     cookie,
     hash,
     resolveUser: (id) => db.user.findUnique({ where: { id } }),
