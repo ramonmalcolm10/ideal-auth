@@ -154,6 +154,7 @@ Key rules:
 | `check()` | `Promise<boolean>` | Is the session valid? (fast, cached) |
 | `user()` | `Promise<TUser \| null>` | Get the authenticated user (from DB with `resolveUser`, or from cookie with `sessionFields`) |
 | `id()` | `Promise<string \| null>` | Get the authenticated user's ID |
+| `touch()` | `Promise<void>` | Re-seal the session cookie with a fresh expiry. No database call needed. |
 
 #### LoginOptions
 
@@ -165,6 +166,20 @@ type LoginOptions = {
   // undefined: use default maxAge (7 days)
 };
 ```
+
+#### Session Extension with `touch()`
+
+Sessions have a fixed expiry. Call `touch()` in middleware to extend the session for active users:
+
+```typescript
+// In middleware — where cookie writes are allowed
+const session = auth();
+if (await session.check()) {
+  await session.touch(); // re-seals cookie with fresh exp
+}
+```
+
+`touch()` re-seals with the same `maxAge` as the original session. No database call needed. `check()`, `user()`, and `id()` are read-only — they never write cookies. Only call `touch()` where cookie writes are allowed (middleware, route handlers, server actions — NOT Server Components).
 
 #### `attempt()` — Two Modes
 

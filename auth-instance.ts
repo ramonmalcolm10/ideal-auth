@@ -172,5 +172,25 @@ export function createAuthInstance<TUser extends AnyUser>(
       const session = await readSession();
       return session?.uid ?? null;
     },
+
+    async touch(): Promise<void> {
+      const session = await readSession();
+      if (!session) return;
+
+      const maxAge = session.exp - session.iat;
+      const now = Math.floor(Date.now() / 1000);
+      const newPayload: SessionPayload = {
+        uid: session.uid,
+        iat: session.iat,  // preserve original issued-at for passwordChangedAt checks
+        exp: now + maxAge,
+        ...(session.data !== undefined && { data: session.data }),
+      };
+
+      const sealed = await seal(newPayload, deps.secret);
+      const opts = buildCookieOptions(maxAge, deps.cookieOptions);
+      await deps.cookie.set(deps.cookieName, sealed, opts);
+
+      cachedPayload = newPayload;
+    },
   };
 }

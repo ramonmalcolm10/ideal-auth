@@ -462,6 +462,74 @@ describe('AuthInstance', () => {
     });
   });
 
+  describe('touch()', () => {
+    it('does nothing when no session exists', async () => {
+      await auth.touch();
+      expect(await auth.check()).toBe(false);
+    });
+
+    it('re-seals the session with a fresh expiry', async () => {
+      await auth.login(testUser);
+
+      // Read the cookie before touch
+      const cookieBefore = bridge.jar.get('ideal_session')!;
+
+      await auth.touch();
+
+      // Cookie should be different (new exp)
+      const cookieAfter = bridge.jar.get('ideal_session')!;
+      expect(cookieAfter).not.toBe(cookieBefore);
+
+      // Session should still be valid
+      const auth2 = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: bridge,
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      })();
+      expect(await auth2.check()).toBe(true);
+    });
+
+    it('preserves original iat after touch (for passwordChangedAt checks)', async () => {
+      const { unseal } = await import('../session/seal');
+
+      await auth.login(testUser);
+
+      // Get the original iat from the sealed session
+      const cookieBefore = bridge.jar.get('ideal_session')!;
+      const payloadBefore = await unseal(cookieBefore, SECRET);
+      const originalIat = payloadBefore!.iat;
+
+      // Wait a moment so the clock advances
+      await new Promise((r) => setTimeout(r, 1100));
+
+      await auth.touch();
+
+      // Unseal the touched cookie and verify iat is preserved
+      const cookieAfter = bridge.jar.get('ideal_session')!;
+      const payloadAfter = await unseal(cookieAfter, SECRET);
+
+      expect(payloadAfter!.iat).toBe(originalIat); // iat must NOT change
+      expect(payloadAfter!.exp).toBeGreaterThan(payloadBefore!.exp); // exp must be extended
+    });
+  });
+
+  describe('check() is read-only', () => {
+    it('does not write cookies when reading session', async () => {
+      await auth.login(testUser);
+      const cookieAfterLogin = bridge.jar.get('ideal_session')!;
+
+      // New instance — check() should only read, never write
+      const auth2 = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: bridge,
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      })();
+      await auth2.check();
+
+      expect(bridge.jar.get('ideal_session')).toBe(cookieAfterLogin);
+    });
+  });
+
   describe('check()', () => {
     it('returns false when not logged in', async () => {
       expect(await auth.check()).toBe(false);

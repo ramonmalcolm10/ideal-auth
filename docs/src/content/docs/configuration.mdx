@@ -271,6 +271,28 @@ The payload is encrypted using iron-session (AES-256-CBC + HMAC-SHA-256). It can
 Session cookies have a **~4KB size limit** (including encryption overhead). Basic fields like `id`, `email`, `name`, and `role` fit easily. Avoid storing large values like JWTs with many claims. If you need to store an access token, test that the total cookie size stays under 4KB.
 :::
 
+### Session extension with `touch()`
+
+Session cookies have a fixed expiry set at login time. To keep active users logged in, call `touch()` in your middleware to re-seal the cookie with a fresh expiry:
+
+```ts
+// In middleware or a route handler — where cookie writes are allowed
+const session = auth();
+if (await session.check()) {
+  await session.touch();
+}
+```
+
+`touch()` re-seals the session cookie with a new `iat`/`exp` using the same `maxAge` as the original session. If the user logged in with `remember: true` (30 days), `touch()` extends by 30 days. No database call, no user object needed. Does nothing if no valid session exists.
+
+:::caution
+Call `touch()` only in contexts where cookie writes are allowed (middleware, Route Handlers, Server Actions). Do not call it in Next.js Server Components — `cookies().set()` throws in read-only contexts. `check()`, `user()`, and `id()` are read-only and safe to call anywhere.
+:::
+
+:::note
+`touch()` only extends the session lifetime — it does not update user data in the cookie. If you need to update user data (e.g., after email verification or profile changes), call `auth().login(updatedUser)` instead.
+:::
+
 ---
 
 ## Password hashing
@@ -630,12 +652,12 @@ import {
     import { cookies } from 'next/headers';
     import { db } from './db';
 
+    // TUser is the session user — no password
     type User = {
       id: string;
       email: string;
       name: string;
       role: string;
-      password: string;
     };
 
     const cookieBridge = {
