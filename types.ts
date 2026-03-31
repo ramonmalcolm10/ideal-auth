@@ -113,6 +113,8 @@ export interface AuthInstance<TUser extends AnyUser = AnyUser> {
   check(): Promise<boolean>;
   user(): Promise<TUser | null>;
   id(): Promise<string | null>;
+  /** Re-seal the session cookie with a fresh expiry. No database call needed. Does nothing if no valid session exists. */
+  touch(): Promise<void>;
 }
 
 export interface HashInstance {
