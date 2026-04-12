@@ -44,6 +44,7 @@ export function createAuth<TUser extends AnyUser>(
       maxAge: config.session?.maxAge ?? SESSION_DEFAULTS.maxAge,
       rememberMaxAge: config.session?.rememberMaxAge ?? SESSION_DEFAULTS.rememberMaxAge,
       cookieOptions: config.session?.cookie ?? {},
+      autoTouch: config.session?.autoTouch ?? false,
       resolveUser: config.resolveUser,
       sessionFields: config.sessionFields,
       hash: config.hash,

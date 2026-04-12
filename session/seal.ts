@@ -24,6 +24,7 @@ export async function unseal(
       uid: data.uid,
       iat: data.iat,
       exp: data.exp,
+      ttl: (typeof data.ttl === 'number' && data.ttl > 0) ? data.ttl : (data.exp - data.iat),
       ...(data.data !== undefined && { data: data.data }),
     };
   } catch {

@@ -17,6 +17,7 @@ interface AuthInstanceDeps<TUser extends AnyUser> {
   maxAge: number;
   rememberMaxAge: number;
   cookieOptions: ConfigurableCookieOptions;
+  autoTouch: boolean;
   resolveUser?: (id: string) => Promise<TUser | null | undefined>;
   sessionFields?: (keyof TUser & string)[];
   hash?: HashInstance;
@@ -34,6 +35,8 @@ export function createAuthInstance<TUser extends AnyUser>(
   let cachedPayload: SessionPayload | null | undefined;
   let cachedUser: TUser | null | undefined;
 
+  let didAutoTouch = false;
+
   async function readSession(): Promise<SessionPayload | null> {
     if (cachedPayload !== undefined) return cachedPayload;
 
@@ -44,7 +47,35 @@ export function createAuthInstance<TUser extends AnyUser>(
     }
 
     cachedPayload = await unseal(raw, deps.secret);
+
+    // Auto-touch: reseal past halfway when enabled
+    if (deps.autoTouch && cachedPayload && !didAutoTouch) {
+      const elapsed = Math.floor(Date.now() / 1000) - cachedPayload.iat;
+      if (elapsed >= cachedPayload.ttl / 2) {
+        await resealSession(cachedPayload);
+      }
+    }
+
     return cachedPayload;
+  }
+
+  async function resealSession(session: SessionPayload): Promise<void> {
+    didAutoTouch = true;
+    const ttl = session.ttl;
+    const now = Math.floor(Date.now() / 1000);
+    const newPayload: SessionPayload = {
+      uid: session.uid,
+      iat: session.iat,  // preserve original issued-at for passwordChangedAt checks
+      exp: now + ttl,
+      ttl,
+      ...(session.data !== undefined && { data: session.data }),
+    };
+
+    const sealed = await seal(newPayload, deps.secret);
+    const opts = buildCookieOptions(ttl, deps.cookieOptions);
+    await deps.cookie.set(deps.cookieName, sealed, opts);
+
+    cachedPayload = newPayload;
   }
 
   function pickSessionData(user: TUser): Record<string, unknown> | undefined {
@@ -69,6 +100,7 @@ export function createAuthInstance<TUser extends AnyUser>(
       uid: String(user.id),
       iat: now,
       exp: now + maxAge,
+      ttl: maxAge,
       data: pickSessionData(user),
     };
 
@@ -176,21 +208,16 @@ export function createAuthInstance<TUser extends AnyUser>(
     async touch(): Promise<void> {
       const session = await readSession();
       if (!session) return;
+      if (didAutoTouch) return; // already resealed by autoTouch on this request
 
-      const maxAge = session.exp - session.iat;
-      const now = Math.floor(Date.now() / 1000);
-      const newPayload: SessionPayload = {
-        uid: session.uid,
-        iat: session.iat,  // preserve original issued-at for passwordChangedAt checks
-        exp: now + maxAge,
-        ...(session.data !== undefined && { data: session.data }),
-      };
+      // autoTouch enabled: reseal immediately (user opted in to cookie writes)
+      // autoTouch disabled: only reseal past halfway (conservative)
+      if (!deps.autoTouch) {
+        const elapsed = Math.floor(Date.now() / 1000) - session.iat;
+        if (elapsed < session.ttl / 2) return;
+      }
 
-      const sealed = await seal(newPayload, deps.secret);
-      const opts = buildCookieOptions(maxAge, deps.cookieOptions);
-      await deps.cookie.set(deps.cookieName, sealed, opts);
-
-      cachedPayload = newPayload;
+      await resealSession(session);
     },
   };
 }

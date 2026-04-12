@@ -468,22 +468,44 @@ describe('AuthInstance', () => {
       expect(await auth.check()).toBe(false);
     });
 
-    it('re-seals the session with a fresh expiry', async () => {
+    it('does not reseal when session is before the halfway point', async () => {
+      // Default maxAge is 7 days — just created, well before halfway
       await auth.login(testUser);
-
-      // Read the cookie before touch
       const cookieBefore = bridge.jar.get('ideal_session')!;
 
       await auth.touch();
 
-      // Cookie should be different (new exp)
-      const cookieAfter = bridge.jar.get('ideal_session')!;
+      // Cookie should be unchanged — not past halfway
+      expect(bridge.jar.get('ideal_session')).toBe(cookieBefore);
+    });
+
+    it('reseals when session is past the halfway point', async () => {
+      // Use 2-second maxAge so we can cross the halfway point quickly
+      const shortBridge = createMockCookieBridge();
+      const shortAuth = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: shortBridge,
+        session: { maxAge: 2 },
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      })();
+
+      await shortAuth.login(testUser);
+      const cookieBefore = shortBridge.jar.get('ideal_session')!;
+
+      // Wait past halfway (> 1 second)
+      await new Promise((r) => setTimeout(r, 1100));
+
+      await shortAuth.touch();
+
+      // Cookie should be different — resealed with new exp
+      const cookieAfter = shortBridge.jar.get('ideal_session')!;
       expect(cookieAfter).not.toBe(cookieBefore);
 
       // Session should still be valid
       const auth2 = createAuth<TestUser>({
         secret: SECRET,
-        cookie: bridge,
+        cookie: shortBridge,
+        session: { maxAge: 2 },
         resolveUser: async (id) => (id === '1' ? testUser : null),
       })();
       expect(await auth2.check()).toBe(true);
@@ -492,20 +514,27 @@ describe('AuthInstance', () => {
     it('preserves original iat after touch (for passwordChangedAt checks)', async () => {
       const { unseal } = await import('../session/seal');
 
-      await auth.login(testUser);
+      // Use 2-second maxAge
+      const shortBridge = createMockCookieBridge();
+      const shortAuth = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: shortBridge,
+        session: { maxAge: 2 },
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      })();
 
-      // Get the original iat from the sealed session
-      const cookieBefore = bridge.jar.get('ideal_session')!;
+      await shortAuth.login(testUser);
+
+      const cookieBefore = shortBridge.jar.get('ideal_session')!;
       const payloadBefore = await unseal(cookieBefore, SECRET);
       const originalIat = payloadBefore!.iat;
 
-      // Wait a moment so the clock advances
+      // Wait past halfway
       await new Promise((r) => setTimeout(r, 1100));
 
-      await auth.touch();
+      await shortAuth.touch();
 
-      // Unseal the touched cookie and verify iat is preserved
-      const cookieAfter = bridge.jar.get('ideal_session')!;
+      const cookieAfter = shortBridge.jar.get('ideal_session')!;
       const payloadAfter = await unseal(cookieAfter, SECRET);
 
       expect(payloadAfter!.iat).toBe(originalIat); // iat must NOT change
@@ -513,8 +542,56 @@ describe('AuthInstance', () => {
     });
   });
 
+  describe('autoTouch', () => {
+    it('check() reseals automatically when autoTouch is true and past halfway', async () => {
+      const shortBridge = createMockCookieBridge();
+      const shortAuth = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: shortBridge,
+        session: { maxAge: 2, autoTouch: true },
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      })();
+
+      await shortAuth.login(testUser);
+      const cookieBefore = shortBridge.jar.get('ideal_session')!;
+
+      // Wait past halfway
+      await new Promise((r) => setTimeout(r, 1100));
+
+      // New instance — check() should auto-reseal
+      const auth2 = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: shortBridge,
+        session: { maxAge: 2, autoTouch: true },
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      })();
+      await auth2.check();
+
+      expect(shortBridge.jar.get('ideal_session')).not.toBe(cookieBefore);
+    });
+
+    it('touch() reseals immediately when autoTouch is true (no halfway check)', async () => {
+      const b = createMockCookieBridge();
+      // Use default 7-day maxAge — session is just created, well before halfway
+      const a = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: b,
+        session: { autoTouch: true },
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      })();
+
+      await a.login(testUser);
+      const cookieBefore = b.jar.get('ideal_session')!;
+
+      await a.touch();
+
+      // Should reseal immediately even though not past halfway
+      expect(b.jar.get('ideal_session')).not.toBe(cookieBefore);
+    });
+  });
+
   describe('check() is read-only', () => {
-    it('does not write cookies when reading session', async () => {
+    it('does not write cookies when reading session (autoTouch disabled)', async () => {
       await auth.login(testUser);
       const cookieAfterLogin = bridge.jar.get('ideal_session')!;
 

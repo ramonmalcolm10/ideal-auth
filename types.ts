@@ -27,6 +27,7 @@ export interface SessionPayload {
   uid: string;
   iat: number;
   exp: number;
+  ttl: number;  // original maxAge in seconds — preserved across touches
   data?: Record<string, unknown>;
 }
 
@@ -42,6 +43,8 @@ interface AuthConfigBase<TUser extends AnyUser> {
     maxAge?: number;
     rememberMaxAge?: number;
     cookie?: Partial<ConfigurableCookieOptions>;
+    /** Automatically extend session on read when past the halfway point. Default: false. */
+    autoTouch?: boolean;
   };
 
   // Laravel-style: provide hash + resolveUserByCredentials and attempt()
@@ -113,7 +116,7 @@ export interface AuthInstance<TUser extends AnyUser = AnyUser> {
   check(): Promise<boolean>;
   user(): Promise<TUser | null>;
   id(): Promise<string | null>;
-  /** Re-seal the session cookie with a fresh expiry. No database call needed. Does nothing if no valid session exists. */
+  /** Re-seal the session cookie with a fresh expiry. When autoTouch is disabled (default), only reseals past the halfway point. No database call needed. Does nothing if no valid session exists or if already resealed on this request. */
   touch(): Promise<void>;
 }
 

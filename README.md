@@ -106,6 +106,7 @@ Returns a function `auth()` that creates an `AuthInstance` on each call.
 | `session.cookieName` | `string` | No | `'ideal_session'` |
 | `session.maxAge` | `number` (seconds) | No | `604800` (7 days) |
 | `session.rememberMaxAge` | `number` (seconds) | No | `2592000` (30 days) |
+| `session.autoTouch` | `boolean` | No | `false`. Auto-extend sessions past halfway on `check()`/`user()`/`id()`. Enable for Express/Hono. Disable for Next.js. |
 | `session.cookie` | `Partial<ConfigurableCookieOptions>` | No | secure in prod, sameSite lax, path / (`httpOnly` is always `true` — not configurable) |
 
 #### AuthInstance Methods
@@ -116,9 +117,10 @@ Returns a function `auth()` that creates an `AuthInstance` on each call.
 | `loginById(id, options?)` | `Promise<void>` | Resolve user by ID, then set session cookie |
 | `attempt(credentials, options?)` | `Promise<boolean>` | Find user, verify password, login if valid |
 | `logout()` | `Promise<void>` | Delete session cookie |
-| `check()` | `Promise<boolean>` | Is the session valid? |
-| `user()` | `Promise<User \| null>` | Get the authenticated user |
-| `id()` | `Promise<string \| null>` | Get the authenticated user's ID |
+| `check()` | `Promise<boolean>` | Is the session valid? (read-only) |
+| `user()` | `Promise<User \| null>` | Get the authenticated user (read-only) |
+| `id()` | `Promise<string \| null>` | Get the authenticated user's ID (read-only) |
+| `touch()` | `Promise<void>` | Extend session expiry. Reseals past halfway (`autoTouch: false`) or immediately (`autoTouch: true`). |
 
 All login methods accept an optional `LoginOptions` object:
 
