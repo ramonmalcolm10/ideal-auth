@@ -234,6 +234,7 @@ The `session` object on `createAuth` controls cookie naming, TTL, and cookie att
 | `maxAge` | `number` | `604800` (7 days) | Session lifetime in seconds. Used when `remember` is not set or `remember: false`. |
 | `rememberMaxAge` | `number` | `2592000` (30 days) | Extended session lifetime in seconds. Used when `login(user, { remember: true })` is called. |
 | `cookie` | `Partial<ConfigurableCookieOptions>` | `{}` | Additional cookie attributes (see table below). |
+| `autoTouch` | `boolean` | `false` | Automatically extend the session when `check()`, `user()`, or `id()` is called and the session is past the halfway point. Enable for frameworks where every route can write cookies (Express, Hono). Leave disabled for Next.js (Server Components can't write cookies). |
 
 ### Cookie options
 
@@ -271,23 +272,48 @@ The payload is encrypted using iron-session (AES-256-CBC + HMAC-SHA-256). It can
 Session cookies have a **~4KB size limit** (including encryption overhead). Basic fields like `id`, `email`, `name`, and `role` fit easily. Avoid storing large values like JWTs with many claims. If you need to store an access token, test that the total cookie size stays under 4KB.
 :::
 
-### Session extension with `touch()`
+### Session extension
 
-Session cookies have a fixed expiry set at login time. To keep active users logged in, call `touch()` in your middleware to re-seal the cookie with a fresh expiry:
+Session cookies have a fixed expiry set at login time. There are two ways to extend sessions for active users:
+
+#### Option 1: `autoTouch` (automatic)
+
+Enable `autoTouch` for frameworks where every route can write cookies (Express, Hono, Elysia). When `check()`, `user()`, or `id()` is called and the session is past the halfway point of its lifetime, the cookie is automatically re-sealed with a fresh expiry.
 
 ```ts
-// In middleware or a route handler — where cookie writes are allowed
+const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: cookieBridge,
+  session: { autoTouch: true },
+  resolveUser: async (id) => db.user.findFirst({ where: { id } }),
+});
+```
+
+:::caution
+Do not enable `autoTouch` in Next.js — `cookies().set()` throws in Server Components. Use manual `touch()` in middleware instead.
+:::
+
+#### Option 2: `touch()` (manual)
+
+Call `touch()` explicitly in middleware or route handlers. When `autoTouch` is disabled (default), `touch()` only re-seals past the halfway point — safe to call on every request without performance concerns. When `autoTouch` is enabled, `touch()` re-seals immediately.
+
+```ts
+// Next.js middleware or Express/Hono route handler
 const session = auth();
 if (await session.check()) {
   await session.touch();
 }
 ```
 
-`touch()` re-seals the session cookie with a new `iat`/`exp` using the same `maxAge` as the original session. If the user logged in with `remember: true` (30 days), `touch()` extends by 30 days. No database call, no user object needed. Does nothing if no valid session exists.
+#### Behavior summary
 
-:::caution
-Call `touch()` only in contexts where cookie writes are allowed (middleware, Route Handlers, Server Actions). Do not call it in Next.js Server Components — `cookies().set()` throws in read-only contexts. `check()`, `user()`, and `id()` are read-only and safe to call anywhere.
-:::
+| | `autoTouch: false` (default) | `autoTouch: true` |
+|---|---|---|
+| `check()` / `user()` / `id()` | Read-only, no cookie writes | Auto-reseals past halfway |
+| `touch()` | Reseals past halfway only | Reseals immediately |
+| Best for | Next.js (Server Components can't write cookies) | Express, Hono, Elysia, SvelteKit |
+
+`touch()` preserves the original `iat` (issued-at) — `passwordChangedAt` invalidation continues to work after a touch. The session's `maxAge` is also preserved: remember-me sessions extend by 30 days, standard sessions by 7 days.
 
 :::note
 `touch()` only extends the session lifetime — it does not update user data in the cookie. If you need to update user data (e.g., after email verification or profile changes), call `auth().login(updatedUser)` instead.

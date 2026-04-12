@@ -167,19 +167,34 @@ type LoginOptions = {
 };
 ```
 
-#### Session Extension with `touch()`
+#### Session Extension
 
-Sessions have a fixed expiry. Call `touch()` in middleware to extend the session for active users:
+Two options for keeping active users logged in:
+
+**`autoTouch: true`** — automatic. Enable for Express, Hono, Elysia, SvelteKit. `check()`/`user()`/`id()` auto-reseal past halfway. Do NOT use with Next.js (Server Components can't write cookies).
 
 ```typescript
-// In middleware — where cookie writes are allowed
+const auth = createAuth<User>({
+  session: { autoTouch: true },
+  ...
+});
+```
+
+**Manual `touch()`** — call in middleware. When `autoTouch` is false (default), only reseals past halfway. When `autoTouch` is true, reseals immediately.
+
+```typescript
 const session = auth();
 if (await session.check()) {
-  await session.touch(); // re-seals cookie with fresh exp
+  await session.touch();
 }
 ```
 
-`touch()` re-seals with the same `maxAge` as the original session. No database call needed. `check()`, `user()`, and `id()` are read-only — they never write cookies. Only call `touch()` where cookie writes are allowed (middleware, route handlers, server actions — NOT Server Components).
+| | `autoTouch: false` (default) | `autoTouch: true` |
+|---|---|---|
+| `check()`/`user()`/`id()` | Read-only | Auto-reseals past halfway |
+| `touch()` | Reseals past halfway | Reseals immediately |
+
+`touch()` preserves original `iat` — `passwordChangedAt` invalidation still works. Does not update user data — use `auth().login(updatedUser)` for that.
 
 #### `attempt()` — Two Modes
 
