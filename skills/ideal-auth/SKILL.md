@@ -64,9 +64,14 @@ Generate encryption key: `bunx ideal-auth encryption-key` (for encrypting TOTP s
 
 ## API Reference
 
-### `createAuth(config): () => AuthInstance`
+### `createAuth(config): (options?) => AuthInstance`
 
-Returns a factory function. Call `auth()` per request to get an `AuthInstance` scoped to that request's cookies. The instance caches the session payload and user — call it once per request and reuse.
+Returns a factory function. Call `auth()` per request to get an `AuthInstance` scoped to that request's cookies. Pass `{ autoTouch: true }` to enable automatic session extension for that request. The instance caches the session payload and user — call it once per request and reuse.
+
+```typescript
+const session = auth();                      // read-only check/user/id
+const session = auth({ autoTouch: true });   // auto-extends past halfway on check/user/id
+```
 
 #### AuthConfig
 
@@ -169,9 +174,9 @@ type LoginOptions = {
 
 #### Session Extension
 
-Two options for keeping active users logged in:
+Three ways to extend sessions for active users:
 
-**`autoTouch: true`** — automatic. Enable for Express, Hono, Elysia, SvelteKit. `check()`/`user()`/`id()` auto-reseal past halfway. Do NOT use with Next.js (Server Components can't write cookies).
+**Global `autoTouch`** — config level. For Express, Hono, Elysia, SvelteKit where every route can write cookies:
 
 ```typescript
 const auth = createAuth<User>({
@@ -180,7 +185,19 @@ const auth = createAuth<User>({
 });
 ```
 
-**Manual `touch()`** — call in middleware. When `autoTouch` is false (default), only reseals past halfway. When `autoTouch` is true, reseals immediately.
+**Per-request `autoTouch`** — pass when calling `auth()`. Ideal for Next.js where middleware can write cookies but Server Components can't:
+
+```typescript
+// Next.js middleware — autoTouch for this request only
+const session = auth({ autoTouch: true });
+await session.check(); // auto-extends past halfway
+
+// Next.js Server Component — default, read-only
+const session = auth();
+await session.check(); // no cookie writes
+```
+
+**Manual `touch()`** — explicit call in middleware. When `autoTouch` is false (default), only reseals past halfway. When `autoTouch` is true, reseals immediately:
 
 ```typescript
 const session = auth();

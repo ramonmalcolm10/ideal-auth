@@ -1,4 +1,4 @@
-import type { AnyUser, AuthInstance, AuthConfig } from './types';
+import type { AnyUser, AuthInstance, AuthConfig, AuthFactoryOptions } from './types';
 import { createAuthInstance } from './auth-instance';
 
 const SESSION_DEFAULTS = {
@@ -19,7 +19,7 @@ const SESSION_DEFAULTS = {
  */
 export function createAuth<TUser extends AnyUser>(
   config: AuthConfig<TUser>,
-): () => AuthInstance<TUser> {
+): (options?: AuthFactoryOptions) => AuthInstance<TUser> {
   if (!config.secret || config.secret.length < 32) {
     throw new Error('secret must be at least 32 characters');
   }
@@ -36,7 +36,9 @@ export function createAuth<TUser extends AnyUser>(
     throw new Error('sessionFields must contain at least one field besides id');
   }
 
-  return () =>
+  const configAutoTouch = config.session?.autoTouch ?? false;
+
+  return (options?: AuthFactoryOptions) =>
     createAuthInstance<TUser>({
       secret: config.secret,
       cookie: config.cookie,
@@ -44,7 +46,7 @@ export function createAuth<TUser extends AnyUser>(
       maxAge: config.session?.maxAge ?? SESSION_DEFAULTS.maxAge,
       rememberMaxAge: config.session?.rememberMaxAge ?? SESSION_DEFAULTS.rememberMaxAge,
       cookieOptions: config.session?.cookie ?? {},
-      autoTouch: config.session?.autoTouch ?? false,
+      autoTouch: options?.autoTouch ?? configAutoTouch,
       resolveUser: config.resolveUser,
       sessionFields: config.sessionFields,
       hash: config.hash,
