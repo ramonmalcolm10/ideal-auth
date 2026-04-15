@@ -88,7 +88,12 @@ await session.logout();
 
 ### `createAuth(config)`
 
-Returns a function `auth()` that creates an `AuthInstance` on each call.
+Returns a function `auth(options?)` that creates an `AuthInstance` on each call. Pass `{ autoTouch: true }` to enable automatic session extension for that request.
+
+```typescript
+const session = auth();                      // default — read-only check/user/id
+const session = auth({ autoTouch: true });   // auto-extends session past halfway on check/user/id
+```
 
 #### Config
 

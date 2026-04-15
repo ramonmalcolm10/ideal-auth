@@ -104,6 +104,11 @@ export type AuthConfig<TUser extends AnyUser = AnyUser> =
   | AuthConfigWithResolveUser<TUser>
   | AuthConfigWithSessionFields<TUser>;
 
+export interface AuthFactoryOptions {
+  /** Override autoTouch for this request. When true, check()/user()/id() auto-extend the session past the halfway point. */
+  autoTouch?: boolean;
+}
+
 export interface HashConfig {
   rounds?: number;
 }

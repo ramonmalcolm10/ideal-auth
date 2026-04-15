@@ -588,6 +588,72 @@ describe('AuthInstance', () => {
       // Should reseal immediately even though not past halfway
       expect(b.jar.get('ideal_session')).not.toBe(cookieBefore);
     });
+
+    it('per-request opt-in: auth({ autoTouch: true }) overrides config default', async () => {
+      // Config has NO autoTouch (defaults to false)
+      const shortBridge = createMockCookieBridge();
+      const factory = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: shortBridge,
+        session: { maxAge: 2 },
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      });
+
+      await factory().login(testUser);
+      const cookieBefore = shortBridge.jar.get('ideal_session')!;
+
+      await new Promise((r) => setTimeout(r, 1100));
+
+      // Per-request opt-in — should auto-reseal
+      const session = factory({ autoTouch: true });
+      await session.check();
+
+      expect(shortBridge.jar.get('ideal_session')).not.toBe(cookieBefore);
+    });
+
+    it('per-request opt-out: auth({ autoTouch: false }) overrides config default', async () => {
+      // Config has autoTouch: true
+      const shortBridge = createMockCookieBridge();
+      const factory = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: shortBridge,
+        session: { maxAge: 2, autoTouch: true },
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      });
+
+      await factory().login(testUser);
+      const cookieBefore = shortBridge.jar.get('ideal_session')!;
+
+      await new Promise((r) => setTimeout(r, 1100));
+
+      // Per-request opt-out — should NOT auto-reseal
+      const session = factory({ autoTouch: false });
+      await session.check();
+
+      expect(shortBridge.jar.get('ideal_session')).toBe(cookieBefore);
+    });
+
+    it('no options falls back to config default', async () => {
+      // Config has autoTouch: true
+      const shortBridge = createMockCookieBridge();
+      const factory = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: shortBridge,
+        session: { maxAge: 2, autoTouch: true },
+        resolveUser: async (id) => (id === '1' ? testUser : null),
+      });
+
+      await factory().login(testUser);
+      const cookieBefore = shortBridge.jar.get('ideal_session')!;
+
+      await new Promise((r) => setTimeout(r, 1100));
+
+      // No options — should use config default (autoTouch: true)
+      const session = factory();
+      await session.check();
+
+      expect(shortBridge.jar.get('ideal_session')).not.toBe(cookieBefore);
+    });
   });
 
   describe('check() is read-only', () => {

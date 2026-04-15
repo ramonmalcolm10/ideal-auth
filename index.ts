@@ -34,6 +34,7 @@ export type {
   HashConfig,
   LoginOptions,
   AuthInstance,
+  AuthFactoryOptions,
   HashInstance,
   TokenVerifierConfig,
   TokenVerifierInstance,

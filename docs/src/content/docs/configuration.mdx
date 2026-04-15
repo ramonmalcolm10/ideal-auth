@@ -280,6 +280,8 @@ Session cookies have a fixed expiry set at login time. There are two ways to ext
 
 Enable `autoTouch` for frameworks where every route can write cookies (Express, Hono, Elysia). When `check()`, `user()`, or `id()` is called and the session is past the halfway point of its lifetime, the cookie is automatically re-sealed with a fresh expiry.
 
+**Global (config level)** — every `auth()` call has autoTouch enabled:
+
 ```ts
 const auth = createAuth<User>({
   secret: process.env.IDEAL_AUTH_SECRET!,
@@ -289,8 +291,20 @@ const auth = createAuth<User>({
 });
 ```
 
+**Per-request** — pass `autoTouch` when calling `auth()`. Overrides the config default. Ideal for Next.js where middleware can write cookies but Server Components can't:
+
+```ts
+// Next.js middleware — opt in to autoTouch for this request
+const session = auth({ autoTouch: true });
+await session.check(); // auto-extends if past halfway
+
+// Next.js Server Component — default, read-only
+const session = auth();
+await session.check(); // no cookie writes, safe in Server Components
+```
+
 :::caution
-Do not enable `autoTouch` in Next.js — `cookies().set()` throws in Server Components. Use manual `touch()` in middleware instead.
+Do not enable `autoTouch` globally in Next.js — `cookies().set()` throws in Server Components. Use per-request `auth({ autoTouch: true })` in middleware only.
 :::
 
 #### Option 2: `touch()` (manual)
