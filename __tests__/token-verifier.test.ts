@@ -12,16 +12,28 @@ describe('createTokenVerifier', () => {
     expect(token.split('.')).toHaveLength(5);
   });
 
-  it('throws on missing secret', () => {
-    expect(() => createTokenVerifier({ secret: '' })).toThrow(
+  it('throws on missing secret at first use', () => {
+    const verifier = createTokenVerifier({ secret: '' });
+    expect(() => verifier.createToken('user-1')).toThrow(
       'secret must be at least 32 characters',
     );
   });
 
-  it('throws on short secret', () => {
-    expect(() => createTokenVerifier({ secret: 'short' })).toThrow(
+  it('throws on short secret at first use', () => {
+    const verifier = createTokenVerifier({ secret: 'short' });
+    expect(() => verifier.createToken('user-1')).toThrow(
       'secret must be at least 32 characters',
     );
+  });
+
+  it('verifyToken returns null instead of throwing on missing secret', () => {
+    const verifier = createTokenVerifier({ secret: '' });
+    expect(verifier.verifyToken('some.fake.token.here.sig')).toBeNull();
+  });
+
+  it('verifyToken returns null instead of throwing on short secret', () => {
+    const verifier = createTokenVerifier({ secret: 'short' });
+    expect(verifier.verifyToken('some.fake.token.here.sig')).toBeNull();
   });
 
   it('verifies a valid token and returns iat', () => {

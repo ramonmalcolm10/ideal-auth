@@ -20,10 +20,6 @@ const SESSION_DEFAULTS = {
 export function createAuth<TUser extends AnyUser>(
   config: AuthConfig<TUser>,
 ): (options?: AuthFactoryOptions) => AuthInstance<TUser> {
-  if (!config.secret || config.secret.length < 32) {
-    throw new Error('secret must be at least 32 characters');
-  }
-
   if (config.resolveUser && config.sessionFields) {
     throw new Error('Provide either resolveUser or sessionFields, not both');
   }
@@ -38,8 +34,12 @@ export function createAuth<TUser extends AnyUser>(
 
   const configAutoTouch = config.session?.autoTouch ?? false;
 
-  return (options?: AuthFactoryOptions) =>
-    createAuthInstance<TUser>({
+  return (options?: AuthFactoryOptions) => {
+    if (!config.secret || config.secret.length < 32) {
+      throw new Error('secret must be at least 32 characters');
+    }
+
+    return createAuthInstance<TUser>({
       secret: config.secret,
       cookie: config.cookie,
       cookieName: config.session?.cookieName ?? SESSION_DEFAULTS.cookieName,
@@ -55,4 +55,5 @@ export function createAuth<TUser extends AnyUser>(
       passwordField: config.passwordField ?? 'password',
       attemptUser: config.attemptUser,
     });
+  };
 }
