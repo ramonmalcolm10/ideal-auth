@@ -4,17 +4,20 @@ import type { TokenVerifierConfig, TokenVerifierInstance } from '../types';
 
 const DEFAULT_EXPIRY_MS = 60 * 60 * 1000; // 1 hour
 
+function validateSecret(secret: string | undefined): asserts secret is string {
+  if (!secret || secret.length < 32) {
+    throw new Error('secret must be at least 32 characters');
+  }
+}
+
 export function createTokenVerifier(
   config: TokenVerifierConfig,
 ): TokenVerifierInstance {
-  if (!config.secret || config.secret.length < 32) {
-    throw new Error('secret must be at least 32 characters');
-  }
-
   const expiryMs = config.expiryMs ?? DEFAULT_EXPIRY_MS;
 
   return {
     createToken(userId: string): string {
+      validateSecret(config.secret);
       const encodedUserId = Buffer.from(userId, 'utf8').toString('base64url');
       const id = generateToken(20);
       const iat = Date.now();
@@ -25,6 +28,7 @@ export function createTokenVerifier(
     },
 
     verifyToken(token: string): { userId: string; iatMs: number } | null {
+      if (!config.secret || config.secret.length < 32) return null;
       const parts = token.split('.');
       if (parts.length !== 5) return null;
 

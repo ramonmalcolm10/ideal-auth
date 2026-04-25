@@ -32,24 +32,24 @@ const testUser: TestUser = { id: '1', email: 'test@example.com' };
 
 describe('createAuth', () => {
   describe('validation', () => {
-    it('throws on missing secret', () => {
-      expect(() =>
-        createAuth({
-          secret: '',
-          cookie: createMockCookieBridge(),
-          resolveUser: async () => null,
-        }),
-      ).toThrow('secret must be at least 32 characters');
+    it('throws on missing secret at first use', () => {
+      const auth = createAuth({
+        secret: '',
+        cookie: createMockCookieBridge(),
+        resolveUser: async () => null,
+      });
+
+      expect(() => auth()).toThrow('secret must be at least 32 characters');
     });
 
-    it('throws on short secret', () => {
-      expect(() =>
-        createAuth({
-          secret: 'short',
-          cookie: createMockCookieBridge(),
-          resolveUser: async () => null,
-        }),
-      ).toThrow('secret must be at least 32 characters');
+    it('throws on short secret at first use', () => {
+      const auth = createAuth({
+        secret: 'short',
+        cookie: createMockCookieBridge(),
+        resolveUser: async () => null,
+      });
+
+      expect(() => auth()).toThrow('secret must be at least 32 characters');
     });
 
     it('accepts secret with 32+ chars', () => {
