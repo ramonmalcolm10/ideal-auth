@@ -37,7 +37,14 @@ export function createAuthInstance<TUser extends AnyUser>(
 
   let didAutoTouch = false;
 
+  function validateSecret(): void {
+    if (!deps.secret || deps.secret.length < 32) {
+      throw new Error('secret must be at least 32 characters');
+    }
+  }
+
   async function readSession(): Promise<SessionPayload | null> {
+    validateSecret();
     if (cachedPayload !== undefined) return cachedPayload;
 
     const raw = await deps.cookie.get(deps.cookieName);
@@ -94,6 +101,7 @@ export function createAuthInstance<TUser extends AnyUser>(
     user: TUser,
     options?: LoginOptions,
   ): Promise<void> {
+    validateSecret();
     const maxAge = options?.remember ? deps.rememberMaxAge : deps.maxAge;
     const now = Math.floor(Date.now() / 1000);
     const payload: SessionPayload = {
