@@ -32,19 +32,20 @@ const testUser: TestUser = { id: '1', email: 'test@example.com' };
 
 describe('createAuth', () => {
   describe('validation', () => {
-    it('throws on missing secret at first auth operation', async () => {
+    it('read operations return null on missing secret (fail closed)', async () => {
       const auth = createAuth({
         secret: '',
         cookie: createMockCookieBridge(),
         resolveUser: async () => null,
       });
 
-      // auth() succeeds — secret only needed when reading/writing session
       const session = auth();
-      await expect(session.check()).rejects.toThrow('secret must be at least 32 characters');
+      expect(await session.check()).toBe(false);
+      expect(await session.user()).toBeNull();
+      expect(await session.id()).toBeNull();
     });
 
-    it('throws on short secret at first auth operation', async () => {
+    it('read operations return null on short secret (fail closed)', async () => {
       const auth = createAuth({
         secret: 'short',
         cookie: createMockCookieBridge(),
@@ -52,7 +53,8 @@ describe('createAuth', () => {
       });
 
       const session = auth();
-      await expect(session.check()).rejects.toThrow('secret must be at least 32 characters');
+      expect(await session.check()).toBe(false);
+      expect(await session.user()).toBeNull();
     });
 
     it('throws on missing secret when writing session (login)', async () => {
