@@ -44,7 +44,11 @@ export function createAuthInstance<TUser extends AnyUser>(
   }
 
   async function readSession(): Promise<SessionPayload | null> {
-    validateSecret();
+    // Fail closed on reads — no secret means no session, not an error
+    if (!deps.secret || deps.secret.length < 32) {
+      cachedPayload = null;
+      return null;
+    }
     if (cachedPayload !== undefined) return cachedPayload;
 
     const raw = await deps.cookie.get(deps.cookieName);
