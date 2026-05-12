@@ -1,0 +1,263 @@
+---
+title: Guest Login
+description: Issue anonymous guest sessions and upgrade them to real accounts.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+ideal-auth doesn't ship a dedicated guest mode, but you can build one cleanly with the same primitives you already use for authenticated users. A guest session is just a session whose `uid` belongs to an anonymous identity rather than a registered user.
+
+This guide covers two patterns — pick the one that matches whether guest activity needs to persist server-side.
+
+<Aside type="caution">
+  Guest sessions are still real sessions: they consume the same cookie slot and respect the same expiry. If you also issue authenticated sessions from the same `createAuth()` factory, a guest cookie will be overwritten on real login — which is usually what you want.
+</Aside>
+
+---
+
+## Pattern 1 — Cookie-only guest
+
+Best for ephemeral state: shopping carts, UI preferences, A/B test buckets, draft form data. No database row, no migration, no cleanup job.
+
+Use `sessionFields` mode so the guest's identity lives entirely in the signed cookie:
+
+```ts
+import { createAuth } from 'ideal-auth';
+
+type SessionUser = {
+  id: string;
+  role: 'guest' | 'user';
+  email?: string;
+};
+
+export const auth = createAuth<SessionUser>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: cookieBridge,
+  sessionFields: ['id', 'role', 'email'],
+});
+```
+
+Issue a guest session anywhere you'd normally redirect to login:
+
+```ts
+const session = auth();
+
+if (!(await session.check())) {
+  await session.login({
+    id: crypto.randomUUID(),
+    role: 'guest',
+  });
+}
+```
+
+Read the role like any other field:
+
+```ts
+const user = await session.user();
+if (user?.role === 'guest') {
+  // gate features, show signup CTA, etc.
+}
+```
+
+### Auto-issuing on first visit
+
+Drop this into middleware so every visitor gets a session id immediately — useful for analytics and cart-before-signup flows.
+
+<Tabs>
+  <TabItem label="Next.js">
+
+```ts
+// middleware.ts
+import { NextResponse, type NextRequest } from 'next/server';
+import { auth } from '@/lib/auth';
+import { nextCookieBridge } from '@/lib/cookie-bridge';
+
+export async function middleware(req: NextRequest) {
+  const res = NextResponse.next();
+  const session = auth({ cookie: nextCookieBridge(req, res) });
+
+  if (!(await session.check())) {
+    await session.login({
+      id: crypto.randomUUID(),
+      role: 'guest',
+    });
+  }
+
+  return res;
+}
+
+export const config = {
+  matcher: ['/((?!_next|api/auth).*)'],
+};
+```
+
+  </TabItem>
+  <TabItem label="TanStack Start">
+
+```ts
+// app/middleware/guest.ts
+import { createMiddleware } from '@tanstack/start';
+import { auth } from '~/lib/auth';
+
+export const guestMiddleware = createMiddleware().server(async ({ next }) => {
+  const session = auth();
+  if (!(await session.check())) {
+    await session.login({
+      id: crypto.randomUUID(),
+      role: 'guest',
+    });
+  }
+  return next();
+});
+```
+
+  </TabItem>
+</Tabs>
+
+---
+
+## Pattern 2 — Database-backed guest
+
+Best when guest activity must survive a logout, get audited, or join other tables (orders, reservations, support tickets). Create a real user row marked as a guest, then `login()` as that user.
+
+```ts
+import { db } from '@/lib/db';
+
+async function createGuestUser() {
+  return db.user.create({
+    data: {
+      role: 'guest',
+      email: null,
+      password: null,
+    },
+  });
+}
+
+const session = auth();
+if (!(await session.check())) {
+  const guest = await createGuestUser();
+  await session.login(guest);
+}
+```
+
+Your `resolveUser` callback already handles the lookup on subsequent requests — no changes needed.
+
+<Aside type="note">
+  Guest rows accumulate fast if every bot or crawler triggers one. Add a periodic cleanup job that deletes guest users older than your retention window (e.g. 30 days) with no related activity:
+
+  ```sql
+  DELETE FROM users
+  WHERE role = 'guest'
+    AND created_at < NOW() - INTERVAL '30 days'
+    AND NOT EXISTS (SELECT 1 FROM orders WHERE user_id = users.id);
+  ```
+</Aside>
+
+---
+
+## Upgrading a guest to a real account
+
+The clean trick: keep the same `id`. Don't `logout()` then `login()` — that would orphan any data already keyed to the guest id.
+
+### Cookie-only guests
+
+Re-`login()` with the upgraded user shape. The cookie is overwritten in place; the `id` you carry forward is up to you:
+
+```ts
+async function signup(email: string, password: string) {
+  const session = auth();
+  const guest = await session.user();
+  const guestId = guest?.id;
+
+  const user = await db.user.create({
+    data: {
+      id: guestId, // reuse so cart/etc. keyed to guestId still resolves
+      email,
+      password: await hash.make(password),
+      role: 'user',
+    },
+  });
+
+  await session.login(user);
+}
+```
+
+### Database-backed guests
+
+Update the existing row instead of creating a new one. Same `uid`, same session — no re-login needed for routing, but `login()` again to refresh the cookie payload:
+
+```ts
+async function signup(email: string, password: string) {
+  const session = auth();
+  const guestId = await session.id();
+  if (!guestId) throw new Error('No guest session to upgrade');
+
+  const user = await db.user.update({
+    where: { id: guestId },
+    data: {
+      email,
+      password: await hash.make(password),
+      role: 'user',
+    },
+  });
+
+  await session.login(user);
+}
+```
+
+Carts, draft posts, and anything else with a `userId` foreign key now belongs to the real account.
+
+---
+
+## Distinguishing guests in your app
+
+The session payload tells you everything you need:
+
+```ts
+const user = await session.user();
+
+if (!user) {
+  // Truly unauthenticated — middleware hasn't issued a guest session yet
+}
+
+if (user?.role === 'guest') {
+  // Show signup prompt, limit features, etc.
+}
+
+if (user?.role === 'user') {
+  // Full account
+}
+```
+
+A guard helper keeps route handlers tidy:
+
+```ts
+export async function requireRealUser() {
+  const user = await auth().user();
+  if (!user || user.role === 'guest') {
+    throw new Response('Sign in required', { status: 401 });
+  }
+  return user;
+}
+```
+
+---
+
+## Security notes
+
+- **Guests can do everything sessions can.** Treat `role: 'guest'` as a *less-privileged user*, not as "unauthenticated." Apply CSRF protection, rate limits, and authorization checks just like any other session.
+- **Don't let guests escalate.** Verify the role on every server-side mutation. Never trust the role field returned by the client — read it from `session.user()`.
+- **Watch for guest-row spam.** Pattern 2 lets unauthenticated traffic write to your `users` table. Rate-limit guest creation by IP, and consider deferring row creation until the guest performs a stateful action.
+- **Use shorter cookie lifetimes for guests.** Optional, but reduces the value of stealing a guest cookie. Pass `{ remember: false }` to `login()` so the cookie expires when the browser closes:
+
+  ```ts
+  await session.login({ id: crypto.randomUUID(), role: 'guest' }, { remember: false });
+  ```
+
+---
+
+## When *not* to use guest login
+
+- **You only need anonymous analytics.** Use a tracking cookie, not a session. Sessions are for state your server reads on every request.
+- **You're tempted to use guests as API keys.** Issue real tokens via [`createTokenVerifier`](/api/token-verifier/) instead. Sessions are designed for browsers.
+- **You want a "skip login" button that does nothing.** If the guest can't do anything the unauthenticated user couldn't, you don't need the session.
