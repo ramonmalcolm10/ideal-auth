@@ -163,6 +163,8 @@ const session = auth();
 await session.attempt({ email, password }); // password verified internally
 ```
 
+> **Timing note:** `attempt()` runs `hash.verify()` against a cached dummy hash when the user is not found, so the user-exists and user-missing paths take roughly the same time. For full protection against user enumeration, ensure your `resolveUserByCredentials` lookup is not catastrophically slower for non-existent users (e.g. use an indexed column).
+
 **Manual (escape hatch):** Provide `attemptUser` for full control over lookup and verification. Takes precedence over the Laravel-style config if both are provided.
 
 ```typescript

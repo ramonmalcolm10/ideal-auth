@@ -10,6 +10,19 @@ import type {
 import { seal, unseal } from './session/seal';
 import { buildCookieOptions } from './session/cookie';
 
+// Equalize attempt() timing between user-found and user-missing paths by always
+// running hash.verify(). The dummy hash is cached per HashInstance so repeated
+// misses match the cost of a real verify.
+const dummyHashCache = new WeakMap<HashInstance, Promise<string>>();
+function getDummyHash(hash: HashInstance): Promise<string> {
+  let p = dummyHashCache.get(hash);
+  if (!p) {
+    p = hash.make('__ideal-auth-dummy__');
+    dummyHashCache.set(hash, p);
+  }
+  return p;
+}
+
 interface AuthInstanceDeps<TUser extends AnyUser> {
   secret: string;
   cookie: CookieBridge;
@@ -160,12 +173,15 @@ export function createAuthInstance<TUser extends AnyUser>(
       if (deps.hash && deps.resolveUserByCredentials) {
         const { [deps.credentialKey]: password, ...lookup } = credentials;
         const dbUser = await deps.resolveUserByCredentials(lookup);
-        if (!dbUser) return false;
 
-        const storedHash = (dbUser as Record<string, any>)[deps.passwordField];
-        if (!storedHash || !(await deps.hash.verify(password, storedHash))) {
-          return false;
-        }
+        // Run verify even on miss against a dummy hash — prevents user enumeration via timing
+        const storedHash = dbUser
+          ? (dbUser as Record<string, any>)[deps.passwordField]
+          : undefined;
+        const hashToCheck = storedHash ?? (await getDummyHash(deps.hash));
+        const ok = await deps.hash.verify(password, hashToCheck);
+
+        if (!dbUser || !storedHash || !ok) return false;
 
         await writeSession(dbUser as TUser, options);
         return true;
