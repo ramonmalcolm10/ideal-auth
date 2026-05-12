@@ -462,6 +462,54 @@ describe('AuthInstance', () => {
     });
   });
 
+  describe('attempt() — timing equalization', () => {
+    // Equalize timing between user-found and user-missing paths to prevent
+    // user enumeration via response timing.
+    it('calls hash.verify even when user is not found', async () => {
+      let verifyCalls = 0;
+      const spyHash = {
+        make: async (p: string) => `hashed:${p}`,
+        verify: async (_p: string, _h: string) => {
+          verifyCalls++;
+          return false;
+        },
+      };
+
+      const auth = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: bridge,
+        resolveUser: async () => null,
+        hash: spyHash,
+        resolveUserByCredentials: async () => null,
+      })();
+
+      await auth.attempt({ email: 'nobody@b.com', password: 'whatever' });
+      expect(verifyCalls).toBe(1);
+    });
+
+    it('calls hash.verify even when storedHash is missing', async () => {
+      let verifyCalls = 0;
+      const spyHash = {
+        make: async (p: string) => `hashed:${p}`,
+        verify: async (_p: string, _h: string) => {
+          verifyCalls++;
+          return false;
+        },
+      };
+
+      const auth = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: bridge,
+        resolveUser: async () => ({ id: '1', email: 'a@b.com' }),
+        hash: spyHash,
+        resolveUserByCredentials: async () => ({ id: '1', email: 'a@b.com' }),
+      })();
+
+      await auth.attempt({ email: 'a@b.com', password: 'whatever' });
+      expect(verifyCalls).toBe(1);
+    });
+  });
+
   describe('logout()', () => {
     it('deletes cookie and check() returns false', async () => {
       await auth.login(testUser);
