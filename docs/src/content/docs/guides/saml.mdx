@@ -1,0 +1,311 @@
+---
+title: SAML SSO
+description: Enterprise single sign-on with SAML 2.0 using ideal-auth and a dedicated SAML library.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+SAML 2.0 is the dominant SSO protocol for enterprise IdPs (Okta, Azure AD/Entra, OneLogin, Ping, ADFS). The protocol itself — XML signing, assertion parsing, metadata exchange — is complex and out of scope for ideal-auth. This guide shows how to wire a battle-tested SAML library to ideal-auth's session layer: the library handles the protocol, ideal-auth handles the cookie.
+
+<Aside type="tip">
+  If your IdP supports OIDC (most modern ones do, including Okta and Azure AD), prefer it. OIDC is simpler, has better client libraries, and avoids XML entirely. Only reach for SAML when the IdP forces it.
+</Aside>
+
+---
+
+## Choosing a SAML library
+
+| Library | Best for | Notes |
+|---------|----------|-------|
+| [`@boxyhq/saml-jackson`](https://github.com/boxyhq/jackson) | Multi-tenant B2B SaaS | Stores SP configs per-tenant in your DB. Used by Cal.com, Retool. Apache 2.0. |
+| [`@node-saml/node-saml`](https://github.com/node-saml/node-saml) | Single-tenant apps | Lower-level. You own the metadata, the routes, the assertion handling. |
+| [`samlify`](https://github.com/tngan/samlify) | Custom flows | Most flexible, but you own more of the security surface. |
+
+This guide uses `@node-saml/node-saml` for the single-tenant case and notes the multi-tenant differences in a callout. The integration pattern is identical — only the config lookup changes.
+
+---
+
+## Installation
+
+```bash
+bun add ideal-auth @node-saml/node-saml
+```
+
+---
+
+## Database schema
+
+SAML users are typically created on first login (just-in-time provisioning). You need a way to recognize a returning SAML user via their IdP-issued `NameID`.
+
+<Tabs>
+  <TabItem label="SQL">
+    ```sql
+    ALTER TABLE users ADD COLUMN saml_subject TEXT UNIQUE;
+    ALTER TABLE users ADD COLUMN saml_idp TEXT;       -- which IdP issued the subject
+    CREATE INDEX idx_users_saml_subject ON users (saml_idp, saml_subject);
+    ```
+  </TabItem>
+  <TabItem label="Drizzle">
+    ```ts title="db/schema.ts"
+    export const users = pgTable('users', {
+      id: text('id').primaryKey(),
+      email: text('email').notNull(),
+      samlSubject: text('saml_subject').unique(),
+      samlIdp: text('saml_idp'),
+      // ... your other columns
+    });
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside type="caution">
+  Match users by `(samlIdp, samlSubject)`, **never by email alone**. A user's email can change at the IdP, and an attacker who controls a different IdP could claim someone else's email. The `NameID` is the only stable identifier.
+</Aside>
+
+---
+
+## SP configuration
+
+Your app is the Service Provider (SP). The IdP needs two URLs from you:
+
+- **ACS (Assertion Consumer Service)** — where the IdP posts the signed assertion. Example: `https://app.example.com/auth/saml/callback`.
+- **Entity ID** — a unique identifier for your SP. Example: `https://app.example.com/saml/metadata`.
+
+You configure the IdP with these, and the IdP gives you back:
+
+- **Entity ID** — the IdP's identifier.
+- **SSO URL** — where you redirect users to start login.
+- **Signing certificate** — used to verify assertion signatures.
+
+```ts title="lib/saml.ts"
+import { SAML } from '@node-saml/node-saml';
+
+export const saml = new SAML({
+  // Your SP
+  issuer: process.env.SAML_SP_ENTITY_ID!,
+  callbackUrl: `${process.env.APP_URL}/auth/saml/callback`,
+
+  // Your IdP
+  entryPoint: process.env.SAML_IDP_SSO_URL!,
+  idpIssuer: process.env.SAML_IDP_ENTITY_ID!,
+  idpCert: process.env.SAML_IDP_CERT!.replace(/\\n/g, '\n'),
+
+  // Security hardening
+  signatureAlgorithm: 'sha256',
+  digestAlgorithm: 'sha256',
+  wantAssertionsSigned: true,
+  wantAuthnResponseSigned: true,
+  acceptedClockSkewMs: 5_000,
+
+  // Identifier format — most IdPs default to emailAddress or persistent
+  identifierFormat: 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
+});
+```
+
+<Aside type="note" title="Multi-tenant note">
+  With `@boxyhq/saml-jackson`, you don't construct one `SAML` instance — you store per-tenant configs and let Jackson route by `tenant` + `product` params. The session-issuing code at the end of this guide is identical; only the config lookup changes.
+</Aside>
+
+---
+
+## The three routes
+
+SAML SP-initiated login has three endpoints. Each maps to a small route handler.
+
+### 1. Login initiation
+
+User clicks "Sign in with SSO." You generate a `SAMLRequest`, optionally bind a `RelayState` (a redirect target after login), and 302 the user to the IdP.
+
+```ts title="app/auth/saml/login/route.ts"
+import { saml } from '@/lib/saml';
+import { NextRequest, NextResponse } from 'next/server';
+
+export async function GET(req: NextRequest) {
+  const callbackUrl = req.nextUrl.searchParams.get('callbackUrl') ?? '/';
+
+  // RelayState is echoed back by the IdP — use it to remember where to send the user
+  const url = await saml.getAuthorizeUrlAsync(
+    callbackUrl,                       // RelayState (validated on return)
+    req.nextUrl.host,
+    {},
+  );
+
+  return NextResponse.redirect(url);
+}
+```
+
+<Aside type="caution" title="Open redirect">
+  Always validate `callbackUrl` against an allowlist before trusting it as a redirect target. An unvalidated `RelayState` is a textbook open-redirect vector.
+</Aside>
+
+### 2. Metadata endpoint
+
+The IdP fetches this once during setup. It describes your SP — entity ID, ACS URL, optional SP signing cert. Serve it as XML.
+
+```ts title="app/auth/saml/metadata/route.ts"
+import { saml } from '@/lib/saml';
+
+export async function GET() {
+  const xml = saml.generateServiceProviderMetadata(null, null);
+  return new Response(xml, {
+    headers: { 'Content-Type': 'application/xml' },
+  });
+}
+```
+
+### 3. ACS callback — where ideal-auth takes over
+
+The IdP POSTs the signed `SAMLResponse` here. This is where you validate the assertion, look up (or create) the user, and hand off to `session.login()`.
+
+```ts title="app/auth/saml/callback/route.ts"
+import { saml } from '@/lib/saml';
+import { auth } from '@/lib/auth';
+import { db } from '@/lib/db';
+import { NextRequest, NextResponse } from 'next/server';
+
+const SAFE_REDIRECTS = new Set(['/dashboard', '/settings', '/']);
+
+export async function POST(req: NextRequest) {
+  const form = await req.formData();
+  const samlResponse = form.get('SAMLResponse') as string;
+  const relayState = form.get('RelayState') as string | null;
+
+  let profile;
+  try {
+    const result = await saml.validatePostResponseAsync({
+      SAMLResponse: samlResponse,
+    });
+    profile = result.profile;
+  } catch (err) {
+    console.error('SAML validation failed', err);
+    return new Response('Invalid SAML response', { status: 401 });
+  }
+
+  if (!profile?.nameID) {
+    return new Response('Missing NameID', { status: 400 });
+  }
+
+  // Look up or provision (JIT)
+  const samlIdp = process.env.SAML_IDP_ENTITY_ID!;
+  let user = await db.user.findUnique({
+    where: { samlIdp_samlSubject: { samlIdp, samlSubject: profile.nameID } },
+  });
+
+  if (!user) {
+    user = await db.user.create({
+      data: {
+        email: (profile.email ?? profile.nameID) as string,
+        name: (profile.displayName ?? profile.cn) as string | undefined,
+        samlSubject: profile.nameID,
+        samlIdp,
+      },
+    });
+  }
+
+  await auth().login(user);
+
+  const redirectTo = relayState && SAFE_REDIRECTS.has(relayState) ? relayState : '/';
+  return NextResponse.redirect(new URL(redirectTo, process.env.APP_URL!));
+}
+```
+
+The handoff to ideal-auth is one line: `await auth().login(user)`. Everything before it is SAML; everything after it is your normal authenticated app.
+
+---
+
+## Mapping IdP attributes
+
+The IdP usually sends additional attributes alongside `NameID` — email, display name, group memberships. Map them at provisioning time and refresh on every login if the IdP is the source of truth:
+
+```ts
+const attrs = profile.attributes ?? {};
+
+const userData = {
+  email: (attrs['http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress']
+       ?? profile.email
+       ?? profile.nameID) as string,
+  name: (attrs['http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name']
+      ?? profile.displayName) as string | undefined,
+  groups: (attrs['http://schemas.xmlsoap.org/claims/Group'] as string[] | undefined) ?? [],
+};
+
+if (user) {
+  user = await db.user.update({
+    where: { id: user.id },
+    data: { email: userData.email, name: userData.name },
+  });
+}
+```
+
+<Aside type="note">
+  Attribute names are namespace URIs because SAML. Check your IdP's documentation — Okta, Azure AD, and ADFS each use slightly different claim names by default.
+</Aside>
+
+---
+
+## Single Logout (SLO)
+
+SLO is optional and many deployments skip it. When the user logs out of your app, you can also notify the IdP — which then notifies every other SP. It's nice in theory but fiddly in practice (timing, cert rotation, IdP support varies).
+
+If you need it:
+
+```ts title="app/auth/saml/logout/route.ts"
+import { saml } from '@/lib/saml';
+import { auth } from '@/lib/auth';
+import { db } from '@/lib/db';
+
+export async function GET() {
+  const session = auth();
+  const userId = await session.id();
+  if (!userId) return new Response('Not logged in', { status: 401 });
+
+  const user = await db.user.findUnique({ where: { id: userId } });
+
+  // Clear the local session first — if the IdP redirect fails, the user is still logged out locally
+  await session.logout();
+
+  if (!user?.samlSubject) {
+    return Response.redirect(new URL('/', process.env.APP_URL!));
+  }
+
+  const url = await saml.getLogoutUrlAsync(
+    { nameID: user.samlSubject, nameIDFormat: 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress' },
+    null,
+    {},
+  );
+  return Response.redirect(url);
+}
+```
+
+For most apps, **plain `await session.logout()` is enough.** SLO is overkill if your app is the only SP the user touches.
+
+---
+
+## Security checklist
+
+- [ ] **Signature verification.** `wantAssertionsSigned: true` and `wantAuthnResponseSigned: true`. Reject unsigned responses outright.
+- [ ] **SHA-256, not SHA-1.** `signatureAlgorithm: 'sha256'` and `digestAlgorithm: 'sha256'`. SHA-1 is broken for signatures.
+- [ ] **Clock skew.** Set `acceptedClockSkewMs` to ~5 seconds. The IdP and SP must agree on time within the assertion's `NotBefore` / `NotOnOrAfter` window.
+- [ ] **Replay protection.** The library checks the assertion's `ID` against recently-seen IDs. Ensure your `node-saml` cache backend (memory by default) is sufficient for your deployment — for multi-instance apps, use a Redis-backed cache.
+- [ ] **RelayState allowlist.** Treat `RelayState` like any other open-redirect surface.
+- [ ] **Cert rotation.** Plan for cert renewal. Many IdPs let you publish two certs simultaneously during rotation — support that on the SP side too.
+- [ ] **Audience restriction.** The library enforces `Audience` matches your SP entity ID by default. Don't disable it.
+- [ ] **`InResponseTo` validation.** Only meaningful for SP-initiated flows; the library handles it when you use `getAuthorizeUrlAsync`.
+
+---
+
+## Testing
+
+[`samltest.id`](https://samltest.id/) provides a public test IdP — register your SP metadata there and you can run end-to-end flows without standing up your own IdP. For Okta/Azure dev tenants, the free tiers are sufficient for non-prod testing.
+
+For unit tests, mock the `saml.validatePostResponseAsync` call and assert that your callback route calls `auth().login()` with the right user shape. The SAML library's own tests cover the protocol layer — don't try to re-test it.
+
+---
+
+## When *not* to use SAML
+
+- **Your IdP supports OIDC.** Use OIDC. It's simpler, JSON instead of XML, and the libraries are smaller.
+- **You only need Google/Microsoft personal accounts.** Use OAuth (Google/Microsoft consumer OAuth, not their enterprise SAML).
+- **You want internal team SSO without an IdP.** Stand up an OIDC provider like [Logto](https://logto.io/) or [Zitadel](https://zitadel.com/) instead of running SAML through a SaaS IdP.
+
+SAML earns its place when an enterprise customer says "we only support SAML." Until then, OIDC is almost always the better tool.
