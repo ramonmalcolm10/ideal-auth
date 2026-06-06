@@ -1,0 +1,339 @@
+---
+title: OTP Login
+description: Email or SMS one-time codes for passwordless or step-up authentication.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+A one-time password (OTP) is a short code — typically 6 digits — that the user types into your app after receiving it by email or SMS. Unlike a [magic link](/guides/magic-link/), the code transfers between devices because the human is the courier.
+
+This guide builds OTP login on top of `createHash` (to store codes safely) and `createRateLimiter` (to prevent brute force). The handoff is the same as every other auth flow in this library: `await auth().login(user)`.
+
+<Aside type="tip">
+  OTP is also useful as a *second factor* (step-up auth, recovery codes, confirming sensitive actions). The issuance and verification primitives below work for any of those use cases. For TOTP authenticator apps (Google Authenticator, 1Password), see [2FA](/guides/two-factor-auth/).
+</Aside>
+
+---
+
+## Setup
+
+```ts title="lib/auth.ts"
+import {
+  createAuth,
+  createHash,
+  createRateLimiter,
+} from 'ideal-auth';
+
+export const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+});
+
+export const otpHash = createHash();
+
+export const otpRequestLimiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000,
+});
+
+export const otpVerifyLimiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000,
+});
+```
+
+Two separate limiters: one for issuing codes (prevent SMS flooding / mailbox spam), one for verifying them (prevent brute force of the 6-digit space).
+
+---
+
+## Database schema
+
+OTPs are short-lived rows with a hashed code, an expiry, and an attempt counter. Don't reuse the users table — codes get rotated and deleted constantly.
+
+```sql
+CREATE TABLE otp_codes (
+  id            TEXT PRIMARY KEY,
+  user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  purpose       TEXT NOT NULL,           -- 'login', '2fa', 'verify-email', ...
+  code_hash     TEXT NOT NULL,
+  expires_at    TIMESTAMPTZ NOT NULL,
+  attempts      INT NOT NULL DEFAULT 0,
+  consumed_at   TIMESTAMPTZ
+);
+
+CREATE INDEX idx_otp_user_purpose ON otp_codes (user_id, purpose, expires_at);
+```
+
+<Aside type="caution">
+  **Store the hash, not the code.** If your `otp_codes` table leaks, plaintext codes give the attacker an active credential. Hashed codes are useless without a brute force window — and the `attempts` counter closes that.
+</Aside>
+
+---
+
+## Generating a code
+
+A 6-digit numeric code has 1,000,000 possibilities. That's brute-forceable in seconds without rate limiting — which is why the `attempts` counter matters more than the code length.
+
+```ts title="lib/otp.ts"
+import { randomInt } from 'node:crypto';
+import { otpHash } from './auth';
+import { db } from './db';
+
+const CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_ATTEMPTS = 5;
+
+export function generateCode(): string {
+  // randomInt is cryptographically secure; Math.random is NOT
+  return randomInt(0, 1_000_000).toString().padStart(6, '0');
+}
+
+export async function issueOtp(userId: string, purpose: string) {
+  // Invalidate any previous unconsumed codes for the same purpose
+  await db.otpCode.deleteMany({
+    where: { userId, purpose, consumedAt: null },
+  });
+
+  const code = generateCode();
+  const codeHash = await otpHash.make(code);
+
+  await db.otpCode.create({
+    data: {
+      id: crypto.randomUUID(),
+      userId,
+      purpose,
+      codeHash,
+      expiresAt: new Date(Date.now() + CODE_TTL_MS),
+    },
+  });
+
+  return code; // return plaintext only to the caller (to send to the user)
+}
+```
+
+<Aside type="caution">
+  Use `crypto.randomInt`, **not** `Math.random()`. `Math.random()` is predictable; an attacker who can guess your seed can predict every code you issue.
+</Aside>
+
+---
+
+## The two routes
+
+### 1. Request a code
+
+```ts title="app/auth/otp/request/route.ts"
+import { otpRequestLimiter } from '@/lib/auth';
+import { issueOtp } from '@/lib/otp';
+import { db } from '@/lib/db';
+import { sendEmail } from '@/lib/mail';
+import { NextRequest, NextResponse } from 'next/server';
+
+export async function POST(req: NextRequest) {
+  const { email } = await req.json();
+  const ip = req.headers.get('x-forwarded-for') ?? '127.0.0.1';
+
+  const ipLimit = await otpRequestLimiter.attempt(`otp:req:ip:${ip}`);
+  if (!ipLimit.allowed) {
+    return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
+  }
+
+  const emailLimit = await otpRequestLimiter.attempt(
+    `otp:req:email:${email.toLowerCase()}`,
+  );
+
+  // Generic response — same body whether the user exists or not
+  const ok = NextResponse.json({
+    message: 'If that email exists, a code was sent.',
+  });
+  if (!emailLimit.allowed) return ok;
+
+  const user = await db.user.findUnique({
+    where: { email: email.toLowerCase() },
+  });
+  if (!user) return ok;
+
+  const code = await issueOtp(user.id, 'login');
+
+  await sendEmail({
+    to: user.email,
+    subject: `Your sign-in code: ${code}`,
+    text: `Your code is ${code}. It expires in 10 minutes.`,
+  });
+
+  return ok;
+}
+```
+
+<Aside type="tip">
+  Put the code in the subject line as well as the body. Users glance at their inbox, see the code, type it — without opening the email. This is faster than the "open email → copy → paste" flow and is the standard pattern for OTP UX.
+</Aside>
+
+### 2. Verify the code
+
+```ts title="app/auth/otp/verify/route.ts"
+import { auth, otpHash, otpVerifyLimiter } from '@/lib/auth';
+import { db } from '@/lib/db';
+import { NextRequest, NextResponse } from 'next/server';
+
+const MAX_ATTEMPTS = 5;
+
+export async function POST(req: NextRequest) {
+  const { email, code } = await req.json();
+  const ip = req.headers.get('x-forwarded-for') ?? '127.0.0.1';
+
+  // Rate-limit verify by IP — protects the brute force surface
+  const ipLimit = await otpVerifyLimiter.attempt(`otp:verify:ip:${ip}`);
+  if (!ipLimit.allowed) {
+    return NextResponse.json({ error: 'Too many attempts' }, { status: 429 });
+  }
+
+  const user = await db.user.findUnique({
+    where: { email: email.toLowerCase() },
+  });
+  // Generic error to avoid enumeration
+  const fail = NextResponse.json({ error: 'Invalid or expired code' }, { status: 400 });
+  if (!user) return fail;
+
+  const row = await db.otpCode.findFirst({
+    where: {
+      userId: user.id,
+      purpose: 'login',
+      consumedAt: null,
+      expiresAt: { gt: new Date() },
+    },
+    orderBy: { expiresAt: 'desc' },
+  });
+  if (!row) return fail;
+
+  // Per-code attempt counter — caps brute force at MAX_ATTEMPTS per issuance
+  if (row.attempts >= MAX_ATTEMPTS) {
+    await db.otpCode.delete({ where: { id: row.id } });
+    return fail;
+  }
+
+  // hash.verify is constant-time
+  const ok = await otpHash.verify(code, row.codeHash);
+
+  if (!ok) {
+    await db.otpCode.update({
+      where: { id: row.id },
+      data: { attempts: row.attempts + 1 },
+    });
+    return fail;
+  }
+
+  // Consume the code (one-time use)
+  await db.otpCode.update({
+    where: { id: row.id },
+    data: { consumedAt: new Date() },
+  });
+
+  // Optional: mark email as verified since they proved ownership of the inbox
+  if (!user.emailVerifiedAt) {
+    await db.user.update({
+      where: { id: user.id },
+      data: { emailVerifiedAt: new Date() },
+    });
+  }
+
+  await auth().login(user);
+
+  return NextResponse.json({ ok: true });
+}
+```
+
+The handoff is one line: `await auth().login(user)`. Everything before it is OTP plumbing; everything after it is your normal authenticated app.
+
+---
+
+## SMS delivery
+
+The flow is identical — only the transport changes. Use a transactional SMS provider (Twilio, Vonage, MessageBird) and rate-limit aggressively because SMS costs real money.
+
+```ts
+import { Twilio } from 'twilio';
+const sms = new Twilio(process.env.TWILIO_SID!, process.env.TWILIO_AUTH!);
+
+await sms.messages.create({
+  to: user.phone,
+  from: process.env.TWILIO_FROM!,
+  body: `Your sign-in code is ${code}. It expires in 10 minutes.`,
+});
+```
+
+<Aside type="caution">
+  SMS OTP has known weaknesses: SIM swap attacks, SS7 interception, carrier social engineering. For high-value accounts (admin, financial), prefer email OTP, [passkeys](/guides/passkeys/), or TOTP from an authenticator app. SMS is fine for consumer login but should not be the only factor on sensitive accounts.
+</Aside>
+
+---
+
+## OTP as a second factor
+
+For step-up auth — confirming a sensitive action, or backing up TOTP — use the same `issueOtp` / verify routes with a different `purpose`:
+
+```ts
+// Issuing a code to confirm a withdrawal
+const code = await issueOtp(user.id, 'confirm-withdrawal');
+await sendEmail({ to: user.email, subject: `Withdrawal code: ${code}`, /* ... */ });
+
+// Verifying it — same shape, just `purpose: 'confirm-withdrawal'` in the lookup
+```
+
+Storing OTPs by `(userId, purpose)` means a 2FA code can't accidentally be replayed against the login endpoint and vice versa.
+
+---
+
+## Brute force math
+
+A 6-digit code = 1,000,000 possibilities. Without limits, an attacker brute-forces it instantly. Three layers stop them:
+
+| Layer | Cap | What it stops |
+|-------|-----|---------------|
+| Per-code `attempts` counter | 5 | Brute-forcing a single live code |
+| Verify rate limit by IP | 5 / 15 min | Distributed guessing from one IP |
+| 10-minute TTL | — | The window in which guessing matters |
+
+With all three: an attacker gets 5 guesses against a code that lives 10 minutes — odds of success are 5 in 1,000,000, or 0.0005%. That's the bar.
+
+<Aside type="tip">
+  If you want even tighter odds, bump the code to 8 digits (1-in-100M) or add a letter. Most apps don't need to — the per-code counter is the load-bearing limit, not the code length.
+</Aside>
+
+---
+
+## Code format choices
+
+| Format | Pros | Cons |
+|--------|------|------|
+| 6-digit numeric | Easiest to type on mobile, works in SMS, fits in a notification preview | Smaller keyspace |
+| 8-digit numeric | 100× larger keyspace | Annoying to type |
+| Alphanumeric (e.g. `K3RQ-7XPM`) | Bigger keyspace, easier to read in email | Worse on mobile keyboards; case confusion (O/0, I/l) |
+| Word-based (e.g. `correct-horse-battery`) | Friendly | Bad for SMS, easy to mistype |
+
+6-digit numeric is the default for a reason — pick something else only if you have a specific reason.
+
+---
+
+## Security checklist
+
+- [ ] **`crypto.randomInt`** — not `Math.random()`.
+- [ ] **Hash the code at rest** — `createHash().make(code)`, never plaintext.
+- [ ] **Constant-time verify** — `createHash().verify()` does this; don't roll your own `===`.
+- [ ] **Per-code attempt counter** — caps brute force per issuance.
+- [ ] **TTL ≤ 10 minutes** — limits the brute force window.
+- [ ] **Invalidate prior codes on issue** — `deleteMany` of unconsumed rows.
+- [ ] **Single-use** — set `consumedAt` on success.
+- [ ] **Rate limit issuance** — by IP and by email/phone. SMS especially: lock down or pay the bill.
+- [ ] **Rate limit verification** — by IP.
+- [ ] **Generic error messages** — `Invalid or expired code` for every failure path. No enumeration.
+- [ ] **Don't put the code in URLs** — request logs, browser history, referrer headers.
+- [ ] **HTTPS only** — codes over HTTP leak to every hop.
+
+---
+
+## When *not* to use OTP
+
+- **The user always reads email on the device they're signing in from.** Use [magic links](/guides/magic-link/) — fewer clicks, no typing.
+- **You need offline auth.** OTP delivery requires connectivity. TOTP (authenticator app) works offline — see [2FA](/guides/two-factor-auth/).
+- **Phishing resistance matters.** OTP codes can be phished in real time. [Passkeys](/guides/passkeys/) are phishing-resistant.
+- **You're sending SMS to high-value accounts at scale.** Costs add up fast and SMS is the weakest delivery channel; switch to email OTP or passkeys.

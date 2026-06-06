@@ -1,0 +1,237 @@
+---
+title: Magic Link Login
+description: Passwordless email login using signed tokens.
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+A magic link is a one-time URL emailed to the user. Clicking it logs them in — no password, no second device. The link itself is a signed token; ideal-auth's [`createTokenVerifier`](/api/create-token-verifier/) handles the crypto, and the route handler hands off to `auth().login(user)` after verification.
+
+This guide covers the SP-initiated flow: user enters email → server emails a link → user clicks → session is issued.
+
+<Aside type="tip">
+  If you want a numeric code the user types into another tab, see [OTP Login](/guides/otp/) instead. Magic links are best when the user opens email on the same device they're signing in from.
+</Aside>
+
+---
+
+## Setup
+
+```ts title="lib/auth.ts"
+import {
+  createAuth,
+  createTokenVerifier,
+  createRateLimiter,
+} from 'ideal-auth';
+
+export const auth = createAuth<User>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: async (id) => db.user.findUnique({ where: { id } }),
+});
+
+export const magicLinks = createTokenVerifier({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  expiryMs: 15 * 60 * 1000, // 15 minutes
+});
+
+export const magicLinkLimiter = createRateLimiter({
+  maxAttempts: 5,
+  windowMs: 15 * 60 * 1000,
+});
+```
+
+<Aside type="caution">
+  Keep the expiry short — 10–15 minutes. A magic link is a bearer credential; the longer it lives, the bigger the window for an attacker who scrapes it from a logged email server, a quoted reply, or a synced device.
+</Aside>
+
+---
+
+## Database schema
+
+Magic links rely on a per-user timestamp to enforce single-use. Same column doubles as the post-password-change session-invalidation column from the [password reset guide](/guides/password-reset/).
+
+```sql
+ALTER TABLE users ADD COLUMN last_login_at TIMESTAMPTZ;
+```
+
+---
+
+## The two routes
+
+### 1. Request a link
+
+```ts title="app/auth/magic/request/route.ts"
+import { magicLinks, magicLinkLimiter } from '@/lib/auth';
+import { db } from '@/lib/db';
+import { sendEmail } from '@/lib/mail';
+import { NextRequest, NextResponse } from 'next/server';
+
+export async function POST(req: NextRequest) {
+  const { email } = await req.json();
+  const ip = req.headers.get('x-forwarded-for') ?? '127.0.0.1';
+
+  const ipLimit = await magicLinkLimiter.attempt(`magic:ip:${ip}`);
+  if (!ipLimit.allowed) {
+    return NextResponse.json({ error: 'Too many requests' }, { status: 429 });
+  }
+
+  const emailLimit = await magicLinkLimiter.attempt(
+    `magic:email:${email.toLowerCase()}`,
+  );
+
+  // Always respond identically — don't leak whether the email exists
+  const genericResponse = NextResponse.json({
+    message: 'If that email exists, a sign-in link was sent.',
+  });
+
+  if (!emailLimit.allowed) return genericResponse;
+
+  const user = await db.user.findUnique({
+    where: { email: email.toLowerCase() },
+  });
+  if (!user) return genericResponse;
+
+  const token = magicLinks.createToken(String(user.id));
+  const url = `${process.env.APP_URL}/auth/magic/callback/${token}`;
+
+  await sendEmail({
+    to: user.email,
+    subject: 'Sign in to Example',
+    text: `Click here to sign in: ${url}\n\nThis link expires in 15 minutes.`,
+  });
+
+  return genericResponse;
+}
+```
+
+<Aside type="caution">
+  Always return the same response whether the email exists or not. Different responses let an attacker enumerate registered emails.
+</Aside>
+
+<Aside>
+  Put the token in the URL **path** (`/callback/TOKEN`), not the query string. Query strings get logged by web servers, proxies, and browser history; path segments are less likely to leak.
+</Aside>
+
+### 2. Consume the link
+
+The user clicks the email link and lands on a route that verifies the token and issues the session in one step.
+
+```ts title="app/auth/magic/callback/[token]/route.ts"
+import { auth, magicLinks } from '@/lib/auth';
+import { db } from '@/lib/db';
+import { NextRequest, NextResponse } from 'next/server';
+
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { token: string } },
+) {
+  const result = magicLinks.verifyToken(params.token);
+  if (!result) {
+    return NextResponse.redirect(new URL('/sign-in?error=expired', req.url));
+  }
+
+  const { userId, iatMs } = result;
+  const user = await db.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    return NextResponse.redirect(new URL('/sign-in?error=expired', req.url));
+  }
+
+  // Single-use: reject tokens issued before the last successful login
+  if (user.lastLoginAt && user.lastLoginAt.getTime() >= iatMs) {
+    return NextResponse.redirect(new URL('/sign-in?error=used', req.url));
+  }
+
+  await db.user.update({
+    where: { id: user.id },
+    data: {
+      lastLoginAt: new Date(),
+      ...(user.emailVerifiedAt ? {} : { emailVerifiedAt: new Date() }),
+    },
+  });
+
+  await auth().login(user);
+
+  return NextResponse.redirect(new URL('/dashboard', req.url));
+}
+```
+
+The handoff to ideal-auth is one line: `await auth().login(user)`. Everything before it is link verification; everything after it is your normal authenticated app.
+
+---
+
+## Single-use enforcement
+
+The `lastLoginAt` check makes each link consumable exactly once without a separate token blocklist:
+
+1. Token created at time `T` → carries `iatMs = T`.
+2. On successful login, `lastLoginAt` is set to `now` (≥ `T`).
+3. If the same link is clicked again, `iatMs` is still `T` but `lastLoginAt ≥ T` → rejected.
+
+This is the same trick the [password reset guide](/guides/password-reset/) uses with `passwordChangedAt`. If you already have that column, you can reuse it — but a dedicated `lastLoginAt` is cleaner because magic-link consumption shouldn't bump the password-change timestamp.
+
+---
+
+## Just-in-time signup
+
+If you want "sign in or sign up" with one button, create the user on first request:
+
+```ts
+let user = await db.user.findUnique({ where: { email: email.toLowerCase() } });
+if (!user) {
+  user = await db.user.create({
+    data: { email: email.toLowerCase(), emailVerifiedAt: null },
+  });
+}
+```
+
+The user's email gets verified when they actually click the link (the callback sets `emailVerifiedAt`). Until then, the row exists but is unverified — which is fine because nothing else trusts it yet.
+
+<Aside type="caution">
+  JIT signup turns your magic-link endpoint into open user-creation. Add a CAPTCHA, tighter rate limits, or both. Otherwise bots can fill your users table.
+</Aside>
+
+---
+
+## Same-device vs cross-device
+
+Magic links assume the user clicks the link on the same browser they entered the email in. That's not always true:
+
+- **Server-rendered apps:** The session cookie issued in the callback is fine — the redirect carries it.
+- **Mobile email apps:** Tapping the link opens the system browser, which may not be the browser the user requested from. The session lands on the system browser; the original tab is still signed-out.
+- **Webmail desktop:** Usually fine; the link opens in the same browser.
+
+If cross-device matters (the user enters their email on their laptop but clicks the link on their phone), reach for [OTP](/guides/otp/) instead — the code transfers cleanly between devices because the human types it.
+
+---
+
+## Email deliverability
+
+Magic links die if the email doesn't land. Things that help:
+
+- **Use a transactional provider** — Resend, Postmark, SendGrid. Don't send from your app server's SMTP.
+- **Send from a domain you control with SPF + DKIM + DMARC.**
+- **Avoid "click here" as the only link text** — spam filters notice. Show the URL too.
+- **Set `subject` to something distinctive** — generic subjects ("Sign in") get caught more often than branded ones ("Sign in to Acme").
+
+---
+
+## Security checklist
+
+- [ ] **Short expiry** — 10–15 minutes.
+- [ ] **Path segment, not query string** — `/callback/TOKEN`, not `?token=TOKEN`.
+- [ ] **Single-use via `lastLoginAt`** — reject tokens with `iatMs ≤ lastLoginAt`.
+- [ ] **Rate limit by IP and email** — prevents enumeration *and* mailbox flooding.
+- [ ] **Generic response** — same JSON whether the email exists or not.
+- [ ] **HTTPS only** — magic links over HTTP leak the token to every hop.
+- [ ] **Don't log the URL** — request logs containing the link give anyone with log access a live credential during its TTL.
+- [ ] **Verify email on consumption** — set `emailVerifiedAt` on first successful callback.
+
+---
+
+## When *not* to use magic links
+
+- **Cross-device flows are common.** Use [OTP](/guides/otp/) — the user types a 6-digit code.
+- **Users share inboxes** (family Plex account, on-call rotation). The link logs in whoever clicks first.
+- **Phishing risk is high** (banks, admin consoles). Magic links train users to click "sign in" links in email. Use [passkeys](/guides/passkeys/) for high-value accounts.
+- **You need step-up for sensitive actions.** Magic links are good for "sign in"; they're not a second factor. Layer them with [2FA](/guides/two-factor-auth/) if needed.
