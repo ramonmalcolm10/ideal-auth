@@ -1,5 +1,17 @@
 export type AnyUser = { id: string | number; [key: string]: any };
 
+/**
+ * The shape of a user as returned by `auth().user()`.
+ *
+ * Session ids are always stored as strings (cookies can only carry strings),
+ * so `user()` always returns `id` as `string`, even if your `TUser` declared
+ * `id: number`. Other fields pass through unchanged.
+ *
+ * If your database uses numeric ids, narrow back to `number` at the point
+ * you actually need it: `Number((await auth().user())?.id)`.
+ */
+export type SessionUser<TUser extends AnyUser> = Omit<TUser, 'id'> & { id: string };
+
 export interface CookieOptions {
   httpOnly?: boolean;
   secure?: boolean;
@@ -88,8 +100,7 @@ export interface AuthConfigWithResolveUser<TUser extends AnyUser> extends AuthCo
  * permissions, subscription tier), prefer `resolveUser` to get fresh
  * data on every request.
  *
- * **ID type:** `user()` always returns `id` as a `string` on subsequent
- * requests (read from cookie), even if the original `TUser.id` was a number.
+ * **ID type:** `user()` always returns `id` as a `string` — see {@link SessionUser}.
  */
 export interface AuthConfigWithSessionFields<
   TUser extends AnyUser,
@@ -119,7 +130,7 @@ export interface AuthInstance<TUser extends AnyUser = AnyUser> {
   attempt(credentials: Record<string, any>, options?: LoginOptions): Promise<boolean>;
   logout(): Promise<void>;
   check(): Promise<boolean>;
-  user(): Promise<TUser | null>;
+  user(): Promise<SessionUser<TUser> | null>;
   id(): Promise<string | null>;
   /** Re-seal the session cookie with a fresh expiry. When autoTouch is disabled (default), only reseals past the halfway point. No database call needed. Does nothing if no valid session exists or if already resealed on this request. */
   touch(): Promise<void>;
