@@ -1136,3 +1136,101 @@ describe('sessionFields (cookie-backed sessions)', () => {
     });
   });
 });
+
+describe('user().id is always a string', () => {
+  type NumericIdUser = { id: number; email: string; name: string };
+  const numericUser: NumericIdUser = { id: 42, email: 'n@example.com', name: 'Nina' };
+
+  describe('sessionFields mode', () => {
+    it('same-request: id is string after login(user) with numeric id', async () => {
+      const bridge = createMockCookieBridge();
+      const session = createAuth<NumericIdUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email', 'name'],
+      })();
+
+      await session.login(numericUser);
+
+      const user = await session.user();
+      expect(user).not.toBeNull();
+      expect(typeof user!.id).toBe('string');
+      expect(user!.id).toBe('42');
+      expect(user!.email).toBe('n@example.com');
+    });
+
+    it('cross-request: id is string when reading from cookie', async () => {
+      const bridge = createMockCookieBridge();
+      const factory = createAuth<NumericIdUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email', 'name'],
+      });
+
+      await factory().login(numericUser);
+
+      // Fresh instance reads from the same jar — no in-memory cache
+      const fresh = factory();
+      const user = await fresh.user();
+      expect(typeof user!.id).toBe('string');
+      expect(user!.id).toBe('42');
+    });
+  });
+
+  describe('resolveUser mode', () => {
+    it('same-request: id is string after login(user) with numeric id', async () => {
+      const bridge = createMockCookieBridge();
+      const session = createAuth<NumericIdUser>({
+        secret: SECRET,
+        cookie: bridge,
+        resolveUser: async () => numericUser,
+      })();
+
+      await session.login(numericUser);
+
+      const user = await session.user();
+      expect(typeof user!.id).toBe('string');
+      expect(user!.id).toBe('42');
+    });
+
+    it('cross-request: id is string even when resolveUser returns numeric id', async () => {
+      const bridge = createMockCookieBridge();
+      const factory = createAuth<NumericIdUser>({
+        secret: SECRET,
+        cookie: bridge,
+        resolveUser: async (id) => {
+          expect(typeof id).toBe('string');
+          expect(id).toBe('42');
+          return numericUser; // returns id: 42 (number) from "DB"
+        },
+      });
+
+      await factory().login(numericUser);
+
+      const fresh = factory();
+      const user = await fresh.user();
+      expect(typeof user!.id).toBe('string');
+      expect(user!.id).toBe('42');
+    });
+  });
+
+  describe('string-id users are unaffected', () => {
+    it('passes string id through unchanged on both paths', async () => {
+      const bridge = createMockCookieBridge();
+      const factory = createAuth<TestUser>({
+        secret: SECRET,
+        cookie: bridge,
+        sessionFields: ['email'],
+      });
+
+      const stringUser: TestUser = { id: 'u_abc', email: 'a@b.c' };
+      await factory().login(stringUser);
+
+      const sameRequest = await factory().user();
+      expect(sameRequest!.id).toBe('u_abc');
+
+      const crossRequest = await factory().user();
+      expect(crossRequest!.id).toBe('u_abc');
+    });
+  });
+});

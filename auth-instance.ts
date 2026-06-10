@@ -6,6 +6,7 @@ import type {
   HashInstance,
   LoginOptions,
   SessionPayload,
+  SessionUser,
 } from './types';
 import { seal, unseal } from './session/seal';
 import { buildCookieOptions } from './session/cookie';
@@ -46,7 +47,7 @@ export function createAuthInstance<TUser extends AnyUser>(
   deps: AuthInstanceDeps<TUser>,
 ): AuthInstance<TUser> {
   let cachedPayload: SessionPayload | null | undefined;
-  let cachedUser: TUser | null | undefined;
+  let cachedUser: SessionUser<TUser> | null | undefined;
 
   let didAutoTouch = false;
 
@@ -136,13 +137,15 @@ export function createAuthInstance<TUser extends AnyUser>(
     await deps.cookie.set(deps.cookieName, sealed, opts);
 
     cachedPayload = payload;
+    // Always coerce id to string so the same-request login path matches the
+    // cross-request read path (cookie ids are always strings).
     if (payload.data) {
       // sessionFields mode: cache only the picked fields
-      cachedUser = { id: user.id, ...payload.data } as TUser;
+      cachedUser = { ...payload.data, id: payload.uid } as SessionUser<TUser>;
     } else {
       // resolveUser mode: strip the password field from cache
       const { [deps.passwordField]: _, ...safeUser } = user as Record<string, any>;
-      cachedUser = safeUser as TUser;
+      cachedUser = { ...safeUser, id: payload.uid } as SessionUser<TUser>;
     }
   }
 
@@ -203,7 +206,7 @@ export function createAuthInstance<TUser extends AnyUser>(
       return session !== null;
     },
 
-    async user(): Promise<TUser | null> {
+    async user(): Promise<SessionUser<TUser> | null> {
       if (cachedUser !== undefined) return cachedUser;
 
       const session = await readSession();
@@ -214,13 +217,18 @@ export function createAuthInstance<TUser extends AnyUser>(
 
       // Cookie-backed: reconstruct user from session data
       if (deps.sessionFields && session.data) {
-        cachedUser = { id: session.uid, ...session.data } as TUser;
+        cachedUser = { ...session.data, id: session.uid } as SessionUser<TUser>;
         return cachedUser;
       }
 
-      // Database-backed: resolve user via callback
+      // Database-backed: resolve user via callback, then normalize id to string
       if (deps.resolveUser) {
-        cachedUser = (await deps.resolveUser(session.uid)) ?? null;
+        const resolved = await deps.resolveUser(session.uid);
+        if (!resolved) {
+          cachedUser = null;
+          return null;
+        }
+        cachedUser = { ...resolved, id: String(resolved.id) } as SessionUser<TUser>;
         return cachedUser;
       }
 

@@ -123,7 +123,7 @@ const session = auth({ autoTouch: true });   // auto-extends session past halfwa
 | `attempt(credentials, options?)` | `Promise<boolean>` | Find user, verify password, login if valid |
 | `logout()` | `Promise<void>` | Delete session cookie |
 | `check()` | `Promise<boolean>` | Is the session valid? (read-only) |
-| `user()` | `Promise<User \| null>` | Get the authenticated user (read-only) |
+| `user()` | `Promise<SessionUser<User> \| null>` | Get the authenticated user (read-only). `id` is always `string` — see [note on id types](#user-id-type). |
 | `id()` | `Promise<string \| null>` | Get the authenticated user's ID (read-only) |
 | `touch()` | `Promise<void>` | Extend session expiry. Reseals past halfway (`autoTouch: false`) or immediately (`autoTouch: true`). |
 
@@ -145,6 +145,22 @@ await session.login(user, { remember: false });
 // Default — 7-day cookie
 await session.login(user);
 ```
+
+#### User id type
+
+You can pass `login(user)` a user whose `id` is a number — the library always normalizes it to a string when sealing into the cookie. As a result, `user()` always returns `id` as a `string`:
+
+```typescript
+type AuthUser = { id: number; email: string; name: string };
+const auth = createAuth<AuthUser>({ /* ... */ });
+
+await auth().login({ id: 42, email: 'a@b.c', name: 'Alice' });
+
+const u = await auth().user();
+// u?.id is string ('42'), not number — matches what's actually in the cookie
+```
+
+The return type is `SessionUser<TUser>`, which is `Omit<TUser, 'id'> & { id: string }`. If app code needs the numeric id back, parse at the boundary: `Number(u.id)`. This avoids the silent type/runtime mismatch where TS believed `id` was a number but the cookie always produced a string.
 
 #### `attempt()` — Two Modes
 

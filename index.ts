@@ -24,6 +24,7 @@ export { generateRecoveryCodes, verifyRecoveryCode } from './totp/recovery';
 // Types
 export type {
   AnyUser,
+  SessionUser,
   CookieBridge,
   ConfigurableCookieOptions,
   CookieOptions,
