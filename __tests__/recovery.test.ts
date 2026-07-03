@@ -69,3 +69,16 @@ describe('verifyRecoveryCode', () => {
     expect(second.remaining).toHaveLength(1);
   });
 });
+
+describe('input normalization', () => {
+  it('accepts codes with surrounding whitespace and uppercase letters', async () => {
+    const { codes, hashed } = await generateRecoveryCodes(hash, 2);
+    const result = await verifyRecoveryCode(
+      `  ${codes[0].toUpperCase()}  `,
+      hashed,
+      hash,
+    );
+    expect(result.valid).toBe(true);
+    expect(result.remaining).toHaveLength(1);
+  });
+});

@@ -111,8 +111,10 @@ When a user enables 2FA, you need to generate a secret, show them a QR code, and
        process.env.ENCRYPTION_KEY,
      );
 
-     // Verify the code from the authenticator app
-     if (!totp.verify(code, secret)) {
+     // Verify the code from the authenticator app.
+     // This is a fresh setup, so there is no previous counter — pass null.
+     const { valid, counter } = totp.verify(code, secret, null);
+     if (!valid) {
        return res.status(400).json({ error: 'Invalid code' });
      }
 
@@ -129,6 +131,8 @@ When a user enables 2FA, you need to generate a secret, show them a QR code, and
          pendingTotpSecret: null,
          recoveryCodeHashes: hashed,
          twoFactorEnabled: true,
+         // record the enrollment code's step so it can't be replayed at login
+         totpLastUsedCounter: counter,
        },
      });
 
@@ -168,6 +172,7 @@ const auth = createAuth({
 // Token verifier for the 2FA pending state (short-lived)
 const pendingVerifier = createTokenVerifier({
   secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: '2fa-pending', // tokens from other flows never verify here
   expiryMs: 5 * 60 * 1000, // 5 minutes
 });
 
@@ -233,12 +238,24 @@ export async function verifyTwoFactor(req, res) {
     return res.status(401).json({ error: 'Invalid session' });
   }
 
-  // Decrypt the TOTP secret and verify the code
+  // Decrypt the TOTP secret and verify the code.
+  // verify + the persisted counter rejects replayed codes —
+  // a code that already logged someone in can't be used again within
+  // the acceptance window.
   const secret = await decrypt(user.totpSecret, process.env.ENCRYPTION_KEY);
 
-  if (!totp.verify(code, secret)) {
+  const { valid, counter } = totp.verify(
+    code,
+    secret,
+    user.totpLastUsedCounter,
+  );
+  if (!valid) {
     return res.status(400).json({ error: 'Invalid 2FA code' });
   }
+  await db.user.update({
+    where: { id: user.id },
+    data: { totpLastUsedCounter: counter },
+  });
 
   // Delete the pending cookie and create a real session
   await cookieBridge.delete('2fa_pending');
@@ -421,61 +438,24 @@ export async function regenerateCodes(req, res) {
 
 TOTP codes are valid for the current time step plus any steps within the configured `window`. With the default settings (30-second period, window of 1), a code is valid for up to 90 seconds (the previous, current, and next time steps). This means a code could be reused within that window.
 
-To prevent replay attacks, store the last used time step for each user and reject codes at or before that step.
-
-### Implementation
+`verify()` handles this: it returns the time step the code matched, and rejects codes at or before the `lastUsedCounter` you pass in. Persist the counter after each successful verification (as shown in Step 2 above) and every code becomes single-use:
 
 ```ts
-function getCurrentTimeStep(period: number = 30): number {
-  return Math.floor(Date.now() / 1000 / period);
+const { valid, counter } = totp.verify(
+  code,
+  secret,
+  user.totpLastUsedCounter, // null on first use
+);
+if (!valid) {
+  return res.status(400).json({ error: 'Invalid or already used 2FA code' });
 }
 
-// POST /api/2fa/verify (enhanced with replay protection)
-export async function verifyTwoFactorWithReplayProtection(req, res) {
-  const { code, remember } = req.body;
-
-  const pendingToken = await cookieBridge.get('2fa_pending');
-  if (!pendingToken) {
-    return res.status(401).json({ error: 'No pending 2FA session' });
-  }
-
-  const result = pendingVerifier.verifyToken(pendingToken);
-  if (!result) {
-    return res.status(401).json({ error: '2FA session expired' });
-  }
-
-  const user = await db.user.findUnique({ where: { id: result.userId } });
-  if (!user || !user.twoFactorEnabled) {
-    return res.status(401).json({ error: 'Invalid session' });
-  }
-
-  const secret = await decrypt(user.totpSecret, process.env.ENCRYPTION_KEY);
-
-  // Verify the TOTP code
-  if (!totp.verify(code, secret)) {
-    return res.status(400).json({ error: 'Invalid 2FA code' });
-  }
-
-  // Check for replay: reject if the current time step has already been used
-  const currentStep = getCurrentTimeStep();
-  if (user.lastTotpStep && currentStep <= user.lastTotpStep) {
-    return res.status(400).json({ error: 'Code already used' });
-  }
-
-  // Record the time step to prevent replay
-  await db.user.update({
-    where: { id: user.id },
-    data: { lastTotpStep: currentStep },
-  });
-
-  // Delete the pending cookie and create a real session
-  await cookieBridge.delete('2fa_pending');
-
-  const session = auth();
-  await session.login(user, { remember });
-
-  return res.json({ success: true });
-}
+// counter is the step the code actually matched (may be the previous or
+// next step within the drift window) — persist it, not the current time
+await db.user.update({
+  where: { id: user.id },
+  data: { totpLastUsedCounter: counter },
+});
 ```
 
 ### Database schema addition
@@ -483,7 +463,7 @@ export async function verifyTwoFactorWithReplayProtection(req, res) {
 Add a column to track the last used time step:
 
 ```sql
-ALTER TABLE users ADD COLUMN last_totp_step BIGINT;
+ALTER TABLE users ADD COLUMN totp_last_used_counter BIGINT;
 ```
 
 <Aside>
@@ -518,7 +498,7 @@ export async function disableTwoFactor(req, res) {
       totpSecret: null,
       pendingTotpSecret: null,
       recoveryCodeHashes: null,
-      lastTotpStep: null,
+      totpLastUsedCounter: null,
     },
   });
 
@@ -541,7 +521,7 @@ CREATE TABLE users (
   totp_secret           TEXT,           -- encrypted with encrypt()
   pending_totp_secret   TEXT,           -- encrypted, temporary during setup
   recovery_code_hashes  TEXT[],         -- array of bcrypt hashes
-  last_totp_step        BIGINT          -- replay protection
+  totp_last_used_counter BIGINT         -- replay protection (verify)
 );
 ```
 

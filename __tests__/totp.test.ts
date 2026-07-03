@@ -34,36 +34,100 @@ describe('createTOTP', () => {
     it('accepts a valid token for the current time', () => {
       const secret = totp.generateSecret();
       const token = generateCode(secret, 6, 30, 0);
-      expect(totp.verify(token, secret)).toBe(true);
+      expect(totp.verify(token, secret, null).valid).toBe(true);
     });
 
     it('rejects an incorrect token', () => {
       const secret = totp.generateSecret();
-      expect(totp.verify('000000', secret)).toBe(false);
+      expect(totp.verify('000000', secret, null).valid).toBe(false);
     });
 
     it('accepts tokens within the default window (±1 step)', () => {
       const secret = totp.generateSecret();
       const pastToken = generateCode(secret, 6, 30, -1);
       const futureToken = generateCode(secret, 6, 30, 1);
-      expect(totp.verify(pastToken, secret)).toBe(true);
-      expect(totp.verify(futureToken, secret)).toBe(true);
+      expect(totp.verify(pastToken, secret, null).valid).toBe(true);
+      expect(totp.verify(futureToken, secret, null).valid).toBe(true);
     });
 
     it('rejects tokens outside the window', () => {
       const secret = totp.generateSecret();
       const farPast = generateCode(secret, 6, 30, -2);
       const farFuture = generateCode(secret, 6, 30, 2);
-      expect(totp.verify(farPast, secret)).toBe(false);
-      expect(totp.verify(farFuture, secret)).toBe(false);
+      expect(totp.verify(farPast, secret, null).valid).toBe(false);
+      expect(totp.verify(farFuture, secret, null).valid).toBe(false);
     });
 
     it('uses timing-safe comparison (no early exit on partial match)', () => {
       const secret = totp.generateSecret();
       // Both wrong tokens should take approximately the same time
       // (we can't measure timing precisely, but we verify the function works)
-      expect(totp.verify('999999', secret)).toBe(false);
-      expect(totp.verify('111111', secret)).toBe(false);
+      expect(totp.verify('999999', secret, null).valid).toBe(false);
+      expect(totp.verify('111111', secret, null).valid).toBe(false);
+    });
+  });
+
+  describe('replay protection (enforced counter)', () => {
+    it('returns the matched counter for a valid token', () => {
+      const secret = totp.generateSecret();
+      const token = generateCode(secret, 6, 30, 0);
+      const result = totp.verify(token, secret, null);
+      expect(result.valid).toBe(true);
+      expect(result.counter).toBe(Math.floor(Date.now() / 1000 / 30));
+    });
+
+    it('rejects a replayed token when lastUsedCounter matches', () => {
+      const secret = totp.generateSecret();
+      const token = generateCode(secret, 6, 30, 0);
+      const first = totp.verify(token, secret, null);
+      expect(first.valid).toBe(true);
+      const replay = totp.verify(token, secret, first.counter);
+      expect(replay.valid).toBe(false);
+      expect(replay.counter).toBeNull();
+    });
+
+    it('accepts a token at a later counter than lastUsedCounter', () => {
+      const secret = totp.generateSecret();
+      const token = generateCode(secret, 6, 30, 0);
+      const currentCounter = Math.floor(Date.now() / 1000 / 30);
+      const result = totp.verify(token, secret, currentCounter - 2);
+      expect(result.valid).toBe(true);
+    });
+
+    it('returns null counter for an invalid token', () => {
+      const secret = totp.generateSecret();
+      const result = totp.verify('000000', secret, null);
+      expect(result.valid).toBe(false);
+      expect(result.counter).toBeNull();
+    });
+  });
+
+  describe('token normalization', () => {
+    it('accepts tokens with whitespace ("123 456" style)', () => {
+      const secret = totp.generateSecret();
+      const token = generateCode(secret, 6, 30, 0);
+      const spaced = `${token.slice(0, 3)} ${token.slice(3)}`;
+      expect(totp.verify(spaced, secret, null).valid).toBe(true);
+      expect(totp.verify(` ${token} `, secret, null).valid).toBe(true);
+    });
+
+    it('rejects tokens with the wrong length', () => {
+      const secret = totp.generateSecret();
+      const token = generateCode(secret, 6, 30, 0);
+      expect(totp.verify(token + '0', secret, null).valid).toBe(false);
+      expect(totp.verify(token.slice(1), secret, null).valid).toBe(false);
+    });
+
+    it('rejects non-numeric tokens', () => {
+      const secret = totp.generateSecret();
+      expect(totp.verify('abcdef', secret, null).valid).toBe(false);
+    });
+
+    it('verify still works when destructured', () => {
+      const { verify } = createTOTP();
+      const secret = totp.generateSecret();
+      const token = generateCode(secret, 6, 30, 0);
+      expect(verify(token, secret, null).valid).toBe(true);
     });
   });
 
@@ -113,10 +177,10 @@ describe('createTOTP', () => {
       const secret = noWindow.generateSecret();
       // Current step should still work
       const current = generateCode(secret, 6, 30, 0);
-      expect(noWindow.verify(current, secret)).toBe(true);
+      expect(noWindow.verify(current, secret, null).valid).toBe(true);
       // Adjacent step should NOT work with window=0
       const adjacent = generateCode(secret, 6, 30, -1);
-      expect(noWindow.verify(adjacent, secret)).toBe(false);
+      expect(noWindow.verify(adjacent, secret, null).valid).toBe(false);
     });
   });
 });

@@ -316,17 +316,27 @@ This guide walks through migrating from [Better Auth](https://www.better-auth.co
      if (!user?.totpSecret) return { error: '2FA is not enabled.' };
 
      const secret = await decrypt(user.totpSecret, process.env.TOTP_KEY!);
-     const isValid = totp.verify(code, secret);
 
-     if (!isValid) {
+     // Pass the persisted counter of the last successful verification
+     // (null for first use) — codes at or before it are rejected,
+     // which gives you built-in replay protection.
+     const { valid, counter } = totp.verify(code, secret, user.totpLastUsedCounter);
+
+     if (!valid) {
        return { error: 'Invalid code.' };
      }
+
+     // Persist the matched counter for the next verification
+     await db.user.update({
+       where: { id: userId },
+       data: { totpLastUsedCounter: counter },
+     });
 
      return { success: true };
    }
    ```
 
-   Better Auth stores 2FA state in the `accounts` table via its plugin system. With ideal-auth, you add `totpSecret`, `recoveryCodes`, and `twoFactorEnabled` columns to your `users` table (or a separate table) and manage the state yourself.
+   Better Auth stores 2FA state in the `accounts` table via its plugin system. With ideal-auth, you add `totpSecret`, `recoveryCodes`, `twoFactorEnabled`, and `totpLastUsedCounter` columns to your `users` table (or a separate table) and manage the state yourself.
 
 8. ### Remove Better Auth
 
@@ -362,7 +372,7 @@ Better Auth manages specific tables. Here is what to keep and what to drop:
 
 | Better Auth table | Action | Notes |
 |-------------------|--------|-------|
-| `users` | **Keep** | Add `password` column if missing. Add `totpSecret`, `recoveryCodes`, `twoFactorEnabled` if migrating 2FA. |
+| `users` | **Keep** | Add `password` column if missing. Add `totpSecret`, `recoveryCodes`, `twoFactorEnabled`, `totpLastUsedCounter` if migrating 2FA. |
 | `sessions` | **Drop** (after migration) | ideal-auth uses encrypted cookies, not database sessions |
 | `accounts` | **Keep if using OAuth** | Stores OAuth provider links. Keep if you plan to use Arctic for OAuth. |
 | `verifications` | **Drop** (after migration) | Replace with `createTokenVerifier` for email verification and password reset flows |

@@ -2,9 +2,10 @@ import { describe, it, expect } from 'bun:test';
 import { createTokenVerifier } from '../token-verifier';
 
 const SECRET = 'a'.repeat(32);
+const PURPOSE = 'test-tokens';
 
 describe('createTokenVerifier', () => {
-  const verifier = createTokenVerifier({ secret: SECRET });
+  const verifier = createTokenVerifier({ secret: SECRET, purpose: PURPOSE });
 
   it('creates a token string', () => {
     const token = verifier.createToken('user-1');
@@ -12,27 +13,37 @@ describe('createTokenVerifier', () => {
     expect(token.split('.')).toHaveLength(5);
   });
 
+  it('throws on missing purpose at creation', () => {
+    // @ts-expect-error — testing the runtime guard for JS callers
+    expect(() => createTokenVerifier({ secret: SECRET })).toThrow(
+      'purpose is required',
+    );
+    expect(() => createTokenVerifier({ secret: SECRET, purpose: '' })).toThrow(
+      'purpose is required',
+    );
+  });
+
   it('throws on missing secret at first use', () => {
-    const verifier = createTokenVerifier({ secret: '' });
+    const verifier = createTokenVerifier({ secret: '', purpose: PURPOSE });
     expect(() => verifier.createToken('user-1')).toThrow(
       'secret must be at least 32 characters',
     );
   });
 
   it('throws on short secret at first use', () => {
-    const verifier = createTokenVerifier({ secret: 'short' });
+    const verifier = createTokenVerifier({ secret: 'short', purpose: PURPOSE });
     expect(() => verifier.createToken('user-1')).toThrow(
       'secret must be at least 32 characters',
     );
   });
 
   it('verifyToken returns null instead of throwing on missing secret', () => {
-    const verifier = createTokenVerifier({ secret: '' });
+    const verifier = createTokenVerifier({ secret: '', purpose: PURPOSE });
     expect(verifier.verifyToken('some.fake.token.here.sig')).toBeNull();
   });
 
   it('verifyToken returns null instead of throwing on short secret', () => {
-    const verifier = createTokenVerifier({ secret: 'short' });
+    const verifier = createTokenVerifier({ secret: 'short', purpose: PURPOSE });
     expect(verifier.verifyToken('some.fake.token.here.sig')).toBeNull();
   });
 
@@ -65,7 +76,7 @@ describe('createTokenVerifier', () => {
   });
 
   it('returns null for expired token', () => {
-    const expired = createTokenVerifier({ secret: SECRET, expiryMs: 0 });
+    const expired = createTokenVerifier({ secret: SECRET, purpose: PURPOSE, expiryMs: 0 });
     const token = expired.createToken('user-1');
     expect(expired.verifyToken(token)).toBeNull();
   });
@@ -79,13 +90,14 @@ describe('createTokenVerifier', () => {
 
   it('returns null with wrong secret', () => {
     const token = verifier.createToken('user-1');
-    const other = createTokenVerifier({ secret: 'b'.repeat(32) });
+    const other = createTokenVerifier({ secret: 'b'.repeat(32), purpose: PURPOSE });
     expect(other.verifyToken(token)).toBeNull();
   });
 
   it('respects custom expiryMs', () => {
     const longExpiry = createTokenVerifier({
       secret: SECRET,
+      purpose: PURPOSE,
       expiryMs: 1000 * 60 * 60 * 24, // 24 hours
     });
     const token = longExpiry.createToken('user-1');
@@ -102,6 +114,7 @@ describe('createTokenVerifier', () => {
     it('works for password reset', () => {
       const passwordReset = createTokenVerifier({
         secret: SECRET,
+        purpose: 'password-reset',
         expiryMs: 60 * 60 * 1000, // 1 hour
       });
       const token = passwordReset.createToken('user-1');
@@ -111,6 +124,7 @@ describe('createTokenVerifier', () => {
     it('works for email verification', () => {
       const emailVerification = createTokenVerifier({
         secret: SECRET,
+        purpose: 'email-verification',
         expiryMs: 24 * 60 * 60 * 1000, // 24 hours
       });
       const token = emailVerification.createToken('user-1');
@@ -121,41 +135,54 @@ describe('createTokenVerifier', () => {
       // Create token with a 1-hour expiry
       const hourVerifier = createTokenVerifier({
         secret: SECRET,
+        purpose: PURPOSE,
         expiryMs: 60 * 60 * 1000,
       });
       const before = Date.now();
       const token = hourVerifier.createToken('user-1');
 
-      // Verify with a different expiryMs — iat should still be accurate
-      // since it's stored in the token, not computed as exp - expiryMs
-      const dayVerifier = createTokenVerifier({
-        secret: SECRET,
-        expiryMs: 24 * 60 * 60 * 1000,
-      });
-      // Token was signed with a different secret-scoped expiryMs,
-      // but same secret means signature is valid. The iat in the token
-      // should reflect actual creation time, not be derived from config.
+      // The iat in the token should reflect actual creation time,
+      // not be derived from config as exp - expiryMs.
       const result = hourVerifier.verifyToken(token);
       expect(result).not.toBeNull();
       expect(result!.iatMs).toBeGreaterThanOrEqual(before);
       expect(result!.iatMs).toBeLessThanOrEqual(Date.now());
     });
+  });
+});
 
-    it('tokens from different verifiers are not interchangeable', () => {
-      const resetVerifier = createTokenVerifier({
-        secret: SECRET + '-reset',
-        expiryMs: 60 * 60 * 1000,
-      });
-      const emailVerifier = createTokenVerifier({
-        secret: SECRET + '-email',
-        expiryMs: 24 * 60 * 60 * 1000,
-      });
+describe('purpose binding', () => {
+  const SECRET2 = 'b'.repeat(32);
 
-      const resetToken = resetVerifier.createToken('user-1');
-      const emailToken = emailVerifier.createToken('user-1');
+  it('verifies a token with the matching purpose', () => {
+    const reset = createTokenVerifier({ secret: SECRET2, purpose: 'password-reset' });
+    const token = reset.createToken('user-1');
+    expect(reset.verifyToken(token)).toMatchObject({ userId: 'user-1' });
+  });
 
-      expect(resetVerifier.verifyToken(emailToken)).toBeNull();
-      expect(emailVerifier.verifyToken(resetToken)).toBeNull();
+  it('rejects a token minted for a different purpose (same secret)', () => {
+    const reset = createTokenVerifier({ secret: SECRET2, purpose: 'password-reset' });
+    const verifyEmail = createTokenVerifier({ secret: SECRET2, purpose: 'email-verification' });
+    const token = reset.createToken('user-1');
+    expect(verifyEmail.verifyToken(token)).toBeNull();
+  });
+
+  it('tokens from verifiers with different secrets are not interchangeable', () => {
+    const resetVerifier = createTokenVerifier({
+      secret: SECRET2 + '-reset',
+      purpose: 'password-reset',
+      expiryMs: 60 * 60 * 1000,
     });
+    const emailVerifier = createTokenVerifier({
+      secret: SECRET2 + '-email',
+      purpose: 'email-verification',
+      expiryMs: 24 * 60 * 60 * 1000,
+    });
+
+    const resetToken = resetVerifier.createToken('user-1');
+    const emailToken = emailVerifier.createToken('user-1');
+
+    expect(resetVerifier.verifyToken(emailToken)).toBeNull();
+    expect(emailVerifier.verifyToken(resetToken)).toBeNull();
   });
 });

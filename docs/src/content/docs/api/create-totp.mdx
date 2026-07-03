@@ -111,20 +111,43 @@ const dataUrl = await QRCode.toDataURL(uri);
 #### verify
 
 ```typescript
-verify(token: string, secret: string): boolean
+verify(
+  token: string,
+  secret: string,
+  lastUsedCounter: number | null,
+): { valid: boolean; counter: number | null }
 ```
 
-Verifies a TOTP code against a secret. Returns `true` if the code is valid within the configured time window.
+Verifies a TOTP code against a secret, with built-in replay protection. `lastUsedCounter` is the persisted time-step counter of the last successfully verified code — pass `null` if the user has never verified one. Codes at or before `lastUsedCounter` are rejected, so a code can never be accepted twice.
+
+On success, `counter` is the time step the code matched. You **must persist it** (e.g. a `totp_last_used_counter BIGINT` column on the users table) and pass it back on the next verification.
+
+| Field | Type | Description |
+|---|---|---|
+| `valid` | `boolean` | Whether the code is valid within the configured time window and newer than `lastUsedCounter` |
+| `counter` | `number \| null` | The matched time step on success, `null` on failure. Store it and pass it as `lastUsedCounter` next time |
 
 ```typescript
 const totp = createTOTP();
 
-const isValid = totp.verify('123456', user.totpSecret);
+const { valid, counter } = totp.verify(
+  '123456',
+  user.totpSecret,
+  user.totpLastUsedCounter,
+);
 
-if (!isValid) {
+if (!valid) {
   return { error: 'Invalid verification code.' };
 }
+
+// Persist the matched counter so this code can never be replayed
+await db.user.update({
+  where: { id: user.id },
+  data: { totpLastUsedCounter: counter },
+});
 ```
+
+Tokens are normalized before verification: whitespace is stripped (so `"123 456"` works), and anything that is not exactly `digits` digits is rejected.
 
 The `window` configuration determines how many adjacent time steps are checked. With the default window of `1`, the current time step and one step in each direction are checked (3 codes total). This accommodates minor clock drift between the server and the user's authenticator app.
 

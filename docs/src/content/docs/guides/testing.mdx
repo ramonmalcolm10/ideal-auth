@@ -205,7 +205,7 @@ This is useful for testing:
 
 ## Testing token verifier
 
-The token verifier is stateless and deterministic (given the same secret), so it is straightforward to test. Use a test secret that is at least 32 characters long:
+The token verifier is stateless and deterministic (given the same secret and purpose), so it is straightforward to test. Use a test secret that is at least 32 characters long. The `purpose` field is required — creation throws without it:
 
 ```ts
 import { createTokenVerifier } from 'ideal-auth';
@@ -213,7 +213,7 @@ import { createTokenVerifier } from 'ideal-auth';
 const SECRET = 'test-secret-that-is-at-least-32-chars';
 
 describe('token verifier', () => {
-  const verifier = createTokenVerifier({ secret: SECRET });
+  const verifier = createTokenVerifier({ secret: SECRET, purpose: 'test-tokens' });
 
   it('creates and verifies a token', () => {
     const token = verifier.createToken('user-1');
@@ -227,6 +227,7 @@ describe('token verifier', () => {
   it('returns null for an expired token', () => {
     const expiredVerifier = createTokenVerifier({
       secret: SECRET,
+      purpose: 'test-tokens',
       expiryMs: 0, // expires immediately
     });
     const token = expiredVerifier.createToken('user-1');
@@ -238,9 +239,22 @@ describe('token verifier', () => {
     const token = verifier.createToken('user-1');
     const otherVerifier = createTokenVerifier({
       secret: 'different-secret-at-least-32-characters',
+      purpose: 'test-tokens',
     });
 
     expect(otherVerifier.verifyToken(token)).toBeNull();
+  });
+
+  it('returns null with a different purpose', () => {
+    // The purpose is mixed into the token signature, so a token from one
+    // flow never verifies in another — even with the same secret.
+    const token = verifier.createToken('user-1');
+    const otherPurpose = createTokenVerifier({
+      secret: SECRET,
+      purpose: 'password-reset',
+    });
+
+    expect(otherPurpose.verifyToken(token)).toBeNull();
   });
 
   it('returns null for tampered tokens', () => {
@@ -380,20 +394,32 @@ describe('TOTP', () => {
   it('verifies a valid code', () => {
     const secret = totp.generateSecret();
     const code = generateTestCode(secret);
-    expect(totp.verify(code, secret)).toBe(true);
+    expect(totp.verify(code, secret, null).valid).toBe(true);
   });
 
   it('rejects an invalid code', () => {
     const secret = totp.generateSecret();
-    expect(totp.verify('000000', secret)).toBe(false);
+    expect(totp.verify('000000', secret, null).valid).toBe(false);
   });
 
   it('accepts codes within the window (default +-1 step)', () => {
     const secret = totp.generateSecret();
     const pastCode = generateTestCode(secret, 6, 30, -1);
     const futureCode = generateTestCode(secret, 6, 30, 1);
-    expect(totp.verify(pastCode, secret)).toBe(true);
-    expect(totp.verify(futureCode, secret)).toBe(true);
+    expect(totp.verify(pastCode, secret, null).valid).toBe(true);
+    expect(totp.verify(futureCode, secret, null).valid).toBe(true);
+  });
+
+  it('rejects a replayed code', () => {
+    const secret = totp.generateSecret();
+    const code = generateTestCode(secret);
+
+    const first = totp.verify(code, secret, null);
+    expect(first.valid).toBe(true);
+
+    // Passing the persisted counter back rejects the same code
+    const second = totp.verify(code, secret, first.counter);
+    expect(second.valid).toBe(false);
   });
 
   it('generates a valid QR URI', () => {

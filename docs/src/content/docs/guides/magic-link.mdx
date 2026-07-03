@@ -32,6 +32,7 @@ export const auth = createAuth<User>({
 
 export const magicLinks = createTokenVerifier({
   secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'magic-link', // tokens from other flows (password reset, etc.) never verify here
   expiryMs: 15 * 60 * 1000, // 15 minutes
 });
 

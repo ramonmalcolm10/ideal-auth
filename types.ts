@@ -47,9 +47,37 @@ export interface LoginOptions {
   remember?: boolean;
 }
 
+/** Metadata about the current session, passed to `validateSession`. */
+export interface SessionInfo {
+  /** The user id stored in the session cookie (always a string). */
+  uid: string;
+  /** When the session was originally created via login. Preserved across `touch()` reseals. */
+  issuedAt: Date;
+  /** When the session expires. */
+  expiresAt: Date;
+}
+
 interface AuthConfigBase<TUser extends AnyUser> {
   secret: string;
   cookie: CookieBridge;
+  /**
+   * Optional server-side session revocation check, run once per request on the
+   * first session read. Return `false` to treat the session as logged out.
+   *
+   * Enables "log out everywhere" — e.g. reject sessions issued before the
+   * user's `passwordChangedAt`:
+   *
+   * ```ts
+   * validateSession: async ({ uid, issuedAt }) => {
+   *   const user = await db.user.find(uid);
+   *   return !user?.passwordChangedAt || issuedAt >= user.passwordChangedAt;
+   * }
+   * ```
+   *
+   * Note: this adds a lookup on every request, which negates the zero-DB
+   * benefit of `sessionFields` mode — use a fast store (memory/Redis) there.
+   */
+  validateSession?: (session: SessionInfo) => boolean | Promise<boolean>;
   session?: {
     cookieName?: string;
     maxAge?: number;
@@ -144,6 +172,14 @@ export interface HashInstance {
 export interface TokenVerifierConfig {
   secret: string;
   expiryMs?: number;
+  /**
+   * Binds tokens to a purpose (e.g. `'password-reset'`, `'email-verification'`).
+   * A token only verifies against a verifier configured with the same purpose —
+   * prevents a token minted for one flow from being replayed in another when
+   * both verifiers share a secret. Required: every verifier declares what its
+   * tokens are for.
+   */
+  purpose: string;
 }
 
 export interface TokenVerifierInstance {
@@ -180,7 +216,20 @@ export interface TOTPConfig {
 export interface TOTPInstance {
   generateSecret(): string;
   generateQrUri(options: { secret: string; issuer: string; account: string }): string;
-  verify(token: string, secret: string): boolean;
+  /**
+   * Verifies a token with built-in replay protection.
+   *
+   * `lastUsedCounter` is the time-step counter of the last successfully
+   * verified code (pass `null` when the user has never verified one) —
+   * codes at or before it are rejected, so a code can never be accepted
+   * twice. On success, persist the returned `counter` and pass it back on
+   * the next verification.
+   */
+  verify(
+    token: string,
+    secret: string,
+    lastUsedCounter: number | null,
+  ): { valid: boolean; counter: number | null };
 }
 
 export interface RecoveryCodeResult {

@@ -46,13 +46,31 @@ export function createTOTP(config?: TOTPConfig): TOTPInstance {
       return `otpauth://totp/${label}?${params.toString()}`;
     },
 
-    verify(token: string, secret: string): boolean {
+    verify(
+      token: string,
+      secret: string,
+      lastUsedCounter: number | null,
+    ): { valid: boolean; counter: number | null } {
+      // Normalize the "123 456" spacing authenticator apps display,
+      // then reject anything that isn't exactly `digits` digits.
+      const normalized = token.replace(/\s+/g, '');
+      if (normalized.length !== digits || !/^\d+$/.test(normalized)) {
+        return { valid: false, counter: null };
+      }
+
       const counter = Math.floor(Date.now() / 1000 / period);
       for (let i = -window; i <= window; i++) {
         const candidate = generate(secret, digits, period, counter + i);
-        if (timingSafeEqual(token, candidate)) return true;
+        if (timingSafeEqual(normalized, candidate)) {
+          // Replay protection: reject codes at or before the last counter
+          // that already produced a successful verification.
+          if (lastUsedCounter != null && counter + i <= lastUsedCounter) {
+            return { valid: false, counter: null };
+          }
+          return { valid: true, counter: counter + i };
+        }
       }
-      return false;
+      return { valid: false, counter: null };
     },
   };
 }

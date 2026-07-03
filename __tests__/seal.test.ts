@@ -80,3 +80,33 @@ describe('seal / unseal', () => {
     expect(result).toBeNull();
   });
 });
+
+describe('seal ttl (iron-session internal expiry)', () => {
+  it('seals with the payload ttl instead of iron-session 14-day default', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const thirtyDays = 60 * 60 * 24 * 30;
+    const sealed = await seal(
+      { uid: 'user-1', iat: now, exp: now + thirtyDays, ttl: thirtyDays },
+      SECRET,
+    );
+
+    // Iron seal format embeds the expiration as a ms timestamp segment.
+    // With the 14-day default this would be ~now+14d; it must honor 30d.
+    const expirationSegment = sealed
+      .split('*')
+      .find((part) => /^\d{13,}$/.test(part));
+    expect(expirationSegment).toBeDefined();
+    const expirationMs = Number(expirationSegment);
+    expect(expirationMs).toBeGreaterThan(Date.now() + 20 * 24 * 3600 * 1000);
+  });
+
+  it('30-day payload survives a round-trip', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const thirtyDays = 60 * 60 * 24 * 30;
+    const payload = { uid: 'user-1', iat: now, exp: now + thirtyDays, ttl: thirtyDays };
+    const result = await unseal(await seal(payload, SECRET), SECRET);
+    expect(result).not.toBeNull();
+    expect(result!.exp).toBe(payload.exp);
+    expect(result!.ttl).toBe(thirtyDays);
+  });
+});
