@@ -5,6 +5,7 @@ import type {
   CookieBridge,
   HashInstance,
   LoginOptions,
+  SessionInfo,
   SessionPayload,
   SessionUser,
 } from './types';
@@ -32,6 +33,7 @@ interface AuthInstanceDeps<TUser extends AnyUser> {
   rememberMaxAge: number;
   cookieOptions: ConfigurableCookieOptions;
   autoTouch: boolean;
+  validateSession?: (session: SessionInfo) => boolean | Promise<boolean>;
   resolveUser?: (id: string) => Promise<TUser | null | undefined>;
   sessionFields?: (keyof TUser & string)[];
   hash?: HashInstance;
@@ -72,6 +74,21 @@ export function createAuthInstance<TUser extends AnyUser>(
     }
 
     cachedPayload = await unseal(raw, deps.secret);
+
+    // Server-side revocation check — false means "treat as logged out".
+    // Errors propagate: a failing lookup should surface, not silently
+    // resolve to either logged-in or logged-out.
+    if (cachedPayload && deps.validateSession) {
+      const valid = await deps.validateSession({
+        uid: cachedPayload.uid,
+        issuedAt: new Date(cachedPayload.iat * 1000),
+        expiresAt: new Date(cachedPayload.exp * 1000),
+      });
+      if (!valid) {
+        cachedPayload = null;
+        return null;
+      }
+    }
 
     // Auto-touch: reseal past halfway when enabled
     if (deps.autoTouch && cachedPayload && !didAutoTouch) {
@@ -139,9 +156,14 @@ export function createAuthInstance<TUser extends AnyUser>(
     cachedPayload = payload;
     // Always coerce id to string so the same-request login path matches the
     // cross-request read path (cookie ids are always strings).
-    if (payload.data) {
-      // sessionFields mode: cache only the picked fields
-      cachedUser = { ...payload.data, id: payload.uid } as SessionUser<TUser>;
+    if (deps.sessionFields) {
+      // sessionFields mode: cache only the picked fields. No data means the
+      // user object had none of the declared fields — cache null to match
+      // the cross-request read path, which treats data-less cookies as
+      // logged out (can't satisfy the TUser contract without the fields).
+      cachedUser = payload.data
+        ? ({ ...payload.data, id: payload.uid } as SessionUser<TUser>)
+        : null;
     } else {
       // resolveUser mode: strip the password field from cache
       const { [deps.passwordField]: _, ...safeUser } = user as Record<string, any>;
@@ -175,16 +197,23 @@ export function createAuthInstance<TUser extends AnyUser>(
       // Laravel-style: strip password, resolve user, verify hash
       if (deps.hash && deps.resolveUserByCredentials) {
         const { [deps.credentialKey]: password, ...lookup } = credentials;
+        // Coerce non-string passwords (missing, arrays from query strings, etc.)
+        // to '' so the flow returns false instead of throwing — and still runs
+        // the verify below to keep timing uniform.
+        const plaintext = typeof password === 'string' ? password : '';
         const dbUser = await deps.resolveUserByCredentials(lookup);
 
         // Run verify even on miss against a dummy hash — prevents user enumeration via timing
-        const storedHash = dbUser
+        const rawStoredHash = dbUser
           ? (dbUser as Record<string, any>)[deps.passwordField]
           : undefined;
+        const storedHash = typeof rawStoredHash === 'string' && rawStoredHash
+          ? rawStoredHash
+          : undefined;
         const hashToCheck = storedHash ?? (await getDummyHash(deps.hash));
-        const ok = await deps.hash.verify(password, hashToCheck);
+        const ok = await deps.hash.verify(plaintext, hashToCheck);
 
-        if (!dbUser || !storedHash || !ok) return false;
+        if (!dbUser || !storedHash || !plaintext || !ok) return false;
 
         await writeSession(dbUser as TUser, options);
         return true;
@@ -197,6 +226,17 @@ export function createAuthInstance<TUser extends AnyUser>(
 
     async logout(): Promise<void> {
       await deps.cookie.delete(deps.cookieName);
+      // Bridge delete(name) implementations typically clear with default
+      // path '/' and no domain — when a custom path/domain is configured,
+      // also overwrite with an expired empty cookie under those attributes
+      // so the real session cookie is actually removed.
+      if (deps.cookieOptions.path || deps.cookieOptions.domain) {
+        await deps.cookie.set(
+          deps.cookieName,
+          '',
+          buildCookieOptions(0, deps.cookieOptions),
+        );
+      }
       cachedPayload = null;
       cachedUser = null;
     },
@@ -215,7 +255,9 @@ export function createAuthInstance<TUser extends AnyUser>(
         return null;
       }
 
-      // Cookie-backed: reconstruct user from session data
+      // Cookie-backed: reconstruct user from session data. Data-less cookies
+      // (e.g. sealed under a resolveUser config) return null — forces re-login
+      // rather than returning a user missing the declared fields.
       if (deps.sessionFields && session.data) {
         cachedUser = { ...session.data, id: session.uid } as SessionUser<TUser>;
         return cachedUser;

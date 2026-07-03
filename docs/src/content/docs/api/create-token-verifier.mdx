@@ -16,23 +16,26 @@ import { createTokenVerifier } from 'ideal-auth';
 
 const passwordResetTokens = createTokenVerifier({
   secret: process.env.AUTH_SECRET!,
+  purpose: 'password-reset',
 });
 ```
 
 :::danger
-The `secret` must be at least **32 characters**. `createTokenVerifier` throws immediately if the secret is shorter.
+The `secret` must be at least **32 characters** and `purpose` is required. `createTokenVerifier` throws immediately if the secret is shorter or `purpose` is missing.
 :::
 
 :::tip
-Use a **different secret** (or a derived secret) for each use case. This prevents a token created for password resets from being accepted by an email verification flow.
+Use a **distinct `purpose`** for each use case. The purpose is mixed into the HMAC signature, so a token created for password resets can never be accepted by an email verification flow — even when both verifiers share the same secret. There is no need for a separate secret per flow.
 
 ```typescript
 const passwordResetTokens = createTokenVerifier({
-  secret: process.env.AUTH_SECRET! + ':password-reset',
+  secret: process.env.AUTH_SECRET!,
+  purpose: 'password-reset',
 });
 
 const emailVerificationTokens = createTokenVerifier({
-  secret: process.env.AUTH_SECRET! + ':email-verification',
+  secret: process.env.AUTH_SECRET!,
+  purpose: 'email-verification',
 });
 ```
 :::
@@ -44,6 +47,7 @@ const emailVerificationTokens = createTokenVerifier({
 ```typescript
 interface TokenVerifierConfig {
   secret: string;
+  purpose: string;
   expiryMs?: number;
 }
 ```
@@ -51,11 +55,16 @@ interface TokenVerifierConfig {
 | Field | Type | Required | Default |
 |---|---|---|---|
 | `secret` | `string` | Yes | — |
+| `purpose` | `string` | Yes | — |
 | `expiryMs` | `number` (milliseconds) | No | `3600000` (1 hour) |
 
 ### secret
 
 The secret used to sign and verify tokens. Must be at least 32 characters.
+
+### purpose
+
+A label identifying the flow the tokens belong to (e.g. `'password-reset'`, `'email-verification'`, `'magic-link'`). The purpose is mixed into the HMAC signature — it is not part of the token string — so a token only verifies against a verifier configured with the same purpose. This provides domain separation between flows without requiring a separate secret for each one.
 
 ### expiryMs
 
@@ -65,12 +74,14 @@ Token lifetime in milliseconds. After this duration, `verifyToken` returns `null
 // Tokens expire in 15 minutes
 const shortLivedTokens = createTokenVerifier({
   secret: process.env.AUTH_SECRET!,
+  purpose: 'password-reset',
   expiryMs: 15 * 60 * 1000,
 });
 
 // Tokens expire in 24 hours
 const longLivedTokens = createTokenVerifier({
   secret: process.env.AUTH_SECRET!,
+  purpose: 'email-verification',
   expiryMs: 24 * 60 * 60 * 1000,
 });
 ```
@@ -90,6 +101,7 @@ Generates a signed token for the given user ID. The token encodes the user ID, a
 ```typescript
 const tokens = createTokenVerifier({
   secret: process.env.AUTH_SECRET!,
+  purpose: 'email-verification',
 });
 
 const token = tokens.createToken('user_abc123');
@@ -110,7 +122,7 @@ base64url(userId).randomId.iat.exp.signature
 | `randomId` | A random identifier unique to this token |
 | `iat` | Issued-at timestamp in milliseconds (`Date.now()` at creation) |
 | `exp` | Expiration timestamp in milliseconds (`iat + expiryMs`) |
-| `signature` | HMAC-SHA256 signature covering all four preceding fields |
+| `signature` | HMAC-SHA256 signature covering all four preceding fields plus the verifier's `purpose` |
 
 ### verifyToken
 
@@ -123,6 +135,7 @@ Validates a token's signature and checks that it has not expired. Returns the de
 ```typescript
 const tokens = createTokenVerifier({
   secret: process.env.AUTH_SECRET!,
+  purpose: 'email-verification',
 });
 
 const result = tokens.verifyToken(token);
@@ -138,6 +151,7 @@ if (!result) {
 Returns `null` when:
 - The token format is malformed (wrong number of segments)
 - The signature does not match (token was tampered with)
+- The token was created by a verifier with a different `purpose`
 - The token has expired (`Date.now() > exp`)
 
 ---
@@ -224,7 +238,8 @@ import { createTokenVerifier, createHash } from 'ideal-auth';
 const hash = createHash();
 
 const passwordResetTokens = createTokenVerifier({
-  secret: process.env.AUTH_SECRET! + ':password-reset',
+  secret: process.env.AUTH_SECRET!,
+  purpose: 'password-reset',
   expiryMs: 60 * 60 * 1000, // 1 hour
 });
 

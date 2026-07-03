@@ -461,6 +461,7 @@ import { createTokenVerifier } from 'ideal-auth';
 
 const verifier = createTokenVerifier({
   secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'password-reset',
   expiryMs: 1000 * 60 * 15, // 15 minutes
 });
 
@@ -474,6 +475,7 @@ const result = verifier.verifyToken(token);
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `secret` | `string` | — | **Required.** Signing secret, at least 32 characters. |
+| `purpose` | `string` | — | **Required.** Label for the flow (e.g. `'password-reset'`, `'email-verification'`, `'magic-link'`). Mixed into the HMAC signature, so a token only verifies against a verifier with the same purpose — reuse one `IDEAL_AUTH_SECRET` across flows with distinct purposes. |
 | `expiryMs` | `number` | `3600000` (1 hour) | Token lifetime in milliseconds. |
 
 ### Return value of `verifyToken`
@@ -506,7 +508,12 @@ const uri = totp.generateQrUri({
   issuer: 'MyApp',
   account: 'user@example.com',
 });
-const valid = totp.verify('123456', secret);
+
+// Pass the persisted counter from the last successful verification,
+// or null if the user has never verified a code.
+const { valid, counter } = totp.verify('123456', secret, null);
+// On success, persist `counter` (e.g. user.totpLastUsedCounter) and
+// pass it back next time — codes at or before it are rejected.
 ```
 
 ### Config options
@@ -523,7 +530,7 @@ const valid = totp.verify('123456', secret);
 |---|---|---|
 | `generateSecret()` | `string` | Generates a random Base32-encoded secret (20 bytes). |
 | `generateQrUri({ secret, issuer, account })` | `string` | Returns an `otpauth://` URI suitable for QR code generation. |
-| `verify(token, secret)` | `boolean` | Verifies a TOTP code against the secret using timing-safe comparison. |
+| `verify(token, secret, lastUsedCounter)` | `{ valid: boolean; counter: number \| null }` | Verifies a TOTP code against the secret using timing-safe comparison, with built-in replay protection. Codes at or before `lastUsedCounter` are rejected. On success, persist the returned `counter` and pass it back on the next verification. Tokens are normalized: whitespace is stripped, and anything that is not exactly `digits` digits is rejected. |
 
 ---
 
@@ -666,9 +673,11 @@ import {
       hash,
     });
 
-    // Token verifier (password reset, email verification)
+    // Token verifier (password reset) — create one verifier per purpose,
+    // sharing the same secret
     export const tokenVerifier = createTokenVerifier({
       secret: process.env.IDEAL_AUTH_SECRET!,
+      purpose: 'password-reset',
       expiryMs: 1000 * 60 * 60, // 1 hour
     });
 

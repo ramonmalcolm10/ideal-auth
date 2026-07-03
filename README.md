@@ -103,6 +103,7 @@ const session = auth({ autoTouch: true });   // auto-extends session past halfwa
 | `cookie` | `CookieBridge` | Yes | — |
 | `resolveUser` | `(id: string) => Promise<User \| null \| undefined>` | Yes (unless `sessionFields` is provided) | — |
 | `sessionFields` | `(keyof User & string)[]` | Yes (unless `resolveUser` is provided) | — |
+| `validateSession` | `(session: SessionInfo) => boolean \| Promise<boolean>` | No | — . Server-side revocation check, run once per request on the first session read. See [Revoking sessions](#revoking-sessions-log-out-everywhere). |
 | `hash` | `HashInstance` | No | — |
 | `resolveUserByCredentials` | `(creds: Record<string, any>) => Promise<AnyUser \| null \| undefined>` | No | — |
 | `credentialKey` | `string` | No | `'password'` |
@@ -121,7 +122,7 @@ const session = auth({ autoTouch: true });   // auto-extends session past halfwa
 | `login(user, options?)` | `Promise<void>` | Set session cookie for the given user |
 | `loginById(id, options?)` | `Promise<void>` | Resolve user by ID, then set session cookie |
 | `attempt(credentials, options?)` | `Promise<boolean>` | Find user, verify password, login if valid |
-| `logout()` | `Promise<void>` | Delete session cookie |
+| `logout()` | `Promise<void>` | Delete session cookie. When a custom cookie `path`/`domain` is configured, also overwrites with an expired cookie under those attributes so it clears everywhere. |
 | `check()` | `Promise<boolean>` | Is the session valid? (read-only) |
 | `user()` | `Promise<SessionUser<User> \| null>` | Get the authenticated user (read-only). `id` is always `string` — see [note on id types](#user-id-type). |
 | `id()` | `Promise<string \| null>` | Get the authenticated user's ID (read-only) |
@@ -161,6 +162,33 @@ const u = await auth().user();
 ```
 
 The return type is `SessionUser<TUser>`, which is `Omit<TUser, 'id'> & { id: string }`. If app code needs the numeric id back, parse at the boundary: `Number(u.id)`. This avoids the silent type/runtime mismatch where TS believed `id` was a number but the cookie always produced a string.
+
+#### Revoking sessions (log out everywhere)
+
+Session cookies are stateless — they stay valid until they expire, even if the user changes their password on another device. The `validateSession` config hook adds a server-side check, run once per request on the first session read (`check()`, `user()`, or `id()`). Return `false` to treat the session as logged out:
+
+```typescript
+const auth = createAuth<AuthUser>({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  cookie: cookieBridge,
+  resolveUser: (id) => db.user.findUnique({ where: { id: Number(id) } }),
+
+  // Reject sessions issued before the last password change
+  validateSession: async ({ uid, issuedAt }) => {
+    const user = await db.user.findUnique({ where: { id: Number(uid) } });
+    if (!user) return false;
+    return !user.passwordChangedAt || issuedAt >= user.passwordChangedAt;
+  },
+});
+```
+
+`issuedAt` is the original login time — it is preserved across `touch()`/`autoTouch` reseals, so extending a session never bypasses the check. Setting `passwordChangedAt = new Date()` when the user changes their password (or adding a similar `sessionsRevokedAt` column for an explicit "log out all devices" button) invalidates every session issued before that moment.
+
+Notes:
+
+- Errors thrown by `validateSession` propagate to the caller — a failing lookup surfaces instead of silently logging the user in or out.
+- In `sessionFields` mode this adds a lookup on every request, negating the zero-DB benefit — use a fast store (memory cache, Redis) for the check there.
+- The cookie is not deleted when validation fails (read paths never write); it simply stops authenticating.
 
 #### `attempt()` — Two Modes
 
@@ -293,14 +321,23 @@ timingSafeEqual('abc', 'xyz'); // false
 
 ### `createTokenVerifier(config)`
 
-Signed, expiring tokens for password resets, email verification, magic links, invites — any flow that needs a one-time, time-limited token tied to a user. Create one instance per use case with its own secret/expiry. You handle delivery (email, SMS) — ideal-auth handles the token lifecycle.
+Signed, expiring tokens for password resets, email verification, magic links, invites — any flow that needs a one-time, time-limited token tied to a user. Create one instance per use case with its own purpose/expiry. You handle delivery (email, SMS) — ideal-auth handles the token lifecycle.
 
 #### Config
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
 | `secret` | `string` | — | Secret for HMAC signing (required) |
+| `purpose` | `string` | — | **Required.** Binds tokens to a flow (e.g. `'password-reset'`). A token only verifies against a verifier configured with the same purpose — a token minted for one flow can never be replayed in another, even when the verifiers share a secret. |
 | `expiryMs` | `number` | `3600000` (1 hour) | Token lifetime in milliseconds |
+
+```typescript
+const passwordReset = createTokenVerifier({ secret, purpose: 'password-reset' });
+const emailVerify = createTokenVerifier({ secret, purpose: 'email-verification' });
+
+const token = passwordReset.createToken(user.id);
+emailVerify.verifyToken(token); // null — wrong purpose, same secret
+```
 
 #### Password Reset
 
@@ -308,7 +345,8 @@ Signed, expiring tokens for password resets, email verification, magic links, in
 import { createTokenVerifier, createHash } from 'ideal-auth';
 
 const passwordReset = createTokenVerifier({
-  secret: process.env.IDEAL_AUTH_SECRET! + '-reset',
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'password-reset',
   expiryMs: 60 * 60 * 1000, // 1 hour
 });
 
@@ -339,7 +377,8 @@ await db.user.update({
 import { createTokenVerifier } from 'ideal-auth';
 
 const emailVerification = createTokenVerifier({
-  secret: process.env.IDEAL_AUTH_SECRET! + '-email',
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'email-verification',
   expiryMs: 24 * 60 * 60 * 1000, // 24 hours
 });
 
@@ -358,7 +397,7 @@ await db.user.update({
 });
 ```
 
-Use different secrets (or suffixes) per use case so tokens aren't interchangeable between flows.
+One secret with a distinct `purpose` per use case is all the separation you need — tokens are never interchangeable between flows.
 
 **Token invalidation:** Tokens are stateless and valid until expiry. `verifyToken()` returns `iatMs` (issued-at timestamp in milliseconds) so you can reject tokens issued before a relevant event (e.g. password change, email already verified). You must implement this check — the library does not track token usage.
 
@@ -387,10 +426,10 @@ const uri = totp.generateQrUri({
 });
 // Render `uri` as a QR code (use any QR library)
 
-// 3. Verify the first code to confirm setup
-const valid = totp.verify(codeFromUser, secret);
+// 3. Verify the first code to confirm setup (fresh setup — no previous counter)
+const { valid, counter } = totp.verify(codeFromUser, secret, null);
 if (valid) {
-  // Mark 2FA as enabled for the user
+  // Mark 2FA as enabled and store `counter` as the user's totpLastUsedCounter
 }
 ```
 
@@ -400,13 +439,21 @@ if (valid) {
 const totp = createTOTP();
 
 // After password login, prompt for TOTP code
-const valid = totp.verify(codeFromUser, user.totpSecret);
-if (!valid) {
-  throw new Error('Invalid 2FA code');
-}
+const { valid, counter } = totp.verify(
+  codeFromUser,
+  user.totpSecret,
+  user.totpLastUsedCounter, // codes at or before this step are rejected
+);
+if (!valid) throw new Error('Invalid 2FA code');
+
+// Persist so this code (and older ones) can never be accepted again
+await db.user.update({
+  where: { id: user.id },
+  data: { totpLastUsedCounter: counter },
+});
 ```
 
-**Replay protection:** A valid TOTP code can be verified multiple times within the acceptance window (default 90 seconds). For mission-critical apps, store the last used time step per user and reject codes at or before that step.
+**Replay protection is built in and enforced.** A raw TOTP code is otherwise valid for the whole acceptance window (default 90 seconds) — `verify()` requires the last used counter (`null` on first use) and returns the matched counter so every code is single-use. Input is normalized: whitespace is stripped (`"123 456"` works) and anything that isn't exactly `digits` digits is rejected.
 
 #### Config
 

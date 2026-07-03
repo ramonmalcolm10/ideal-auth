@@ -5,7 +5,10 @@ export async function seal(
   payload: SessionPayload,
   secret: string,
 ): Promise<string> {
-  return sealData(payload, { password: secret });
+  // Pass the session ttl explicitly — iron-session defaults its internal seal
+  // expiry to 14 days, which would silently cap sessions with a longer maxAge
+  // (e.g. the 30-day rememberMaxAge) regardless of the payload's own exp.
+  return sealData(payload, { password: secret, ttl: payload.ttl });
 }
 
 export async function unseal(

@@ -19,8 +19,11 @@ export async function verifyRecoveryCode(
   hashedCodes: string[],
   hashInstance: HashInstance,
 ): Promise<RecoveryCodeResult> {
+  // Codes are generated as lowercase hex — accept pasted input with
+  // surrounding whitespace or uppercase letters.
+  const normalized = code.trim().toLowerCase();
   for (let i = 0; i < hashedCodes.length; i++) {
-    if (await hashInstance.verify(code, hashedCodes[i])) {
+    if (await hashInstance.verify(normalized, hashedCodes[i])) {
       const remaining = [...hashedCodes.slice(0, i), ...hashedCodes.slice(i + 1)];
       return { valid: true, remaining };
     }

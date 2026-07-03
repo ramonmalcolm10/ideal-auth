@@ -13,7 +13,23 @@ function validateSecret(secret: string | undefined): asserts secret is string {
 export function createTokenVerifier(
   config: TokenVerifierConfig,
 ): TokenVerifierInstance {
+  // Structural config error — always known at definition time, so throw
+  // eagerly (unlike the secret, which may only be bound at request time).
+  if (!config.purpose || typeof config.purpose !== 'string') {
+    throw new Error(
+      "purpose is required — e.g. createTokenVerifier({ secret, purpose: 'password-reset' }). " +
+        'It binds tokens to one flow so they cannot be replayed in another.',
+    );
+  }
   const expiryMs = config.expiryMs ?? DEFAULT_EXPIRY_MS;
+
+  // Purpose binding: the purpose is mixed into the signed payload (never the
+  // token itself), so a token minted for one purpose fails verification on a
+  // verifier configured with a different one — even when they share a secret.
+  // '\0' cannot appear in the dot-joined payload, so the binding is unambiguous.
+  function signedPayload(payload: string): string {
+    return `${payload}\0${config.purpose}`;
+  }
 
   return {
     createToken(userId: string): string {
@@ -23,7 +39,7 @@ export function createTokenVerifier(
       const iat = Date.now();
       const exp = iat + expiryMs;
       const payload = `${encodedUserId}.${id}.${iat}.${exp}`;
-      const signature = signData(payload, config.secret);
+      const signature = signData(signedPayload(payload), config.secret);
       return `${payload}.${signature}`;
     },
 
@@ -35,7 +51,7 @@ export function createTokenVerifier(
       const [encodedUserId, id, iatStr, expStr, signature] = parts;
       const payload = `${encodedUserId}.${id}.${iatStr}.${expStr}`;
 
-      if (!verifySignature(payload, signature, config.secret)) return null;
+      if (!verifySignature(signedPayload(payload), signature, config.secret)) return null;
 
       const exp = Number(expStr);
       const iat = Number(iatStr);

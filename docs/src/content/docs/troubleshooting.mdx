@@ -277,6 +277,10 @@ Session payloads store the user ID as a string (`uid`). If your database uses nu
 
 Both `createToken()` and `verifyToken()` must use the same secret. If you have separate services for token creation (e.g., a password reset endpoint) and verification (e.g., a reset confirmation page), they must share the same `IDEAL_AUTH_SECRET`.
 
+### Different `purpose` between creation and verification
+
+The verifier's required `purpose` is mixed into the HMAC signature, so a token only verifies against a verifier configured with the same purpose. If the token was created with `purpose: 'password-reset'` but you verify it with a verifier configured as `purpose: 'email-verification'`, `verifyToken()` returns `null`. This is by design — it prevents a token minted for one flow from being replayed in another. Make sure both sides use the exact same `purpose` string.
+
 ### Token has expired
 
 Check the `expiryMs` value. The default is `3600000` (1 hour). If more time than `expiryMs` has passed since the token was created, `verifyToken()` returns `null`.
@@ -284,6 +288,7 @@ Check the `expiryMs` value. The default is `3600000` (1 hour). If more time than
 ```ts
 const verifier = createTokenVerifier({
   secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'password-reset',
   expiryMs: 1000 * 60 * 60 * 24, // extend to 24 hours if needed
 });
 ```
@@ -361,7 +366,11 @@ Even a simple Redis-backed store is dramatically more effective than the memory 
 
 ## TOTP codes not verifying
 
-The user enters the code from their authenticator app, but `totp.verify()` returns `false`.
+The user enters the code from their authenticator app, but `totp.verify()` returns `{ valid: false, counter: null }`.
+
+### Code was already used (replay rejected)
+
+`verify()` rejects any code at or before the persisted `lastUsedCounter`, so entering the same code twice within a period fails by design — the user must wait for the next code. Also make sure you persist the returned `counter` after each successful verification and pass the stored value back as `lastUsedCounter` (or `null` if the user has never verified a code).
 
 ### Server clock drift
 

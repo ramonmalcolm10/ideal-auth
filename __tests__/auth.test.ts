@@ -1234,3 +1234,231 @@ describe('user().id is always a string', () => {
     });
   });
 });
+
+describe('validateSession (server-side revocation)', () => {
+  it('treats the session as logged out when validateSession returns false', async () => {
+    const bridge = createMockCookieBridge();
+    const config = {
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: ['email'] as ('email')[],
+    };
+    await createAuth<TestUser>(config)().login(testUser);
+
+    const revoked = createAuth<TestUser>({
+      ...config,
+      validateSession: async () => false,
+    })();
+    expect(await revoked.check()).toBe(false);
+    expect(await revoked.user()).toBeNull();
+    expect(await revoked.id()).toBeNull();
+  });
+
+  it('keeps the session when validateSession returns true', async () => {
+    const bridge = createMockCookieBridge();
+    const factory = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: ['email'],
+      validateSession: async () => true,
+    });
+    await factory().login(testUser);
+
+    const fresh = factory();
+    expect(await fresh.check()).toBe(true);
+    expect((await fresh.user())!.email).toBe(testUser.email);
+  });
+
+  it('receives uid and issuedAt/expiresAt as Dates, once per request', async () => {
+    const bridge = createMockCookieBridge();
+    const calls: { uid: string; issuedAt: Date; expiresAt: Date }[] = [];
+    const factory = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: ['email'],
+      validateSession: async (session) => {
+        calls.push(session);
+        return true;
+      },
+    });
+    await factory().login(testUser);
+
+    const fresh = factory();
+    await fresh.check();
+    await fresh.user();
+    await fresh.id();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].uid).toBe('1');
+    expect(calls[0].issuedAt).toBeInstanceOf(Date);
+    expect(calls[0].expiresAt.getTime()).toBeGreaterThan(calls[0].issuedAt.getTime());
+  });
+
+  it('propagates validateSession errors instead of swallowing them', async () => {
+    const bridge = createMockCookieBridge();
+    const config = {
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: ['email'] as ('email')[],
+    };
+    await createAuth<TestUser>(config)().login(testUser);
+
+    const failing = createAuth<TestUser>({
+      ...config,
+      validateSession: async () => {
+        throw new Error('db down');
+      },
+    })();
+    await expect(failing.check()).rejects.toThrow('db down');
+  });
+
+  it('supports the passwordChangedAt revocation pattern', async () => {
+    const bridge = createMockCookieBridge();
+    let passwordChangedAt: Date | null = null;
+    const factory = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: ['email'],
+      validateSession: async ({ issuedAt }) =>
+        !passwordChangedAt || issuedAt >= passwordChangedAt,
+    });
+    await factory().login(testUser);
+
+    expect(await factory().check()).toBe(true);
+
+    // Password changed after login — session issued before must die
+    passwordChangedAt = new Date(Date.now() + 1000);
+    expect(await factory().check()).toBe(false);
+  });
+});
+
+describe('logout with custom cookie path/domain', () => {
+  function createRecordingBridge() {
+    const jar = new Map<string, string>();
+    const log: { op: string; name: string; options?: import('../types').CookieOptions }[] = [];
+    return {
+      jar,
+      log,
+      get(name: string) {
+        const value = jar.get(name);
+        return value || undefined;
+      },
+      set(name: string, value: string, options: import('../types').CookieOptions) {
+        jar.set(name, value);
+        log.push({ op: 'set', name, options });
+      },
+      delete(name: string) {
+        jar.delete(name);
+        log.push({ op: 'delete', name });
+      },
+    };
+  }
+
+  it('overwrites with an expired cookie under the configured path', async () => {
+    const bridge = createRecordingBridge();
+    const auth = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: ['email'],
+      session: { cookie: { path: '/app' } },
+    })();
+
+    await auth.login(testUser);
+    await auth.logout();
+
+    const expiring = bridge.log.filter(
+      (entry) => entry.op === 'set' && entry.options?.maxAge === 0,
+    );
+    expect(expiring).toHaveLength(1);
+    expect(expiring[0].options?.path).toBe('/app');
+    expect(expiring[0].options?.httpOnly).toBe(true);
+    expect(await auth.check()).toBe(false);
+  });
+
+  it('only calls delete when no custom path/domain is configured', async () => {
+    const bridge = createRecordingBridge();
+    const auth = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: ['email'],
+    })();
+
+    await auth.login(testUser);
+    await auth.logout();
+
+    expect(bridge.log.filter((e) => e.op === 'delete')).toHaveLength(1);
+    expect(bridge.log.filter((e) => e.op === 'set' && e.options?.maxAge === 0)).toHaveLength(0);
+  });
+});
+
+describe('attempt() input hardening', () => {
+  const hashedUser = async (hash: import('../types').HashInstance) => ({
+    id: '1',
+    email: 'test@example.com',
+    password: await hash.make('correct-password'),
+  });
+
+  it('returns false instead of throwing when password is missing', async () => {
+    const hash = createHash({ rounds: 4 });
+    const dbUser = await hashedUser(hash);
+    const auth = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: createMockCookieBridge(),
+      resolveUser: async () => dbUser,
+      hash,
+      resolveUserByCredentials: async () => dbUser,
+    })();
+
+    expect(await auth.attempt({ email: 'test@example.com' })).toBe(false);
+  });
+
+  it('returns false instead of throwing when password is not a string', async () => {
+    const hash = createHash({ rounds: 4 });
+    const dbUser = await hashedUser(hash);
+    const auth = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: createMockCookieBridge(),
+      resolveUser: async () => dbUser,
+      hash,
+      resolveUserByCredentials: async () => dbUser,
+    })();
+
+    expect(await auth.attempt({ email: 'x', password: 123 })).toBe(false);
+    expect(await auth.attempt({ email: 'x', password: ['a', 'b'] })).toBe(false);
+    expect(await auth.attempt({ email: 'x', password: null })).toBe(false);
+  });
+
+  it('returns false when the stored hash is not a string', async () => {
+    const hash = createHash({ rounds: 4 });
+    const auth = createAuth({
+      secret: SECRET,
+      cookie: createMockCookieBridge(),
+      resolveUser: async () => null,
+      hash,
+      resolveUserByCredentials: async () => ({ id: '1', password: null }),
+    })();
+
+    expect(await auth.attempt({ email: 'x', password: 'anything' })).toBe(false);
+  });
+});
+
+describe('sessionFields fallback when user lacks declared fields', () => {
+  it('user() returns null consistently on same-request and cross-request reads', async () => {
+    const bridge = createMockCookieBridge();
+    const factory = createAuth<TestUser>({
+      secret: SECRET,
+      cookie: bridge,
+      sessionFields: ['email'],
+    });
+
+    const sparse = { id: '9' } as TestUser;
+    const first = factory();
+    await first.login(sparse);
+    // No declared fields captured — same-request user() must match the
+    // cross-request behavior (data-less cookies are treated as logged out)
+    expect(await first.user()).toBeNull();
+    expect(await factory().user()).toBeNull();
+    // The session itself still exists — id() remains available
+    expect(await factory().id()).toBe('9');
+  });
+});

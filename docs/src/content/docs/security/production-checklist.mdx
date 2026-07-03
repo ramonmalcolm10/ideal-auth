@@ -98,21 +98,24 @@ Review every item on this list before deploying an application that uses ideal-a
 
   ```ts
   const resetTokens = createTokenVerifier({
-    secret: process.env.RESET_TOKEN_SECRET!,
+    secret: process.env.IDEAL_AUTH_SECRET!,
+    purpose: 'password-reset',
     expiryMs: 60 * 60 * 1000, // 1 hour
   });
   ```
 
-- [ ] **Different secrets per use case.** Use separate secrets (or separate `createTokenVerifier` instances) for password reset tokens and email verification tokens. This prevents a reset token from being used as a verification token and vice versa.
+- [ ] **Distinct `purpose` per use case.** `createTokenVerifier` requires a `purpose`, and it is mixed into the token signature — a token only verifies against a verifier with the same purpose. This prevents a reset token from being used as a verification token and vice versa, even with a shared secret. One secret with distinct purposes is the recommended pattern; separate secrets per flow are no longer needed for separation.
 
   ```ts
   const resetTokens = createTokenVerifier({
-    secret: process.env.RESET_TOKEN_SECRET!,
+    secret: process.env.IDEAL_AUTH_SECRET!,
+    purpose: 'password-reset',
     expiryMs: 60 * 60 * 1000,        // 1 hour
   });
 
   const emailTokens = createTokenVerifier({
-    secret: process.env.EMAIL_TOKEN_SECRET!,
+    secret: process.env.IDEAL_AUTH_SECRET!,
+    purpose: 'email-verification',
     expiryMs: 24 * 60 * 60 * 1000,   // 24 hours
   });
   ```
@@ -162,14 +165,18 @@ Review every item on this list before deploying an application that uses ideal-a
 
   // Before verifying
   const decryptedSecret = await decrypt(user.totpSecret, process.env.TOTP_ENCRYPTION_KEY!);
-  const isValid = totp.verify(code, decryptedSecret);
+  const { valid, counter } = totp.verify(code, decryptedSecret, user.totpLastUsedCounter);
+  if (valid) {
+    // Persist the matched counter for replay protection
+    await db.user.update({ where: { id: userId }, data: { totpLastUsedCounter: counter } });
+  }
   ```
 
 - [ ] **Recovery codes are shown only once and stored hashed.** `generateRecoveryCodes` returns both plaintext codes (to show the user) and bcrypt-hashed versions (to store in your database). Never store or display the plaintext codes after the initial setup.
 
 - [ ] **2FA status is verified server-side, not in cookies alone.** Do not store `has2FA: true` in the session cookie and trust it. Always check the database for the user's 2FA status when performing sensitive operations.
 
-- [ ] **TOTP replay protection is implemented for critical flows.** A TOTP code is valid for the current time window (default: 30 seconds) plus the configured window tolerance (default: 1 step = 30 seconds on each side). For critical operations (e.g., disabling 2FA, changing email), track the last used TOTP timestamp and reject codes that are not newer.
+- [ ] **TOTP replay protection is wired up.** A TOTP code is valid for the current time window (default: 30 seconds) plus the configured window tolerance (default: 1 step = 30 seconds on each side). `verify()` has built-in replay protection: codes at or before the `lastUsedCounter` you pass in are rejected. Persist the returned `counter` (a `totp_last_used_counter` column) after every successful verification and pass it back on the next call.
 
 ---
 

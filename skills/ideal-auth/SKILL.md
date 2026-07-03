@@ -313,11 +313,12 @@ const auth = createAuth({
 
 ### `createTokenVerifier(config): TokenVerifierInstance`
 
-Signed, expiring tokens for password resets, email verification, magic links, invites. Create one instance per use case with its own secret/expiry.
+Signed, expiring tokens for password resets, email verification, magic links, invites. Create one instance per use case with its own purpose/expiry.
 
 ```typescript
 type TokenVerifierConfig = {
   secret: string;      // 32+ chars, required
+  purpose: string;     // required, e.g. 'password-reset' — throws at creation if missing
   expiryMs?: number;   // default: 3600000 (1 hour)
 };
 
@@ -327,9 +328,9 @@ type TokenVerifierInstance = {
 };
 ```
 
-Token format: `encodedUserId.randomId.issuedAtMs.expiryMs.signature` (HMAC-SHA256 signed).
+Token format: `encodedUserId.randomId.issuedAtMs.expiryMs.signature` (HMAC-SHA256 signed). The `purpose` is mixed into the HMAC signature, so a token only verifies against a verifier configured with the same purpose.
 
-**Important:** Tokens are stateless. Use `iatMs` to reject tokens issued before a relevant event (e.g., password change). Use different secrets per use case so tokens aren't interchangeable.
+**Important:** Tokens are stateless. Use `iatMs` to reject tokens issued before a relevant event (e.g., password change). Use one secret with a distinct `purpose` per use case — tokens aren't interchangeable across purposes, so cross-flow replay is impossible even when verifiers share a secret.
 
 ---
 
@@ -347,9 +348,11 @@ type TOTPConfig = {
 type TOTPInstance = {
   generateSecret(): string;                              // 32-char base32 string
   generateQrUri(opts: { secret: string; issuer: string; account: string }): string;
-  verify(token: string, secret: string): boolean;
+  verify(token: string, secret: string, lastUsedCounter: number | null): { valid: boolean; counter: number | null };
 };
 ```
+
+`verify` has built-in enforced replay protection: `lastUsedCounter` is the persisted time-step counter of the last successful verification (`null` for first use), and codes at or before it are rejected. On success, persist the returned `counter` (e.g. a `totpLastUsedCounter` field) and pass it back on the next verification. Tokens are normalized before checking (whitespace stripped; must be exactly the configured digit length).
 
 ---
 
@@ -1492,7 +1495,8 @@ export const requireAuth = new Elysia({ name: 'requireAuth' })
 import { createTokenVerifier, createHash } from 'ideal-auth';
 
 const passwordReset = createTokenVerifier({
-  secret: process.env.IDEAL_AUTH_SECRET! + '-reset',  // use a different secret per use case
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'password-reset',  // required — one secret, distinct purpose per use case
   expiryMs: 60 * 60 * 1000,  // 1 hour
 });
 
@@ -1525,7 +1529,8 @@ await db.user.update({
 
 ```typescript
 const emailVerification = createTokenVerifier({
-  secret: process.env.IDEAL_AUTH_SECRET! + '-email',
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'email-verification',
   expiryMs: 24 * 60 * 60 * 1000,  // 24 hours
 });
 
@@ -1564,17 +1569,19 @@ const uri = totp.generateQrUri({
 });
 // Render uri as QR code with any QR library
 
-// 3. Verify user can produce a valid code
-if (!totp.verify(codeFromAuthenticator, secret)) {
+// 3. Verify user can produce a valid code (null = no previous verification)
+const setupResult = totp.verify(codeFromAuthenticator, secret, null);
+if (!setupResult.valid) {
   throw new Error('Invalid setup code');
 }
 
-// 4. Store secret encrypted
+// 4. Store secret encrypted, plus the counter for replay protection
 await db.user.update({
   where: { id: user.id },
   data: {
     totpSecret: await encrypt(secret, process.env.ENCRYPTION_KEY!),
     totpEnabled: true,
+    totpLastUsedCounter: setupResult.counter,
   },
 });
 
@@ -1596,9 +1603,17 @@ import { decrypt } from 'ideal-auth';
 if (user.totpEnabled) {
   const decryptedSecret = await decrypt(user.totpSecret, process.env.ENCRYPTION_KEY!);
 
-  if (!totp.verify(codeFromUser, decryptedSecret)) {
+  // Pass the persisted counter — codes at or before it are rejected (replay protection)
+  const result = totp.verify(codeFromUser, decryptedSecret, user.totpLastUsedCounter);
+  if (!result.valid) {
     throw new Error('Invalid 2FA code');
   }
+
+  // Persist the returned counter for the next verification
+  await db.user.update({
+    where: { id: user.id },
+    data: { totpLastUsedCounter: result.counter },
+  });
 }
 
 await auth().login(user);
@@ -1765,6 +1780,8 @@ redirect(safeRedirect(redirectTo, '/dashboard'));
 - Secret must be 32+ characters — throws at startup if shorter
 - SHA-256 prehash for passwords > 72 bytes (prevents silent bcrypt truncation)
 - Timing-safe comparison for all secret/signature/TOTP operations
+- Token verifiers require a `purpose` (mixed into the signature) — throws at creation without it, blocks cross-flow token replay
+- TOTP replay protection — `verify` rejects codes at or before the `lastUsedCounter` you pass in
 
 ### Your responsibility:
 - CSRF protection (framework-dependent — see each framework section)
@@ -1773,8 +1790,9 @@ redirect(safeRedirect(redirectTo, '/dashboard'));
 - Rate limiting on login, registration, and password reset endpoints
 - Using a persistent rate limit store in production (not in-memory)
 - Encrypting TOTP secrets at rest
+- Persisting the TOTP `counter` after each successful verification and passing it back as `lastUsedCounter`
 - Checking `iatMs` on tokens to prevent reuse after password change
-- Using different token secrets per use case
+- Using a distinct `purpose` per token verifier use case
 - Setting `NODE_ENV=production` in production
 - Never logging passwords
 - Using parameterized queries/ORM (SQL injection prevention)
@@ -1845,13 +1863,16 @@ redirect(safeRedirect(redirectTo, '/dashboard'));
 - Server clock must be synced (use NTP)
 - Don't set `window: 0` — too strict for real-world use
 - Verify the TOTP secret round-trips correctly through storage
+- A code at or before the persisted `lastUsedCounter` is rejected (replay protection) — wait for the next code
+- Ensure you persist the returned `counter` on success and pass the stored value back on the next `verify` call
+- Token must be exactly the configured digit length after whitespace is stripped
 
 ### Rate limiter not working in production
 - `MemoryRateLimitStore` resets on process restart and is per-process
 - Use Redis-backed store for serverless/multi-instance deployments
 
 ### Token verifier returns null
-- Same secret must be used for creation and verification
+- Same secret AND same `purpose` must be used for creation and verification
 - Check if token has expired (default: 1 hour)
 - Secret rotation invalidates all outstanding tokens
 
@@ -2130,11 +2151,12 @@ Before deploying, verify:
 - [ ] Password reset endpoint is rate limited
 - [ ] Using persistent rate limit store in production (not in-memory)
 - [ ] CSRF protection is enabled for your framework
-- [ ] Token secrets are 32+ chars, different per use case
+- [ ] Token secrets are 32+ chars; each verifier has a distinct `purpose`
 - [ ] Token expiry is appropriate (reset: 1h, email: 24h, magic link: 15m)
 - [ ] Tokens are in URL paths, not query strings
 - [ ] Token `iatMs` is checked against relevant timestamps
 - [ ] TOTP secret is stored encrypted in database
+- [ ] TOTP `counter` is persisted after each successful verification (replay protection)
 - [ ] Recovery codes are shown once, stored hashed
 - [ ] Post-login redirects are validated with `safeRedirect`
 - [ ] Error messages don't leak user existence ("Invalid email or password")
