@@ -1,0 +1,197 @@
+---
+title: User Impersonation
+description: Let admins temporarily log in as another user, with a signed exit token to return to their own account.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+ideal-auth doesn't ship a dedicated impersonation feature, but you can build it safely with two primitives you already have: `loginById()` to switch the session to the target user, and a purpose-bound [`createTokenVerifier`](/ideal-auth/api/create-token-verifier/) to mint a signed **exit token** that lets the admin get back to their own account.
+
+The result behaves like impersonation in Laravel or Django admin: support staff see exactly what the user sees, every request runs with the *user's* privileges (not the admin's), and one click returns the admin to their own session.
+
+<Aside type="caution">
+  Impersonation is the highest-risk admin feature you can ship — it converts "admin" into "any user." Read the [security notes](#security-notes) before enabling it in production.
+</Aside>
+
+---
+
+## How it works
+
+Impersonation is three moves:
+
+1. **Start** — after authorizing the admin, mint an exit token carrying the *admin's* id, store it in its own httpOnly cookie, then `loginById(targetUserId)`. The session cookie now belongs to the target user.
+2. **During** — the app behaves exactly as if the target user logged in. The exit cookie is the only evidence an admin is behind the wheel; verify it to show a banner and to block sensitive actions.
+3. **Stop** — verify the exit token, `loginById(adminId)` to restore the admin's session, delete the exit cookie.
+
+Because the exit token is signed with `purpose: 'impersonation'`, it can't be forged, can't be replayed into any other token flow (password reset, magic link, …), and expires on its own — if the admin walks away, the escape hatch closes and they simply log in again normally.
+
+---
+
+## Setup
+
+Create a dedicated verifier for exit tokens. Reuse your main secret — the `purpose` keeps these tokens isolated from every other flow:
+
+```ts
+// lib/impersonation.ts
+import { createTokenVerifier } from 'ideal-auth';
+
+export const impersonationVerifier = createTokenVerifier({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'impersonation',
+  expiryMs: 60 * 60 * 1000, // 1 hour — the max length of an impersonation window
+});
+
+export const IMPERSONATION_COOKIE = 'impersonating';
+```
+
+The exit token lives in its own cookie, separate from the session cookie. Set it with your framework's cookie API using the same hardening you'd give a session cookie:
+
+```ts
+// Next.js example — use your framework's equivalent
+import { cookies } from 'next/headers';
+
+export async function setImpersonationCookie(token: string) {
+  (await cookies()).set(IMPERSONATION_COOKIE, token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 60 * 60, // match expiryMs
+  });
+}
+```
+
+---
+
+## Starting impersonation
+
+Authorize first, mint the exit token second, switch the session last:
+
+```ts
+export async function startImpersonation(targetUserId: string) {
+  const session = auth();
+
+  // 1. Authorize: only admins may impersonate, and never other admins.
+  const admin = await session.user();
+  if (!admin || admin.role !== 'admin') {
+    throw new Response('Forbidden', { status: 403 });
+  }
+  const target = await db.user.find(targetUserId);
+  if (!target || target.role === 'admin') {
+    throw new Response('Cannot impersonate this user', { status: 403 });
+  }
+
+  // 2. Audit before switching — once loginById runs, "who did this" is gone
+  //    from the session.
+  await db.auditLog.create({
+    event: 'impersonation.start',
+    actorId: admin.id,
+    targetId: targetUserId,
+  });
+
+  // 3. Mint the exit token carrying the ADMIN's id, then become the target.
+  const exitToken = impersonationVerifier.createToken(admin.id);
+  await setImpersonationCookie(exitToken);
+  await session.loginById(targetUserId, { remember: false });
+}
+```
+
+`{ remember: false }` keeps the impersonated session browser-scoped — closing the browser ends it rather than persisting it for `rememberMaxAge`.
+
+<Aside type="note">
+  Using `sessionFields` mode? `loginById` isn't available there — fetch the target yourself and call `session.login(target)` instead. Everything else is identical.
+</Aside>
+
+---
+
+## Detecting impersonation
+
+The current session is indistinguishable from a real login — by design. The exit cookie is the marker. Verify it (never just check its presence — an expired or forged token must not count):
+
+```ts
+export async function getImpersonator(): Promise<string | null> {
+  const token = (await cookies()).get(IMPERSONATION_COOKIE)?.value;
+  if (!token) return null;
+
+  const result = impersonationVerifier.verifyToken(token);
+  return result?.userId ?? null; // the admin's id, or null
+}
+```
+
+Use it to render a persistent banner so staff always know which hat they're wearing:
+
+```tsx
+const impersonatorId = await getImpersonator();
+
+{impersonatorId && (
+  <div className="impersonation-banner">
+    Viewing as {user.email} — <form action={stopImpersonation}><button>Return to admin</button></form>
+  </div>
+)}
+```
+
+---
+
+## Stopping impersonation
+
+Verify the exit token, restore the admin session, clear the cookie:
+
+```ts
+export async function stopImpersonation() {
+  const session = auth();
+
+  const token = (await cookies()).get(IMPERSONATION_COOKIE)?.value;
+  const result = token ? impersonationVerifier.verifyToken(token) : null;
+
+  (await cookies()).delete(IMPERSONATION_COOKIE);
+
+  if (!result) {
+    // Token expired or missing — the escape hatch is closed. End the
+    // impersonated session entirely; the admin logs back in normally.
+    await session.logout();
+    return;
+  }
+
+  await db.auditLog.create({
+    event: 'impersonation.stop',
+    actorId: result.userId,
+    targetId: await session.id(),
+  });
+
+  await session.loginById(result.userId);
+}
+```
+
+The expired-token branch matters: never fall back to leaving the impersonated session live, and never restore an admin session from anything other than a verified token.
+
+---
+
+## Blocking sensitive actions
+
+The impersonated session passes every auth check the real user would — so destructive or identity-changing actions must check the impersonation marker server-side:
+
+```ts
+export async function assertNotImpersonating() {
+  if (await getImpersonator()) {
+    throw new Response('Action unavailable while impersonating', { status: 403 });
+  }
+}
+
+// In handlers for: password change, email change, 2FA enrollment,
+// account deletion, payment methods, data export…
+await assertNotImpersonating();
+```
+
+At minimum, block anything that changes credentials or moves money. A support agent should be able to *see* the user's problem, not reset their password from inside their account.
+
+---
+
+## Security notes
+
+- **Authorize on the server, every time.** The target user id arrives from an admin UI — treat it like any untrusted input. Re-check the admin's role inside `startImpersonation`, not just in the UI.
+- **Never impersonate up or sideways.** Block impersonating admins (or any role ≥ the actor's own). Otherwise a compromised junior-admin account escalates to super-admin through the impersonation feature itself.
+- **Audit both ends.** Log `impersonation.start` and `impersonation.stop` with actor id, target id, and timestamp. During the window, the session says the *user* acted — the audit log is the only record of who really did.
+- **Keep the exit token short-lived.** It's a stateless bearer token: once minted it can't be revoked, only expired. One hour is plenty; shorter is better. If it expires mid-session, the admin logs in again — a minor cost for a hard bound on the escalation window.
+- **The exit cookie must be `httpOnly` + `secure`.** It's as sensitive as a session cookie — anyone holding a valid exit token can become that admin via your stop endpoint.
+- **`validateSession` still applies.** If you've configured [server-side revocation](/ideal-auth/security/session-invalidation/), impersonated sessions are checked like any other — banning the target user also ends the impersonation of them.
+- **Consider notifying the user.** Depending on your product and jurisdiction, emailing "an administrator accessed your account" after the fact may be good practice or legally required.
