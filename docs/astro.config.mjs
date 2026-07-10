@@ -13,6 +13,7 @@ export default defineConfig({
       ],
       components: {
         SocialIcons: './src/components/SocialIcons.astro',
+        Head: './src/components/Head.astro',
       },
       editLink: {
         baseUrl: 'https://github.com/ramonmalcolm10/ideal-auth/edit/main/docs/',
@@ -28,23 +29,23 @@ export default defineConfig({
         },
         {
           label: 'Framework Guides',
-          autogenerate: { directory: 'frameworks' },
+          items: [{ autogenerate: { directory: 'frameworks' } }],
         },
         {
           label: 'Guides',
-          autogenerate: { directory: 'guides' },
+          items: [{ autogenerate: { directory: 'guides' } }],
         },
         {
           label: 'Security',
-          autogenerate: { directory: 'security' },
+          items: [{ autogenerate: { directory: 'security' } }],
         },
         {
           label: 'Migration',
-          autogenerate: { directory: 'migration' },
+          items: [{ autogenerate: { directory: 'migration' } }],
         },
         {
           label: 'API Reference',
-          autogenerate: { directory: 'api' },
+          items: [{ autogenerate: { directory: 'api' } }],
         },
       ],
     }),
