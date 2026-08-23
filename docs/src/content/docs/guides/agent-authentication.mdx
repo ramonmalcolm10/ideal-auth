@@ -1,0 +1,216 @@
+---
+title: Agent Authentication
+description: Give AI agents and automations scoped, revocable API access to user accounts — Laravel Sanctum-style tokens built from existing primitives.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+AI agents, MCP clients, and automations increasingly need to call your app *on behalf of a user* — read their data, draft their content, act with their authority. ideal-auth handles browser sessions; agents talk to APIs with a `Bearer` header instead of a cookie. This guide builds that API surface the same way Laravel does with Sanctum: **opaque random tokens, stored hashed, with a list of abilities, revocable by deleting a row** — no JWT, no OAuth server, no new dependencies.
+
+Everything comes from primitives you already have: [`generateToken`](/ideal-auth/api/crypto/) for the key material, [`signData`](/ideal-auth/api/crypto/) for an indexable digest so the raw token is never stored, and [`createRateLimiter`](/ideal-auth/api/rate-limiter/) to keep runaway agents in check.
+
+<Aside type="note">
+  This covers **first-party API access**: agents your users configure by pasting a token. If you need third-party platforms to connect via a consent redirect flow (the ChatGPT connector directory, remote MCP's mandated OAuth 2.1), run a dedicated OAuth server alongside — see [when you need OAuth](#when-you-need-oauth). ideal-auth still owns the login session underneath it.
+</Aside>
+
+---
+
+## How it works
+
+An agent never receives the user's password or session cookie. Instead:
+
+1. **Create** — the user, logged in normally, creates a token in your settings UI and picks its abilities ("read articles", "create drafts"). Your server generates a random key, stores only its HMAC digest, and shows the key once.
+2. **Connect** — the user pastes the key into the agent's app (ChatGPT custom connectors, Claude Code MCP headers, Zapier credentials, an env var for a homegrown bot). That copy-paste is the delegation — it's the entire "protocol".
+3. **Act** — the agent sends `Authorization: Bearer <token>` on every request. Your API looks up the digest, checks the requested action against the token's abilities, rate-limits per token, and logs both identities.
+4. **Revoke** — the user deletes the token in settings. The row is gone; the agent gets `401` on its next call.
+
+Because only the digest is stored, a database leak exposes no usable tokens. Because each token carries its own abilities, a leaked token opens only the endpoints it was scoped to — it is *not* a session.
+
+---
+
+## The token table
+
+One table holds every agent token:
+
+```ts
+// Example schema — adapt to your ORM
+{
+  id: string,
+  digest: string,      // unique index — HMAC of the raw token
+  userId: string,      // who delegated
+  name: string,        // user-facing label: "Claude – blog assistant"
+  abilities: string[], // e.g. ['articles:read', 'drafts:write']
+  lastUsedAt: Date | null,
+  createdAt: Date,
+}
+```
+
+`lastUsedAt` isn't decorative — it's how users decide, six months later, which tokens are dead and safe to revoke.
+
+---
+
+## Creating tokens
+
+```ts
+// lib/agent-tokens.ts
+import { generateToken, signData } from 'ideal-auth';
+
+const SECRET = process.env.IDEAL_AUTH_SECRET!;
+
+export async function createAgentToken(name: string, abilities: string[]) {
+  const session = auth();
+  const user = await session.user();
+  if (!user) throw new Response('Unauthorized', { status: 401 });
+
+  // Deny-by-default: only abilities you've explicitly defined can be granted.
+  const unknown = abilities.filter((a) => !ALLOWED_ABILITIES.includes(a));
+  if (unknown.length) {
+    throw new Response(`Unknown abilities: ${unknown.join(', ')}`, { status: 400 });
+  }
+
+  const token = `ak_${generateToken(32)}`;
+  await db.agentTokens.create({
+    digest: signData(token, SECRET),
+    userId: user.id,
+    name,
+    abilities,
+  });
+
+  return token; // display once — only the digest is stored
+}
+```
+
+`signData` is a keyed HMAC, not a plain hash: it's deterministic (so the digest column can be unique-indexed and looked up in O(1)) and secret-keyed (so even with a full database dump, an attacker can't verify guesses offline without also having your server secret).
+
+<Aside type="caution">
+  Don't use [`createHash`](/ideal-auth/api/create-hash/) here. Password hashing is deliberately slow and salted — wrong on both counts for high-entropy random tokens, and the salt would break digest lookup. `signData` is the right tool: instant, deterministic, secret-keyed.
+</Aside>
+
+---
+
+## Authenticating agent requests
+
+Verify the header, load the token, check the ability, rate-limit — in that order:
+
+```ts
+import { createRateLimiter } from 'ideal-auth';
+
+const agentLimiter = createRateLimiter({
+  maxAttempts: 60,     // 60 requests
+  windowMs: 60 * 1000, // per minute, per token
+});
+
+export async function requireAgent(req: Request, ability: string) {
+  const header = req.headers.get('authorization');
+  const raw = header?.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!raw) throw new Response('Unauthorized', { status: 401 });
+
+  const token = await db.agentTokens.find({ digest: signData(raw, SECRET) });
+  if (!token) throw new Response('Unauthorized', { status: 401 });
+
+  if (!token.abilities.includes(ability)) {
+    throw new Response(`Missing ability: ${ability}`, { status: 403 });
+  }
+
+  const { allowed } = await agentLimiter.attempt(`agent:${token.id}`);
+  if (!allowed) throw new Response('Too many requests', { status: 429 });
+
+  await db.agentTokens.update(token.id, { lastUsedAt: new Date() });
+  return token;
+}
+```
+
+Then in a handler:
+
+```ts
+export async function GET(req: Request) {
+  const token = await requireAgent(req, 'articles:read');
+  const articles = await db.articles.findByUser(token.userId);
+  return Response.json(articles);
+}
+```
+
+Every write an agent performs should record **both** identities — during the request the app acts as the user, so the audit log is the only place the agent's involvement survives:
+
+```ts
+await db.auditLog.create({
+  event: 'draft.create',
+  actorTokenId: token.id,   // which agent token did it…
+  onBehalfOf: token.userId, // …with this user's authority
+});
+```
+
+<Aside type="caution">
+  Keep `requireAgent` a separate gate on API endpoints. Never fall back from "no session cookie" to "try the Bearer header" on browser routes — agent tokens must not satisfy your normal session checks.
+</Aside>
+
+---
+
+## Blocking sensitive actions
+
+Abilities are allow-lists, but some actions should have no ability at all. Same rule as the [impersonation guide](/ideal-auth/guides/impersonation/): an agent should be able to *use* the account, never *take over* the account.
+
+Don't define abilities for: password or email changes, 2FA enrollment, account deletion, payment methods, session management, or creating further agent tokens. If an ability doesn't exist, `requireAgent` can never authorize it — deny-by-default does the enforcement for you.
+
+---
+
+## Short-lived delegation grants
+
+Sometimes you want to hand an agent temporary authority without a settings page or a database row — a one-off task, a tool call inside your own product. [`createTokenVerifier`](/ideal-auth/api/create-token-verifier/) covers this: its payload is any UTF-8 string, so a JSON-encoded grant works as-is.
+
+```ts
+import { createTokenVerifier } from 'ideal-auth';
+
+const grantVerifier = createTokenVerifier({
+  secret: process.env.IDEAL_AUTH_SECRET!,
+  purpose: 'agent-delegation',
+  expiryMs: 15 * 60 * 1000, // 15 minutes — agents re-request, they don't squat
+});
+
+export function mintGrant(userId: string, abilities: string[]) {
+  return grantVerifier.createToken(JSON.stringify({ userId, abilities }));
+}
+
+export function verifyGrant(token: string) {
+  const result = grantVerifier.verifyToken(token);
+  if (!result) return null;
+  try {
+    const grant = JSON.parse(result.userId);
+    return grant.userId && Array.isArray(grant.abilities) ? grant : null;
+  } catch {
+    return null;
+  }
+}
+```
+
+The trade-off is revocation: these are stateless — once minted they can only expire, never be killed. That's why the expiry is minutes, not days. The moment you want a longer-lived grant, that's the signal to use a stored token instead.
+
+| | Stored tokens | Delegation grants |
+| --- | --- | --- |
+| Lifetime | until revoked | minutes |
+| Revocable | ✅ delete the row | ❌ expiry only |
+| Database | one table | none |
+| Best for | standing access, pasted into agent apps | one-off tasks, internal tool calls |
+
+---
+
+## Security notes
+
+- **Show tokens once, store only digests.** The raw token exists in exactly two places: the user's clipboard and the agent's config. Your database knows only the HMAC.
+- **Scope minimally.** A token with two abilities beats a token with `*` every time. Agents can be re-granted; leaked tokens can't be un-leaked — only revoked, so make revocation easy.
+- **Bearer headers, never cookies.** Agent tokens travel in `Authorization` and are stored by the agent, not the browser — which keeps them out of CSRF territory entirely.
+- **Rate-limit per token, not per IP.** Agents burst, retry, and loop in ways humans don't, and many share egress IPs. The per-token key isolates a runaway agent without collateral damage.
+- **Record the pair, always.** The whole point of tracking `tokenId` + `userId` is the audit trail. A log that says the *user* acted, when an agent did, is the impersonation problem all over again.
+- **Treat agent input as user input.** A scoped agent can still submit garbage. Validation, authorization, and ownership checks on every write apply exactly as for a human-driven request.
+- **Let users see their tokens.** Name, abilities, `lastUsedAt`, and a revoke button on a settings page. Stale-token cleanup only happens if users can tell which tokens are stale.
+
+---
+
+## When you need OAuth
+
+The pasted-token pattern is how Stripe, GitHub (PATs), and OpenAI's own API onboard programmatic access — for users technical enough to wire up an agent, it's the right default. Reach for OAuth when a third-party platform *requires* the redirect flow:
+
+- **Listed integrations** — the ChatGPT connector directory and claude.ai remote MCP connectors expect a standard OAuth 2.1 authorization server (discovery metadata, PKCE, dynamic client registration).
+- **Remote MCP servers** — the MCP specification mandates OAuth 2.1 for authorization.
+
+Even then, ideal-auth doesn't get replaced — an authorization server has to know who the user is before it can show a consent screen, and that login session is exactly what ideal-auth provides. Pair it with a dedicated OAuth library (e.g. `node-oidc-provider`, or the MCP SDK's auth helpers) that delegates "is this user logged in?" back to your existing session. Keeping OAuth — and JWT — out of the core is deliberate: it's the same line Laravel draws between Sanctum and Passport.
