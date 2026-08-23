@@ -1,5 +1,6 @@
 import type {
   AnyUser,
+  AttemptResult,
   AuthInstance,
   ConfigurableCookieOptions,
   CookieBridge,
@@ -171,6 +172,57 @@ export function createAuthInstance<TUser extends AnyUser>(
     }
   }
 
+  /**
+   * The one implementation behind both `attempt()` and `attemptWithReason()`.
+   *
+   * Ordering here is load-bearing: hash.verify() runs unconditionally, before
+   * any branch that could return early, so a caller who only logs the reason
+   * still gets the constant-time property it never asked to give up.
+   */
+  async function runAttempt(
+    credentials: Record<string, any>,
+    options?: LoginOptions,
+  ): Promise<AttemptResult> {
+    // Escape hatch: attemptUser handles everything
+    if (deps.attemptUser) {
+      const user = await deps.attemptUser(credentials);
+      if (!user) return { ok: false, reason: 'rejected' };
+      await writeSession(user, options);
+      return { ok: true };
+    }
+
+    // Laravel-style: strip password, resolve user, verify hash
+    if (deps.hash && deps.resolveUserByCredentials) {
+      const { [deps.credentialKey]: password, ...lookup } = credentials;
+      // Coerce non-string passwords (missing, arrays from query strings, etc.)
+      // to '' so the flow returns false instead of throwing — and still runs
+      // the verify below to keep timing uniform.
+      const plaintext = typeof password === 'string' ? password : '';
+      const dbUser = await deps.resolveUserByCredentials(lookup);
+
+      // Run verify even on miss against a dummy hash — prevents user enumeration via timing
+      const rawStoredHash = dbUser
+        ? (dbUser as Record<string, any>)[deps.passwordField]
+        : undefined;
+      const storedHash = typeof rawStoredHash === 'string' && rawStoredHash
+        ? rawStoredHash
+        : undefined;
+      const hashToCheck = storedHash ?? (await getDummyHash(deps.hash));
+      const ok = await deps.hash.verify(plaintext, hashToCheck);
+
+      if (!dbUser) return { ok: false, reason: 'no_user' };
+      if (!storedHash) return { ok: false, reason: 'no_password' };
+      if (!plaintext || !ok) return { ok: false, reason: 'bad_password' };
+
+      await writeSession(dbUser as TUser, options);
+      return { ok: true };
+    }
+
+    throw new Error(
+      'Provide either attemptUser() or both hash + resolveUserByCredentials in config to use attempt()',
+    );
+  }
+
   return {
     async login(user: TUser, options?: LoginOptions): Promise<void> {
       await writeSession(user, options);
@@ -186,42 +238,18 @@ export function createAuthInstance<TUser extends AnyUser>(
     },
 
     async attempt(credentials: Record<string, any>, options?: LoginOptions): Promise<boolean> {
-      // Escape hatch: attemptUser handles everything
-      if (deps.attemptUser) {
-        const user = await deps.attemptUser(credentials);
-        if (!user) return false;
-        await writeSession(user, options);
-        return true;
-      }
+      // Stays a boolean forever. Widening this return type would turn every
+      // `if (!await attempt())` in every downstream app into a permanently
+      // false branch — an object is always truthy — and log everyone in
+      // without a type error at the call site. Use attemptWithReason().
+      return (await runAttempt(credentials, options)).ok;
+    },
 
-      // Laravel-style: strip password, resolve user, verify hash
-      if (deps.hash && deps.resolveUserByCredentials) {
-        const { [deps.credentialKey]: password, ...lookup } = credentials;
-        // Coerce non-string passwords (missing, arrays from query strings, etc.)
-        // to '' so the flow returns false instead of throwing — and still runs
-        // the verify below to keep timing uniform.
-        const plaintext = typeof password === 'string' ? password : '';
-        const dbUser = await deps.resolveUserByCredentials(lookup);
-
-        // Run verify even on miss against a dummy hash — prevents user enumeration via timing
-        const rawStoredHash = dbUser
-          ? (dbUser as Record<string, any>)[deps.passwordField]
-          : undefined;
-        const storedHash = typeof rawStoredHash === 'string' && rawStoredHash
-          ? rawStoredHash
-          : undefined;
-        const hashToCheck = storedHash ?? (await getDummyHash(deps.hash));
-        const ok = await deps.hash.verify(plaintext, hashToCheck);
-
-        if (!dbUser || !storedHash || !plaintext || !ok) return false;
-
-        await writeSession(dbUser as TUser, options);
-        return true;
-      }
-
-      throw new Error(
-        'Provide either attemptUser() or both hash + resolveUserByCredentials in config to use attempt()',
-      );
+    async attemptWithReason(
+      credentials: Record<string, any>,
+      options?: LoginOptions,
+    ): Promise<AttemptResult> {
+      return runAttempt(credentials, options);
     },
 
     async logout(): Promise<void> {

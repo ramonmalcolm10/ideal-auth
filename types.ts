@@ -47,6 +47,38 @@ export interface LoginOptions {
   remember?: boolean;
 }
 
+/**
+ * Why an attempt failed.
+ *
+ * `attempt()` computes this and throws it away. `attemptWithReason()` hands it
+ * back instead — no second lookup, because the resolve already happened.
+ *
+ * Reasons are facts, not messages. Three of the four confirm whether an address
+ * is registered, so showing them to an anonymous visitor is a disclosure
+ * decision that belongs to the application: gate it behind a probe budget, or
+ * don't show it. `bad_password` is the one that must never reach a screen in
+ * any form — that a password was close is the single thing a login must not
+ * confirm.
+ */
+export type AttemptFailure =
+  /** Nothing matched the lookup. */
+  | 'no_user'
+  /** The account exists but has no password set — a social or passkey signup. */
+  | 'no_password'
+  /** The password did not match. */
+  | 'bad_password'
+  /** `attemptUser()` declined. Why is that callback's business, not ours. */
+  | 'rejected';
+
+/**
+ * No user is returned on success: the resolved row still carries the password
+ * hash at that point, and handing it back is how it ends up somewhere it
+ * shouldn't. Call `user()` for the session-safe copy.
+ */
+export type AttemptResult =
+  | { ok: true }
+  | { ok: false; reason: AttemptFailure };
+
 /** Metadata about the current session, passed to `validateSession`. */
 export interface SessionInfo {
   /** The user id stored in the session cookie (always a string). */
@@ -156,6 +188,17 @@ export interface AuthInstance<TUser extends AnyUser = AnyUser> {
   login(user: TUser, options?: LoginOptions): Promise<void>;
   loginById(id: string, options?: LoginOptions): Promise<void>;
   attempt(credentials: Record<string, any>, options?: LoginOptions): Promise<boolean>;
+  /**
+   * Same work as `attempt()`, but returns why it failed instead of discarding
+   * it — no second lookup, because the resolve already happened.
+   *
+   * The reason is a fact, not a message. See {@link AttemptFailure} before
+   * putting any of it on a screen.
+   */
+  attemptWithReason(
+    credentials: Record<string, any>,
+    options?: LoginOptions,
+  ): Promise<AttemptResult>;
   logout(): Promise<void>;
   check(): Promise<boolean>;
   user(): Promise<SessionUser<TUser> | null>;
