@@ -8,7 +8,9 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 ## Signature
 
 ```typescript
-function createAuth<TUser>(config: AuthConfig<TUser>): () => AuthInstance<TUser>
+function createAuth<TUser>(
+  config: AuthConfig<TUser>,
+): (options?: AuthFactoryOptions) => AuthInstance<TUser>
 ```
 
 `createAuth` is the main entry point for session-based authentication. It accepts an `AuthConfig` object and returns a **factory function**. Each call to the factory produces an `AuthInstance` scoped to the current request's cookies.
@@ -453,6 +455,7 @@ import type {
   AttemptFailure,
   AttemptResult,
   AuthConfig,
+  AuthFactoryOptions,
   AuthInstance,
   CookieBridge,
   CookieOptions,
