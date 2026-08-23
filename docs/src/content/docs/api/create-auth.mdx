@@ -3,12 +3,14 @@ title: createAuth
 description: API reference for createAuth — the core session auth factory.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 ## Signature
 
 ```typescript
-function createAuth<TUser>(config: AuthConfig<TUser>): () => AuthInstance<TUser>
+function createAuth<TUser>(
+  config: AuthConfig<TUser>,
+): (options?: AuthFactoryOptions) => AuthInstance<TUser>
 ```
 
 `createAuth` is the main entry point for session-based authentication. It accepts an `AuthConfig` object and returns a **factory function**. Each call to the factory produces an `AuthInstance` scoped to the current request's cookies.
@@ -183,6 +185,47 @@ if (!success) {
   return { error: 'Invalid credentials.' };
 }
 ```
+
+### attemptWithReason
+
+```typescript
+attemptWithReason(
+  credentials: Record<string, unknown>,
+  options?: LoginOptions,
+): Promise<AttemptResult>
+```
+
+Identical work to `attempt()` — same lookup, same verification, same login on success — but returns *why* it failed instead of discarding it. No extra query: `attempt()` already resolved the user and already knew which branch failed.
+
+```typescript
+const result = await auth().attemptWithReason({
+  email: 'user@example.com',
+  password: 'their-password',
+});
+
+if (!result.ok) {
+  return { error: messageFor(result.reason) };
+}
+```
+
+| `reason` | Meaning |
+| --- | --- |
+| `no_user` | Nothing matched the lookup. |
+| `no_password` | The account exists but has no password set — a social or passkey signup. |
+| `bad_password` | The password did not match. |
+| `rejected` | `attemptUser()` declined. Why is that callback's business, not the library's. |
+
+<Aside type="caution" title="A reason is a fact, not a message">
+  Three of the four confirm whether an address is registered. Putting any of them
+  on a screen is a disclosure decision that belongs to your application — see
+  [Login error messages](/ideal-auth/guides/login-error-messages/) for the
+  probe-budget pattern. `bad_password` must never reach a user in any form: that
+  a password was close is the one thing a login must not confirm.
+</Aside>
+
+Success returns `{ ok: true }` and no user object. The resolved row still carries the password hash at that point, and handing it back is how it ends up somewhere it shouldn't — call [`user()`](#user) for the session-safe copy.
+
+Timing is unaffected. Both methods run `hash.verify()` unconditionally before any branch, against a dummy hash when no user was found, so a caller that only logs the reason keeps the constant-time property it never asked to give up.
 
 ### logout
 
@@ -409,7 +452,10 @@ All types are available as type-only exports:
 
 ```typescript
 import type {
+  AttemptFailure,
+  AttemptResult,
   AuthConfig,
+  AuthFactoryOptions,
   AuthInstance,
   CookieBridge,
   CookieOptions,
