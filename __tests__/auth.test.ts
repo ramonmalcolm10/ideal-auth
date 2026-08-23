@@ -381,6 +381,109 @@ describe('AuthInstance', () => {
       expect(result).toBe(false);
     });
 
+    describe('attemptWithReason()', () => {
+      it('reports no_user for an address with no account', async () => {
+        const result = await laravelAuth.attemptWithReason({
+          email: 'nobody@b.com',
+          password: 'correct-password',
+        });
+        expect(result).toEqual({ ok: false, reason: 'no_user' });
+      });
+
+      it('reports bad_password for a real account and a wrong password', async () => {
+        const result = await laravelAuth.attemptWithReason({
+          email: 'a@b.com',
+          password: 'wrong',
+        });
+        expect(result).toEqual({ ok: false, reason: 'bad_password' });
+      });
+
+      it('reports no_password for an account that has none (social/passkey signup)', async () => {
+        const social = createAuth<TestUser>({
+          secret: SECRET,
+          cookie: bridge,
+          resolveUser: async () => null,
+          hash,
+          resolveUserByCredentials: async () => ({ id: '2', email: 'g@b.com' }),
+        })();
+
+        const result = await social.attemptWithReason({
+          email: 'g@b.com',
+          password: 'anything',
+        });
+        // The case a second `findFirst` by email cannot see: the row exists,
+        // so "account exists" is true, but no password can ever succeed.
+        expect(result).toEqual({ ok: false, reason: 'no_password' });
+      });
+
+      it('reports rejected when attemptUser declines', async () => {
+        const tokenAuth = createAuth<TestUser>({
+          secret: SECRET,
+          cookie: bridge,
+          resolveUser: async () => null,
+          attemptUser: async (creds) =>
+            creds.token === 'valid' ? { id: '1', email: 'a@b.com' } : null,
+        })();
+
+        expect(await tokenAuth.attemptWithReason({ token: 'bad' })).toEqual({
+          ok: false,
+          reason: 'rejected',
+        });
+        expect(await tokenAuth.attemptWithReason({ token: 'valid' })).toEqual({ ok: true });
+      });
+
+      it('logs in on success and returns no user object', async () => {
+        const result = await laravelAuth.attemptWithReason({
+          email: 'a@b.com',
+          password: 'correct-password',
+        });
+
+        expect(result).toEqual({ ok: true });
+        // The password hash must not ride back out on the result.
+        expect(result).not.toHaveProperty('user');
+        expect(await laravelAuth.check()).toBe(true);
+      });
+
+      it('still verifies against the dummy hash on a user miss', async () => {
+        let verifyCalls = 0;
+        const countingHash = {
+          make: (p: string) => hash.make(p),
+          verify: (p: string, h: string) => {
+            verifyCalls++;
+            return hash.verify(p, h);
+          },
+        };
+
+        const auth = createAuth<TestUser>({
+          secret: SECRET,
+          cookie: bridge,
+          resolveUser: async () => null,
+          hash: countingHash,
+          resolveUserByCredentials: async () => null,
+        })();
+
+        // Returning the reason must not buy back the timing oracle the dummy
+        // hash exists to close: the miss path still pays for a verify.
+        expect(await auth.attemptWithReason({ email: 'x@b.com', password: 'p' }))
+          .toEqual({ ok: false, reason: 'no_user' });
+        expect(verifyCalls).toBe(1);
+      });
+
+      it('agrees with attempt() on every path', async () => {
+        const cases = [
+          { email: 'a@b.com', password: 'correct-password' },
+          { email: 'a@b.com', password: 'wrong' },
+          { email: 'nobody@b.com', password: 'correct-password' },
+        ];
+
+        for (const creds of cases) {
+          const bool = await laravelAuth.attempt(creds);
+          const rich = await laravelAuth.attemptWithReason(creds);
+          expect(rich.ok).toBe(bool);
+        }
+      });
+    });
+
     it('strips password from lookup credentials', async () => {
       let receivedCreds: Record<string, any> = {};
       const authWithSpy = createAuth<TestUser>({

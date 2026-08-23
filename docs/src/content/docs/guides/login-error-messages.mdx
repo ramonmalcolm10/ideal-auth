@@ -1,0 +1,142 @@
+---
+title: Login Error Messages
+description: Tell people their account doesn't exist without handing an attacker your user list.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+"Invalid email or password" reads as *you got the password wrong*. Someone who has no account reads it that way too, so they try again. And again. A session recording of one signup funnel caught three submissions across four minutes, interleaved with trips back to the homepage — the "create an account" link was below the fold, under the primary button.
+
+This is expensive on cold traffic. Anyone arriving from an ad has no account by definition, and the login form is the first thing they recognise.
+
+The fix is to say what actually happened. The reason not to is user enumeration. This guide is about holding both.
+
+## The reason is already computed
+
+`attempt()` resolves the user, verifies the hash, and then collapses everything into a boolean. The information you want was known one line before it was thrown away.
+
+The usual workaround is a second lookup on the failure path:
+
+```ts
+// Don't do this.
+if (!success) {
+  const exists = Boolean(await db.user.findFirst({ where: { email } }));
+  return { error: exists ? GENERIC : NO_ACCOUNT };
+}
+```
+
+Beyond the wasted query, it's *wrong in a way that's hard to see*: a user who signed up with Google or a passkey has a row, so `exists` is `true`, so they're told "invalid email or password" — for an account where no password can ever work. They cannot succeed and the message tells them to keep trying. A second lookup is structurally blind to this; only the attempt knows.
+
+[`attemptWithReason()`](/ideal-auth/api/create-auth/#attemptwithreason) hands back what the attempt already established, with no extra query:
+
+```ts
+const result = await auth().attemptWithReason({ email, password });
+
+if (!result.ok) {
+  result.reason; // 'no_user' | 'no_password' | 'bad_password' | 'rejected'
+}
+```
+
+<Aside type="caution" title="A reason is a fact, not a message">
+  The library returns what happened. What your application *reveals* is a
+  separate decision, and it stays yours — that's why there's no built-in
+  message table. Never surface `bad_password`, in any wording: that a password
+  was close is the one thing a login must not confirm.
+</Aside>
+
+## Decide what you're actually protecting
+
+Before building a gate, audit whether the thing is already public. Most apps answer "does this address have an account?" somewhere else, cheerfully and unauthenticated:
+
+- **Registration** — "Email is already in use" is the same fact, from the same anonymous visitor.
+- **Password reset** — "we sent you a link" vs. "no account found" is the same fact again.
+- **Login timing** — closed by default here (see below), but not in every stack.
+
+If your signup form already answers it, withholding it at login isn't protecting a secret; it's protecting one of several doors while the others stand open. Either close them together or accept the disclosure deliberately. What must stay closed regardless is whether a *password* was right.
+
+## The probe budget
+
+The danger in enumeration isn't one answer, it's a million cheap ones. So cap how many times a single client gets a straight answer, and fall back to the generic message after that — the fallback is indistinguishable from a truthful "no account", so an attacker past the budget learns nothing and can't tell they've hit it.
+
+```ts
+import { createRateLimiter } from 'ideal-auth';
+import type { AttemptFailure } from 'ideal-auth';
+
+const GENERIC = 'Invalid email or password';
+const NO_ACCOUNT = 'No account found with that email';
+const NO_PASSWORD = 'That account signs in with Google or a passkey';
+
+/**
+ * How many straight answers one client gets per hour.
+ *
+ * Deliberately never reset on success: someone holding one valid account could
+ * otherwise clear the bucket between probes.
+ */
+const probeBudget = createRateLimiter({
+  maxAttempts: 30,
+  windowMs: 60 * 60 * 1000,
+});
+
+/**
+ * `bad_password` and `rejected` never get their own message.
+ *
+ * `no_user` and `no_password` both confirm the address is registered, so both
+ * sit behind the budget — being more helpful doesn't make the second one safer
+ * to hand out.
+ */
+function messageFor(reason: AttemptFailure, mayProbe: boolean): string {
+  if (!mayProbe) return GENERIC;
+
+  switch (reason) {
+    case 'no_user': return NO_ACCOUNT;
+    case 'no_password': return NO_PASSWORD;
+    default: return GENERIC;
+  }
+}
+```
+
+Wire it on the failure path only:
+
+```ts
+const result = await auth().attemptWithReason(
+  { email, password },
+  { remember },
+);
+
+if (!result.ok) {
+  const { allowed } = await probeBudget.attempt(`probe:${clientKey}`);
+  return { error: messageFor(result.reason, allowed) };
+}
+```
+
+Charging the budget only on failure matters more than it looks. A successful login tells an attacker nothing they didn't already know, so counting it just burns budget belonging to real users — and on carrier-NAT'd mobile traffic, many real users share one address. Probing for existence produces failures by construction, so counting failures alone loses nothing.
+
+<Aside type="danger" title="Your limiter key decides whether any of this works">
+  A budget keyed on something the client controls is not a budget. Most proxies
+  *append* to `X-Forwarded-For`, so a caller-supplied value survives as a prefix
+  and rotating it rotates the key — every limit silently bypassed, including
+  this one. Resolve the client address by taking the right-most hop your known
+  trusted-proxy count leaves, never the raw header. See
+  [Rate Limiting](/ideal-auth/guides/rate-limiting/).
+</Aside>
+
+## Timing is handled
+
+Disclosure through response time is a separate channel, and leaving it open would make the whole discussion moot — the answer would be readable with a stopwatch whatever your messages said.
+
+Both `attempt()` and `attemptWithReason()` run `hash.verify()` unconditionally before any branch that could return early, against a cached dummy hash when no user was found. The user-missing and user-found paths cost the same. Asking for the reason doesn't opt out of this.
+
+If you use `attemptUser` instead of the Laravel-style flow, that guarantee is yours to keep: verify against a dummy hash on the miss path too, or the callback reintroduces the oracle.
+
+## Then fix the funnel
+
+A better message ends the retry loop. It doesn't, by itself, get anyone signed up.
+
+- Point ad campaigns at your registration page. Cold traffic has no account; sending it to a login form is the actual bug.
+- On `no_user`, render the signup link *next to the field they just filled*, not at the foot of the page under the primary button.
+- Carry the address across, so they don't retype it.
+- On `no_password`, put them in front of the button that works — the provider they actually used.
+
+## When to skip this
+
+Keep the single generic message if an account's existence is itself sensitive — a therapy platform, a whistleblower service, a private beta, anything where "this person has an account here" is the disclosure. In those apps the retry loop is a cost worth paying, and `attempt()` returning a boolean is the right tool.
