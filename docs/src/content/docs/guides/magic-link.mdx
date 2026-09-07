@@ -3,8 +3,6 @@ title: Magic Link Login
 description: Passwordless email login using signed tokens.
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
-
 A magic link is a one-time URL emailed to the user. Clicking it logs them in — no password, no second device. The link itself is a signed token; ideal-auth's [`createTokenVerifier`](/api/create-token-verifier/) handles the crypto, and the route handler hands off to `auth().login(user)` after verification.
 
 This guide covers the SP-initiated flow: user enters email → server emails a link → user clicks → session is issued.

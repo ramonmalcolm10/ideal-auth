@@ -3,8 +3,6 @@ title: Rate Limiting
 description: Protect auth endpoints from brute force attacks.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 Rate limiting prevents brute force attacks by restricting how many times an action can be performed within a time window. ideal-auth provides `createRateLimiter` with a pluggable store interface and a built-in `MemoryRateLimitStore`.
 
 ## Basic setup

@@ -3,8 +3,6 @@ title: Testing
 description: How to test auth flows in your application.
 ---
 
-import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
-
 Testing authentication code requires mocking the boundary between your application and the framework — primarily the cookie layer. ideal-auth's `CookieBridge` interface makes this straightforward: replace the three cookie functions with in-memory implementations and you have a fully functional auth system in your tests.
 
 ## Mocking the cookie bridge

@@ -1,0 +1,119 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import Header from "../components/Header.astro";
+import { Card } from "../components/ui/card";
+import { CardGrid } from "../components/ui/card-grid";
+import { LinkButton } from "../components/ui/link-button";
+import { config } from "virtual:nimbus/config";
+import { withBase } from "@cloudflare/nimbus-docs/runtime";
+
+// Hand-built because Nimbus has no `template: splash`. Starlight rendered
+// this from a `hero:` frontmatter block; the tagline, both CTAs, the six
+// cards and the "What's included" list are carried over from it verbatim.
+export const prerender = true;
+
+const base = import.meta.env.BASE_URL;
+
+const included = [
+  ["createAuth", "Session authentication with encrypted cookies, login, logout, and user resolution"],
+  ["createHash", "bcrypt password hashing with automatic SHA-256 prehash for passwords exceeding 72 bytes"],
+  ["createTokenVerifier", "Signed, expiring tokens for password resets, email verification, and similar flows"],
+  ["createTOTP", "RFC 6238 time-based one-time passwords for two-factor authentication"],
+  ["generateRecoveryCodes", "Hashed backup codes for 2FA recovery"],
+  ["createRateLimiter", "Sliding-window rate limiting with pluggable stores"],
+];
+---
+
+<BaseLayout title={config.title} description={config.description}>
+  <div class="flex flex-col min-h-screen">
+    <Header />
+    <main
+      id="main-content"
+      tabindex="-1"
+      class="flex-1 mx-auto max-w-4xl w-full px-6 py-20"
+    >
+      <h1
+        class="text-foreground leading-tight"
+        style="font-size: var(--nb-h1-size); font-weight: var(--nb-h1-weight); letter-spacing: var(--nb-h1-tracking);"
+      >
+        {config.title}
+      </h1>
+      <p class="mt-3 text-[1.0625rem] text-muted-foreground leading-relaxed">
+        Session auth, password hashing, 2FA, token verification, and rate
+        limiting. Bring your own schema. Works with any framework.
+      </p>
+
+      <div class="mt-8 flex flex-wrap gap-3">
+        <LinkButton href={withBase("/getting-started", base)} variant="primary">
+          Get started
+        </LinkButton>
+        {
+          config.github && (
+            <LinkButton
+              href={config.github}
+              variant="secondary"
+              target="_blank"
+              rel="noopener"
+            >
+              View on GitHub
+            </LinkButton>
+          )
+        }
+      </div>
+
+      <h2 class="mt-16 mb-6 text-xl font-semibold text-foreground">
+        Why ideal-auth?
+      </h2>
+
+      <CardGrid>
+        <Card title="Framework agnostic" icon="ph:rocket-launch">
+          Works with Next.js, SvelteKit, Nuxt, TanStack Start, Express, Hono,
+          and any framework that can get, set, and delete cookies.
+        </Card>
+        <Card title="Bring your own schema" icon="ph:database">
+          No database adapters or ORM lock-in. You provide <code
+            >resolveUser</code
+          > and <code>resolveUserByCredentials</code> — use any database, any schema.
+        </Card>
+        <Card title="Encrypted sessions" icon="ph:lock-key">
+          Session payloads are encrypted with AES-256-CBC and authenticated with
+          HMAC via iron-session. No plaintext tokens, no JWTs.
+        </Card>
+        <Card title="TOTP 2FA with recovery codes" icon="ph:device-mobile">
+          RFC 6238 compliant one-time passwords with configurable digits,
+          period, and window. Generate hashed recovery codes out of the box.
+        </Card>
+        <Card title="Security-first defaults" icon="ph:shield-check">
+          <code>httpOnly</code> cookies are always forced on. bcrypt uses SHA-256
+          prehash for long passwords. All comparisons are timing-safe. <code
+            >secure</code
+          > defaults to <code>true</code> in production.
+        </Card>
+        <Card title="Runs everywhere" icon="ph:laptop">
+          Zero framework dependencies. Works in Node.js, Bun, and Deno with no
+          configuration changes.
+        </Card>
+      </CardGrid>
+
+      <h2 class="mt-16 mb-6 text-xl font-semibold text-foreground">
+        What's included
+      </h2>
+
+      <ul class="flex flex-col gap-2 text-muted-foreground">
+        {
+          included.map(([name, desc]) => (
+            <li>
+              <code class="text-foreground font-medium">{name}</code> — {desc}
+            </li>
+          ))
+        }
+        <li>
+          <span class="text-foreground font-medium">Crypto utilities</span> —
+          <code>encrypt</code>/<code>decrypt</code>, <code>signData</code>/<code
+            >verifySignature</code
+          >, <code>timingSafeEqual</code>, <code>generateToken</code>
+        </li>
+      </ul>
+    </main>
+  </div>
+</BaseLayout>

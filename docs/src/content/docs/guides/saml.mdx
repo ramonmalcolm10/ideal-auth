@@ -3,8 +3,6 @@ title: SAML SSO
 description: Enterprise single sign-on with SAML 2.0 using ideal-auth and a dedicated SAML library.
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
-
 SAML 2.0 is the dominant SSO protocol for enterprise IdPs (Okta, Azure AD/Entra, OneLogin, Ping, ADFS). The protocol itself — XML signing, assertion parsing, metadata exchange — is complex and out of scope for ideal-auth. This guide shows how to wire a battle-tested SAML library to ideal-auth's session layer: the library handles the protocol, ideal-auth handles the cookie.
 
 <Aside type="tip">

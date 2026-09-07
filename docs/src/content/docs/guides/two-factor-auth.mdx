@@ -3,8 +3,6 @@ title: Two-Factor Authentication
 description: Add TOTP 2FA with recovery codes to your app.
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
-
 Two-factor authentication (2FA) adds a second verification step after a password login. ideal-auth provides `createTOTP` for time-based one-time passwords (TOTP) and `generateRecoveryCodes` / `verifyRecoveryCode` for backup recovery codes.
 
 This guide covers the complete 2FA lifecycle: setup, login verification, recovery codes, replay protection, and disabling 2FA.

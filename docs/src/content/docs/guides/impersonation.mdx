@@ -3,8 +3,6 @@ title: User Impersonation
 description: Let admins temporarily log in as another user, with a signed exit token to return to their own account.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 ideal-auth doesn't ship a dedicated impersonation feature, but you can build it safely with two primitives you already have: `loginById()` to switch the session to the target user, and a purpose-bound [`createTokenVerifier`](/ideal-auth/api/create-token-verifier/) to mint a signed **exit token** that lets the admin get back to their own account.
 
 The result behaves like impersonation in Laravel or Django admin: support staff see exactly what the user sees, every request runs with the *user's* privileges (not the admin's), and one click returns the admin to their own session.

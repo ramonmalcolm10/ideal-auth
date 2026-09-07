@@ -3,8 +3,6 @@ title: Passkeys (WebAuthn)
 description: Passwordless authentication with passkeys using ideal-auth and SimpleWebAuthn.
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
-
 Passkeys use public-key cryptography to authenticate users without passwords. The browser creates a key pair during registration — the private key stays on the device (or synced via iCloud/Google), and the public key is stored in your database. During login, the server sends a challenge, the browser signs it with the private key, and the server verifies the signature with the stored public key.
 
 ideal-auth handles the session after authentication. The WebAuthn protocol (challenge generation, credential storage, verification) is handled by [@simplewebauthn/server](https://simplewebauthn.dev/) and [@simplewebauthn/browser](https://simplewebauthn.dev/).

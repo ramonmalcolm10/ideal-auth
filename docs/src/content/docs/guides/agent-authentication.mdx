@@ -3,8 +3,6 @@ title: Agent Authentication
 description: Give AI agents and automations scoped, revocable API access to user accounts — Laravel Sanctum-style tokens built from existing primitives.
 ---
 
-import { Aside } from '@astrojs/starlight/components';
-
 AI agents, MCP clients, and automations increasingly need to call your app *on behalf of a user* — read their data, draft their content, act with their authority. ideal-auth handles browser sessions; agents talk to APIs with a `Bearer` header instead of a cookie. This guide builds that API surface the same way Laravel does with Sanctum: **opaque random tokens, stored hashed, with a list of abilities, revocable by deleting a row** — no JWT, no OAuth server, no new dependencies.
 
 Everything comes from primitives you already have: [`generateToken`](/ideal-auth/api/crypto/) for the key material, [`signData`](/ideal-auth/api/crypto/) for an indexable digest so the raw token is never stored, and [`createRateLimiter`](/ideal-auth/api/rate-limiter/) to keep runaway agents in check.
