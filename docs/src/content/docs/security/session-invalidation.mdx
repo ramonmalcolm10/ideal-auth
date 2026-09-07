@@ -3,8 +3,6 @@ title: Session Invalidation
 description: Implement "logout everywhere" and session revocation with stateless sessions.
 ---
 
-import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
-
 ideal-auth uses stateless encrypted cookies for sessions. There is no server-side session store, no session ID in a database, and no central registry of active sessions. This is a deliberate design choice — stateless sessions are simpler, faster, and scale horizontally without shared state.
 
 The tradeoff: you cannot "delete" a session by removing a row from a database. This page covers practical patterns for session invalidation when you need it.

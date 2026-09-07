@@ -3,8 +3,6 @@ title: Federated Logout
 description: Log users out across multiple domains and OAuth providers using ideal-auth.
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
-
 When your application authenticates through a central identity provider (OAuth, OIDC, or a custom login service), logging out requires more than just clearing the local session cookie. You need to clear sessions on every domain that has one and, optionally, revoke the session at the identity provider itself.
 
 <Aside type="tip">

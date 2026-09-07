@@ -3,8 +3,6 @@ title: Roles & Permissions
 description: Implement role-based and permission-based access control with ideal-auth.
 ---
 
-import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
-
 ideal-auth intentionally does not include a roles and permissions system. Access control schemas vary significantly between applications — flat roles, hierarchical RBAC, fine-grained permissions, attribute-based access control — and baking one into the library would either be too simple for real use cases or too opinionated.
 
 Instead, ideal-auth gives you the building blocks: `resolveUser` fetches your user from the database (with whatever role/permission data you need), and you write the access control checks that match your schema.

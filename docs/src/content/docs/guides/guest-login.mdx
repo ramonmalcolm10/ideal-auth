@@ -3,8 +3,6 @@ title: Guest Login
 description: Issue anonymous guest sessions and upgrade them to real accounts.
 ---
 
-import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
-
 ideal-auth doesn't ship a dedicated guest mode, but you can build one cleanly with the same primitives you already use for authenticated users. A guest session is just a session whose `uid` belongs to an anonymous identity rather than a registered user.
 
 This guide covers two patterns — pick the one that matches whether guest activity needs to persist server-side.
@@ -259,5 +257,5 @@ export async function requireRealUser() {
 ## When *not* to use guest login
 
 - **You only need anonymous analytics.** Use a tracking cookie, not a session. Sessions are for state your server reads on every request.
-- **You're tempted to use guests as API keys.** Issue real tokens via [`createTokenVerifier`](/api/token-verifier/) instead. Sessions are designed for browsers.
+- **You're tempted to use guests as API keys.** Issue real tokens via [`createTokenVerifier`](/api/create-token-verifier/) instead. Sessions are designed for browsers.
 - **You want a "skip login" button that does nothing.** If the guest can't do anything the unauthenticated user couldn't, you don't need the session.

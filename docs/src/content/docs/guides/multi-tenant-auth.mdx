@@ -3,8 +3,6 @@ title: Multi-Tenant Authentication
 description: Cross-domain authentication for multi-tenant applications using ideal-auth.
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
-
 Multi-tenant applications often serve each tenant on a different domain or subdomain (e.g., `acme.yourapp.com`, `widgets.yourapp.com`). Because cookies are scoped to a single domain, a session cookie set on your central login page cannot be read by a tenant domain. This guide covers how to implement secure cross-domain authentication using `ideal-auth`'s crypto primitives and a short-lived, one-time-use database token.
 
 <Aside type="tip">

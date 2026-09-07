@@ -3,8 +3,6 @@ title: Token Refresh
 description: Refresh OAuth access tokens stored in session cookies using ideal-auth.
 ---
 
-import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
-
 When using `sessionFields` to store OAuth access tokens in the session cookie, those tokens will eventually expire. This guide covers how to proactively refresh them before they expire, keeping the user's session alive without re-authentication.
 
 <Aside type="tip">

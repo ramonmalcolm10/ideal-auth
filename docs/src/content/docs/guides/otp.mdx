@@ -3,8 +3,6 @@ title: OTP Login
 description: Email or SMS one-time codes for passwordless or step-up authentication.
 ---
 
-import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
-
 A one-time password (OTP) is a short code — typically 6 digits — that the user types into your app after receiving it by email or SMS. Unlike a [magic link](/guides/magic-link/), the code transfers between devices because the human is the courier.
 
 This guide builds OTP login on top of `createHash` (to store codes safely) and `createRateLimiter` (to prevent brute force). The handoff is the same as every other auth flow in this library: `await auth().login(user)`.
